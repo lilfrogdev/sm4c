@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"io"
 
 	"github.com/lilfrogdev/sm4c/internal/config"
 	"github.com/spf13/cobra"
@@ -12,7 +11,7 @@ import (
 // that exercises config loading and reports the defaults. M1 will add
 // tmux/claude version probing, socket-directory perm checks, and a
 // summary of the active FSM thresholds.
-func newDoctorCmd(stdout, stderr io.Writer, pf *persistentFlags) *cobra.Command {
+func newDoctorCmd(pf *persistentFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
 		Short: "Run environment and security self-checks",
@@ -26,27 +25,21 @@ doctor never touches the live tmux server and never writes to the filesystem
 outside of transient os.Stat calls.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			out := cmd.OutOrStdout()
-			if out == nil {
-				out = stdout
-			}
-			_ = stderr
-
 			cfg, err := config.Load(pf.configPath)
 			if err != nil {
 				return fmt.Errorf("doctor: load config: %w", err)
 			}
 
-			fmt.Fprintln(out, "sm4c doctor (M0 skeleton)")
-			fmt.Fprintf(out, "  config path    : %s\n", orDefault(pf.configPath, "<built-in defaults>"))
-			fmt.Fprintf(out, "  socket_name    : %s\n", cfg.SocketName)
-			fmt.Fprintf(out, "  prefix_key     : %s\n", cfg.PrefixKey)
-			fmt.Fprintf(out, "  monitor_silence: %s\n", cfg.MonitorSilence)
-			fmt.Fprintf(out, "  log_level      : %s\n", cfg.LogLevel)
-			fmt.Fprintf(out, "  tmux_bin       : %s\n", orDefault(cfg.TmuxBin, "<resolve via PATH>"))
-			fmt.Fprintf(out, "  claude_bin     : %s\n", orDefault(cfg.ClaudeBin, "<resolve via PATH>"))
-			fmt.Fprintln(out, "")
-			fmt.Fprintln(out, "NOTE: full tmux/claude preflight is not implemented until M1.")
+			cmd.Println("sm4c doctor (M0 skeleton)")
+			cmd.Printf("  config path    : %s\n", orDefault(pf.configPath, "<built-in defaults>"))
+			cmd.Printf("  socket_name    : %s\n", cfg.SocketName)
+			cmd.Printf("  prefix_key     : %s\n", cfg.PrefixKey)
+			cmd.Printf("  monitor_silence: %s\n", cfg.MonitorSilence)
+			cmd.Printf("  log_level      : %s\n", cfg.LogLevel)
+			cmd.Printf("  tmux_bin       : %s\n", orDefault(cfg.TmuxBin, "<resolve via PATH>"))
+			cmd.Printf("  claude_bin     : %s\n", orDefault(cfg.ClaudeBin, "<resolve via PATH>"))
+			cmd.Println("")
+			cmd.Println("NOTE: full tmux/claude preflight is not implemented until M1.")
 			return nil
 		},
 	}

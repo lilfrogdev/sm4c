@@ -50,10 +50,11 @@ func Execute(args []string) int {
 	}
 	// cobra prints its own usage on flag errors; we print other errors
 	// ourselves so we can control formatting and avoid leaking sensitive
-	// content from wrapped errors.
+	// content from wrapped errors. Writes to stderr cannot meaningfully
+	// fail here: if they do, the process is exiting anyway.
 	var flagErr *cobraFlagError
 	if !errors.As(err, &flagErr) {
-		fmt.Fprintf(os.Stderr, "sm4c: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "sm4c: %v\n", err)
 	}
 	return 1
 }
@@ -88,8 +89,8 @@ CLI separately; sm4c does not call Anthropic APIs directly.`,
 		"enable debug logging to stderr. May log potentially sensitive diagnostic info; see SECURITY.md.")
 
 	cmd.AddCommand(
-		newVersionCmd(stdout),
-		newDoctorCmd(stdout, stderr, pf),
+		newVersionCmd(),
+		newDoctorCmd(pf),
 	)
 	return cmd
 }
@@ -100,10 +101,8 @@ CLI separately; sm4c does not call Anthropic APIs directly.`,
 func runRoot(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 	_ = args
 	_ = pf
-	fmt.Fprintln(cmd.OutOrStdout(),
-		"sm4c: TUI is not implemented yet (M1 milestone).")
-	fmt.Fprintln(cmd.OutOrStdout(),
-		"Run `sm4c --help` to see available subcommands, or `sm4c doctor` for a self-check.")
+	cmd.Println("sm4c: TUI is not implemented yet (M1 milestone).")
+	cmd.Println("Run `sm4c --help` to see available subcommands, or `sm4c doctor` for a self-check.")
 	return nil
 }
 
