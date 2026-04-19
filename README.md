@@ -76,13 +76,19 @@ make build
 
 ## Quickstart
 
-_(The full TUI — sidebar, status badges, and in-app session compose flow — lands in M3. This section describes the M2c behavior shipped today.)_
+_(M3a ships a read-only sidebar. Embedded pane rendering, input routing, status badges, and the compose flow land in M3b–M3e.)_
 
 ```bash
-# Open the empty-state TUI. From there:
-#   n         — new claude session (bare; prompts come in M3)
-#   ?         — toggle help
-#   q / ^C    — quit
+# Open the TUI. What you see depends on whether you have any managed sessions:
+#   - none yet → empty-state screen
+#   - one or more → sidebar view listing them (refreshed every 1s)
+# Bindings available in both views:
+#   j / k / ↑ / ↓   move highlight (sidebar only)
+#   enter           attach to highlighted session (exec into tmux)
+#   n               new claude session (bare; compose flow comes in M3e)
+#   ctrl+b          focus toggle (placeholder; activates in M3b)
+#   ?               toggle help
+#   q / ^C          quit
 sm4c
 
 # Shell shortcut: skip the TUI and spawn a session directly with claude args.
@@ -101,13 +107,14 @@ sm4c stop         # stop the sm4c tmux server (destructive)
 
 Anything after `--` is forwarded verbatim to `claude`. If a claude arg does not start with a dash, you can omit the `--` (e.g. `sm4c /help` just works).
 
-To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename. To detach from a live session without killing it, press `Ctrl-b d` (tmux's default detach).
+To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename. To detach from a live session without killing it, press `Ctrl-b d` (tmux's default detach) — in M3a this returns you to the shell, not to the sm4c sidebar. M3b changes that by hosting the claude pane inside sm4c so the sidebar stays visible.
 
-Planned for M3 (not yet shipped):
+Planned for M3b–M3e (not yet shipped):
 
-- Sidebar listing all managed sessions with live status (idle / running / needs input / done) from tmux's monitor flags
-- In-app new-session flow (pick working directory, set session name) replacing today's bare-`claude` stopgap
-- `Ctrl-a`-prefixed keymap for session switching, fuzzy switcher, and `u` to toggle the Unmanaged pane
+- M3b: embedded pane rendering. The highlighted session's output is displayed next to the sidebar in-app, so the sidebar remains visible at all times.
+- M3c: input routing. `Ctrl+B` toggles focus between sidebar and active session; keystrokes flow to claude when the pane has focus; terminal resizes propagate to tmux.
+- M3d: status badges. Live per-session status (idle / running / needs input / done) derived from tmux's `monitor-bell` / `monitor-activity` / `monitor-silence` flags.
+- M3e: compose flow for `n`. Pick the target working directory and set a session name before spawning, replacing today's bare-`claude` stopgap.
 
 ## Security
 

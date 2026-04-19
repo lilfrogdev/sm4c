@@ -2,10 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/lilfrogdev/sm4c/internal/tmuxctl"
 	"github.com/lilfrogdev/sm4c/internal/tui"
 	"github.com/spf13/cobra"
 )
@@ -20,22 +24,16 @@ import (
 //      offer.
 //
 //   2. Bare `sm4c` with no args routes through runTUI (and NOT
-//      through runLaunch's spawn path). The previous M2c behavior
-//      silently spawned claude; this commit explicitly reverses
-//      that, and the regression cost is high enough to pin.
+//      through runLaunch's spawn path).
+//
+//   3. ActionAttachSession from the TUI is realized via execAttach
+//      with the correct tmux attach argv for the reported window ID.
 //
 // All tests stub runTUIProgram so no real terminal, no real tmux,
 // and no real claude are involved.
 
 // TestBareSm4cRoutesToTUI verifies that invoking the root command
-// with zero positional args goes through runTUI, not runLaunch. We
-// use a deliberately bogus --config path so preflight fails before
-// the TUI could ever open, and assert the error envelope is the
-// "config load" one (which only runTUI/runLaunch/setupOneShot emit).
-// The positive signal that we took the TUI branch — not the launch
-// branch — is that runLaunch's later "create claude window" /
-// "exec" errors do NOT appear: runTUI's preflight path short-
-// circuits at setupOneShot.
+// with zero positional args goes through runTUI, not runLaunch.
 func TestBareSm4cRoutesToTUI(t *testing.T) {
 	t.Parallel()
 
@@ -62,22 +60,12 @@ func TestBareSm4cRoutesToTUI(t *testing.T) {
 
 // TestRunTUIRefusesWhenClaudeMissing pins the fast-fail contract:
 // when preflight cannot resolve claude, runTUI MUST error out with
-// a message that names claude BEFORE the TUI is opened. Without this
-// check, a user with a broken install would see their terminal
-// flash and die when the TUI tries to paint — a confusing failure
-// mode that a CLI error sidesteps entirely.
-//
-// We stub runTUIProgram to a recorder so we can positively confirm
-// the TUI runtime was NOT entered. If the stub ever runs, the
-// preflight ordering has regressed.
+// a message that names claude BEFORE the TUI is opened.
 func TestRunTUIRefusesWhenClaudeMissing(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	cfgPath := dir + "/sm4c.toml"
-	// Real tmux so tmux resolution passes; bogus claude so the
-	// claude-resolution step is the thing that fails. 0o600 keeps
-	// config.Load's permission check happy.
 	if err := os.WriteFile(cfgPath, []byte(`
 tmux_bin = "/bin/sh"
 claude_bin = "/sm4c/tests/no/such/claude"
@@ -87,7 +75,7 @@ claude_bin = "/sm4c/tests/no/such/claude"
 
 	calls := 0
 	orig := runTUIProgram
-	runTUIProgram = func(_ *cobra.Command) (tui.Model, error) {
+	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot) (tui.Model, error) {
 		calls++
 		return tui.Model{}, nil
 	}
@@ -106,4 +94,109 @@ claude_bin = "/sm4c/tests/no/such/claude"
 	if calls != 0 {
 		t.Fatalf("runTUIProgram was called despite preflight failure (calls=%d)", calls)
 	}
+}
+
+// TestTUIAttachActionExecsCorrectWindow drives the ActionAttachSession
+// branch end-to-end by substituting both runTUIProgram (to return a
+// Model pre-set to ActionAttachSession with a known window ID) and
+// execAttach (to record the argv instead of replacing the process).
+// We construct the Model by driving the real tui.Model through
+// Init() and a synthetic Enter keystroke — that way the test catches
+// regressions in either the TUI's Update logic OR the CLI's
+// realization path, not just one side.
+func TestTUIAttachActionExecsCorrectWindow(t *testing.T) {
+	// Not t.Parallel(): we swap package-level runTUIProgram and
+	// execAttach, which would race with any other test doing the
+	// same. Keep this test serial.
+
+	dir := t.TempDir()
+	cfgPath := dir + "/sm4c.toml"
+	if err := os.WriteFile(cfgPath, []byte(`
+tmux_bin = "/bin/sh"
+claude_bin = "/bin/sh"
+`), 0o600); err != nil {
+		t.Fatalf("write cfg: %v", err)
+	}
+
+	var recordedArgv []string
+	origExec := execAttach
+	execAttach = func(argv []string) error {
+		recordedArgv = argv
+		// Return a harmless error so runTUI surfaces cleanly and
+		// we don't have to fake syscall.Exec's no-return semantics.
+		return errors.New("test stub: not actually exec'ing")
+	}
+	t.Cleanup(func() { execAttach = origExec })
+
+	// `go test` detaches stdin, so the real TTY check would refuse
+	// to open the TUI. Override the seam for this test.
+	origTTY := interactiveStdin
+	interactiveStdin = func() bool { return true }
+	t.Cleanup(func() { interactiveStdin = origTTY })
+
+	origTUI := runTUIProgram
+	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot) (tui.Model, error) {
+		return buildAttachModel(t, "@7"), nil
+	}
+	t.Cleanup(func() { runTUIProgram = origTUI })
+
+	var out, errb bytes.Buffer
+	cmd := newRootCmd(&out, &errb)
+	cmd.SetArgs([]string{"--config", cfgPath})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected stubbed execAttach error to propagate")
+	}
+	if !strings.Contains(err.Error(), "test stub") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(recordedArgv) < 2 {
+		t.Fatalf("execAttach received %d-arg argv; expected at least [tmux, attach-session, ...]", len(recordedArgv))
+	}
+	joined := strings.Join(recordedArgv, " ")
+	if !strings.Contains(joined, "@7") {
+		t.Fatalf("execAttach argv does not reference target window @7: %v", recordedArgv)
+	}
+}
+
+// buildAttachModel drives a real tui.Model through its public API
+// until it reports ActionAttachSession on id. We deliberately use
+// only exported symbols so the test catches any regression in the
+// TUI's attach-commit path as part of the CLI wiring test.
+func buildAttachModel(t *testing.T, id string) tui.Model {
+	t.Helper()
+
+	lister := func(context.Context) ([]tui.Session, error) {
+		return []tui.Session{{WindowID: id, Name: "t"}}, nil
+	}
+	m := tui.NewModel(lister, 0)
+
+	// Init emits a fetch tea.Cmd; running it synchronously gives us
+	// the sessionsMsg value, which Update then folds into the
+	// Model's sessions slice.
+	initCmd := m.Init()
+	if initCmd == nil {
+		t.Fatal("buildAttachModel: Init returned nil cmd")
+	}
+	msg := initCmd()
+	next, _ := m.Update(msg)
+	final, ok := next.(tui.Model)
+	if !ok {
+		t.Fatalf("Update(sessionsMsg) returned %T, expected tui.Model", next)
+	}
+
+	enterMsg := tea.KeyMsg{Type: tea.KeyEnter}
+	after, _ := final.Update(enterMsg)
+	got, ok := after.(tui.Model)
+	if !ok {
+		t.Fatalf("Update(enter) returned %T, expected tui.Model", after)
+	}
+	if got.Action() != tui.ActionAttachSession {
+		t.Fatalf("post-enter Action = %v, want ActionAttachSession", got.Action())
+	}
+	if w := got.SelectedWindowID(); w != id {
+		t.Fatalf("post-enter SelectedWindowID = %q, want %q", w, id)
+	}
+	return got
 }

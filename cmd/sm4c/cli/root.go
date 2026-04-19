@@ -73,9 +73,13 @@ server and surfaces per-session status.
 sm4c is not affiliated with Anthropic. You must install the official claude
 CLI separately; sm4c does not call Anthropic APIs directly.
 
-Running sm4c with no arguments opens the empty-state TUI. From there,
-press ` + "`n`" + ` to start a new claude session, ` + "`?`" + ` for the
-full keymap, and ` + "`q`" + ` or ` + "`Ctrl+C`" + ` to exit.
+Running sm4c with no arguments opens the TUI. If no managed sessions
+exist yet, you land on the empty-state view; once one or more
+sessions are live, the TUI shows a sidebar listing them. From there,
+use ` + "`j`" + `/` + "`k`" + ` (or arrows) to move the highlight,
+` + "`Enter`" + ` to attach to the highlighted session, ` + "`n`" + `
+to start a new session, ` + "`?`" + ` for the full keymap, and
+` + "`q`" + ` or ` + "`Ctrl+C`" + ` to exit.
 
 Running sm4c with positional arguments skips the TUI and spawns a new
 claude session directly with those arguments, so ` + "`sm4c /help`" + `
@@ -85,7 +89,7 @@ will try to parse them as sm4c flags.
 
 Subcommands (ls, status, stop, doctor, version) are read-mostly and
 never spawn a claude session.`,
-		Example: `  sm4c                           # open the empty-state TUI
+		Example: `  sm4c                           # open the TUI (empty-state or sidebar)
   sm4c /help                     # spawn a session with /help as first input
   sm4c -- -n my-session          # spawn with claude flags
   sm4c ls                        # list managed sessions

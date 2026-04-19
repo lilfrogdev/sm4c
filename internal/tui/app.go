@@ -2,6 +2,7 @@ package tui
 
 import (
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -27,33 +28,101 @@ const (
 	// does not carry the claude binary path, argv, or socket name —
 	// the caller already has all that from preflight / config.
 	ActionNewSession
+
+	// ActionAttachSession signals "the user highlighted a session in
+	// the sidebar and pressed Enter; please hand the terminal to
+	// that tmux window." The target window ID is read off the Model
+	// via SelectedWindowID() — passing it through Action would make
+	// the enum carry state, which Bubble Tea's message model
+	// disallows.
+	//
+	// In M3a this branch still exec-attaches via tmux; once M3b
+	// lands the embedded pane, cmd/sm4c/cli will realize this
+	// intent by selecting the window in the hosted viewport instead
+	// of exec'ing. The Model stays oblivious to which of the two
+	// it is.
+	ActionAttachSession
 )
 
-// Model is the Bubble Tea model backing the empty-state view. It is
-// deliberately anemic in this milestone; M3 will grow it into a real
-// sidebar + per-session status machine. Every field here has a plan
-// for when it becomes useful:
+// Model is the Bubble Tea model backing the sidebar + empty-state
+// view. Its fields split into two groups: the UX state (help,
+// quitting, action) which decides what to render and what intent to
+// report on exit, and the session-list state (lister, pollInterval,
+// sessions, highlight, ready, listErr, selectedWindowID) which backs
+// the sidebar once managed windows show up.
 //
-//   - help      toggled by `?`; shows the full keybind list.
-//   - quitting  set when the user pressed a quit key; causes Update
-//               to return tea.Quit on the NEXT step. Separating
-//               "set intent" from "tell bubbletea to quit" in two
-//               Update returns is what makes the unit tests able to
-//               observe ActionNone even without running the runtime.
-//   - action    the intent the caller should realize once tea.Quit
-//               flushes the runtime. Exposed via Model.Action().
+//   - help              toggled by `?`; shows the full keybind list.
+//   - quitting          set when the user pressed a quit key; causes
+//                       Update to return tea.Quit on the NEXT step.
+//                       Separating "set intent" from "tell bubbletea
+//                       to quit" in two Update returns is what makes
+//                       the unit tests able to observe ActionNone
+//                       even without running the runtime.
+//   - action            the intent the caller should realize once
+//                       tea.Quit flushes the runtime. Exposed via
+//                       Model.Action().
+//   - lister            injected SessionLister. Nil means "no live
+//                       data": the Model renders the empty state,
+//                       Init returns no startup cmd, and the poll
+//                       loop is inert. This is how unit tests that
+//                       care only about key handling keep their
+//                       fixtures minimal.
+//   - pollInterval      how often to re-fetch via lister. Honored
+//                       only when lister is non-nil and the value
+//                       is positive.
+//   - sessions          last snapshot returned by lister. Treated as
+//                       authoritative for rendering; Model does not
+//                       mutate it between fetches.
+//   - highlight         zero-based index into sessions that the user
+//                       is currently cursoring over. Clamped by the
+//                       sessionsMsg handler so it always references
+//                       a valid row (or is -1 when sessions is empty).
+//   - ready             true once the first sessionsMsg has been
+//                       processed. Before that, the view short-
+//                       circuits to the empty state so a slow first
+//                       fetch doesn't paint a stale "N sessions"
+//                       line.
+//   - listErr           last fetch error, if any. Surfaced as a
+//                       faint single-line notice in the sidebar.
+//                       Does not block rendering of stale sessions.
+//   - selectedWindowID  set by the Enter key when the user commits
+//                       an attach intent. Exposed via
+//                       SelectedWindowID() so the caller can build
+//                       the tmux attach argv.
 type Model struct {
 	help     bool
 	quitting bool
 	action   Action
+
+	lister       SessionLister
+	pollInterval time.Duration
+
+	sessions         []Session
+	highlight        int
+	ready            bool
+	listErr          error
+	selectedWindowID string
 }
 
-// NewModel constructs a fresh Model. We don't take any dependencies
-// yet (no tmuxctl handle, no config) because the empty-state TUI has
-// no live data to render. When M3 adds the sidebar, it'll accept a
-// snapshot of managed windows and a refresh channel.
-func NewModel() Model {
-	return Model{}
+// NewModel constructs a fresh Model. A nil lister is explicitly
+// supported — it keeps the Model in the empty-state view with no
+// polling, which is the shape every pre-M3 unit test already
+// expects. Production callers (cmd/sm4c/cli/tui.go) pass a lister
+// that wraps tmuxctl.OneShot.ListWindows and filters to managed
+// windows.
+//
+// pollInterval is honored only when it's positive; zero or negative
+// means "fetch once at Init and never again", which is useful for
+// tests that want exactly one fetch event.
+func NewModel(lister SessionLister, pollInterval time.Duration) Model {
+	if pollInterval < 0 {
+		pollInterval = 0
+	}
+	return Model{
+		lister:       lister,
+		pollInterval: pollInterval,
+		highlight:    -1,
+	}
 }
 
 // Action reports what the caller should do after the program exits.
@@ -63,10 +132,21 @@ func NewModel() Model {
 // field is only authoritative once tea.Quit has fired.
 func (m Model) Action() Action { return m.action }
 
-// Init is the Bubble Tea entry point. We have no startup work — no
-// timers, no subprocess probes, nothing to stream — so we return nil.
-// (tea.Cmd of nil is the canonical "do nothing" value.)
-func (m Model) Init() tea.Cmd { return nil }
+// SelectedWindowID reports the tmux window ID the user committed to
+// via Enter. It is only meaningful when Action() == ActionAttachSession;
+// for any other Action the caller MUST NOT read it (it'll be the empty
+// string). The ID is an opaque tmux token like "@3" — the TUI does
+// not validate or parse it.
+func (m Model) SelectedWindowID() string { return m.selectedWindowID }
+
+// Init is the Bubble Tea entry point. When a SessionLister is wired,
+// we kick off the first fetch immediately so the sidebar paints real
+// data on the first frame instead of "no sessions" flashing for a
+// tick. When no lister is configured (tests, or a deliberately inert
+// Model) Init returns nil — no work, no messages, no tick chain.
+func (m Model) Init() tea.Cmd {
+	return m.fetchSessions()
+}
 
 // Update is the pure state-transition function. The only messages
 // the empty-state view reacts to today are key presses and window
@@ -83,8 +163,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+	case sessionsMsg:
+		return m.handleSessions(msg), m.scheduleNextPoll()
+	case pollTickMsg:
+		// A tick's only job is to kick off the next fetch. The fetch
+		// itself, once complete, will schedule the following tick.
+		// This keeps the cadence strictly serial — no overlap between
+		// a slow fetch and the next ticker firing.
+		return m, m.fetchSessions()
 	}
 	return m, nil
+}
+
+// handleSessions folds the freshest snapshot into the Model, clamping
+// the highlight so j/k navigation stays on a valid row across
+// insertions (new session created in another terminal) and deletions
+// (a session closed while we were polling). Empty lister results and
+// nil returns are normalized to a nil slice + highlight = -1, which
+// makes the "no sessions" branch in View a single len-check.
+func (m Model) handleSessions(msg sessionsMsg) Model {
+	m.ready = true
+	m.listErr = msg.err
+	m.sessions = msg.sessions
+	switch {
+	case len(m.sessions) == 0:
+		m.highlight = -1
+	case m.highlight < 0:
+		m.highlight = 0
+	case m.highlight >= len(m.sessions):
+		m.highlight = len(m.sessions) - 1
+	}
+	return m
 }
 
 // handleKey is factored out of Update so the unit tests can exercise
@@ -104,16 +213,54 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Signal "spawn a new session" and exit. The caller does the
 		// actual tmux/exec work; this keeps Update free of I/O.
 		//
-		// TODO (M3): this is the placeholder flow. The real design
-		// is a small sub-view that prompts for a target working
-		// directory and an optional session name (claude's `-n`),
-		// then realizes it. Until M3 lands, `n` here is equivalent
-		// to the shell shortcut `sm4c` with no args — i.e. a bare
-		// claude launch. That keeps the behavior useful without
-		// committing to a half-built form-field UX we'd throw away.
+		// TODO (M3e): replace this placeholder with the real compose
+		// sub-view (cwd picker + optional session name + args). For
+		// M3a, pressing `n` is still equivalent to `sm4c` with no
+		// args under the previous M2c behavior — a bare claude
+		// launch in the process's current working directory. That
+		// keeps the key useful in the sidebar without committing
+		// to a half-built form UX we'd throw away.
 		m.action = ActionNewSession
 		m.quitting = true
 		return m, tea.Quit
+
+	case "enter":
+		// Commit the highlighted session as the attach target. When
+		// the highlight is out of range (no sessions, or the list is
+		// empty) Enter is a no-op: we do NOT want to emit an
+		// ActionAttachSession with an empty window ID, because
+		// cmd/sm4c/cli would then try to build a tmux argv around
+		// an empty token.
+		if m.highlight < 0 || m.highlight >= len(m.sessions) {
+			return m, nil
+		}
+		m.selectedWindowID = m.sessions[m.highlight].WindowID
+		m.action = ActionAttachSession
+		m.quitting = true
+		return m, tea.Quit
+
+	case "j", "down":
+		// Move highlight down, no wrap. A no-wrap bottom is the
+		// same convention tmux's choose-tree and vim's :ls use —
+		// wrapping makes skimming a list feel disorienting.
+		if m.highlight < len(m.sessions)-1 {
+			m.highlight++
+		}
+		return m, nil
+
+	case "k", "up":
+		if m.highlight > 0 {
+			m.highlight--
+		}
+		return m, nil
+
+	case "ctrl+b":
+		// Placeholder for M3b's focus toggle. We pin the binding
+		// now so muscle memory carries into M3b without a keymap
+		// rewrite, but Update is a no-op here. If it ever does
+		// become meaningful the help text in bindings[] should
+		// lose the " (M3b)" suffix at the same commit.
+		return m, nil
 
 	case "?":
 		// Toggle the expanded help block. Unlike quit/new, this does
@@ -124,25 +271,57 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View renders the empty-state screen. It is called on every
-// re-render; returning the same bytes twice is cheap and by design
-// (no animations, no transitions).
+// View renders the current screen. It is called on every re-render;
+// returning the same bytes twice is cheap and by design. View
+// dispatches between two layouts based on Model state:
+//
+//   - Empty state (no sessions, or first fetch has not returned yet)
+//     keeps the M2c layout: title, hint, key bar, optional help,
+//     disclaimer footer.
+//
+//   - Sidebar (len(sessions) > 0, post-first-fetch) lists each
+//     managed window one per row with the active marker, name, and
+//     window ID. M3b will widen this layout to include the hosted
+//     pane on the right; until then, the sidebar is full-width.
+//
+// Both layouts end in a single newline so Bubble Tea's differ can
+// line-diff renders cleanly.
 func (m Model) View() string {
 	if m.quitting {
 		// Bubble Tea keeps View on screen briefly after tea.Quit
 		// schedules; returning an empty string avoids a flicker of
 		// stale content before the terminal is handed over to
-		// tmux (ActionNewSession) or back to the shell
-		// (ActionNone).
+		// tmux (ActionAttachSession / ActionNewSession) or back to
+		// the shell (ActionNone).
 		return ""
 	}
 
+	if m.ready && len(m.sessions) > 0 {
+		return m.renderSidebarView()
+	}
+	return m.renderEmptyView()
+}
+
+// renderEmptyView is the M2c "no active sessions" pane. We reach it
+// when either the first fetch has not returned (ready == false) or
+// the fetch returned zero managed sessions.
+func (m Model) renderEmptyView() string {
 	var sections []string
 
 	sections = append(sections, titleStyle.Render("sm4c"))
 	sections = append(sections, hintStyle.Render("no active sessions"))
 	sections = append(sections, "")
 	sections = append(sections, m.renderKeys())
+
+	if m.listErr != nil {
+		// A fetch error on the empty path is usually a preflight
+		// issue (e.g. tmux socket permissions flipped mid-run). We
+		// surface it faintly so the user sees a clue without the
+		// sidebar becoming a stack trace.
+		sections = append(sections, "")
+		sections = append(sections, hintStyle.Render(
+			"session fetch error: "+m.listErr.Error()))
+	}
 
 	if m.help {
 		sections = append(sections, "")
@@ -167,11 +346,17 @@ type keybind struct {
 	desc string
 }
 
-// bindings is the authoritative list of keys the empty-state view
-// advertises. When M3 adds more, they go here so the render paths
-// and the help view stay in sync automatically.
+// bindings is the authoritative list of keys the sidebar view
+// advertises. Both renderKeys and renderHelp iterate this slice, so
+// any key added here appears in the compact bar AND the expanded
+// help without further changes. Per-milestone keys carry a suffix
+// like "(M3b)" until their behavior lands; dropping the suffix is
+// the explicit checkpoint for enabling the binding.
 var bindings = []keybind{
+	{"j/k", "move highlight"},
+	{"enter", "attach to session"},
 	{"n", "new session"},
+	{"ctrl+b", "focus toggle (M3b)"},
 	{"?", "toggle help"},
 	{"q", "quit"},
 }
@@ -203,25 +388,130 @@ func (m Model) renderHelp() string {
 	return strings.Join(lines, "\n")
 }
 
+// renderSidebarView paints the sessions-list layout. M3a is
+// full-width; M3b will split this into a left-column sidebar + right-
+// column hosted pane. We keep the renderer isolated so that split
+// can land without touching the empty-state path.
+func (m Model) renderSidebarView() string {
+	var sections []string
+
+	header := titleStyle.Render("sm4c") + hintStyle.Render(
+		" — "+pluralize(len(m.sessions), "session", "sessions"),
+	)
+	sections = append(sections, header)
+	sections = append(sections, "")
+	sections = append(sections, m.renderSessionList())
+	sections = append(sections, "")
+	sections = append(sections, m.renderKeys())
+
+	if m.listErr != nil {
+		sections = append(sections, "")
+		sections = append(sections, hintStyle.Render(
+			"session fetch error: "+m.listErr.Error()))
+	}
+	if m.help {
+		sections = append(sections, "")
+		sections = append(sections, m.renderHelp())
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, sections...) + "\n"
+}
+
+// renderSessionList emits one row per session. The row format is:
+//
+//	<active-marker> <name> <window-id>
+//
+// where <active-marker> is a two-column cell ("● " for the tmux-
+// active window, "  " otherwise), <name> is the sanitized window
+// title, and <window-id> is the opaque tmux ID rendered faintly so
+// the eye treats it as metadata. The highlighted row is painted in
+// reverse video via rowStyle, which is the only "color" decision —
+// and it uses the terminal's native reverse attribute, not a hex
+// color, per the no-theming rule.
+func (m Model) renderSessionList() string {
+	rows := make([]string, 0, len(m.sessions))
+	for i, s := range m.sessions {
+		marker := "  "
+		if s.Active {
+			marker = "● "
+		}
+		name := s.Name
+		if name == "" {
+			// tmux always has a window name; an empty one would
+			// indicate a parser bug in tmuxctl. Render a sentinel
+			// so the sidebar doesn't become an empty column.
+			name = "(unnamed)"
+		}
+		row := marker + name + "  " + hintStyle.Render(s.WindowID)
+		if i == m.highlight {
+			row = rowHighlightStyle.Render(row)
+		}
+		rows = append(rows, row)
+	}
+	return strings.Join(rows, "\n")
+}
+
+// pluralize is a tiny helper kept inline so the sidebar header's
+// grammar ("1 session" vs. "3 sessions") reads naturally. It lives
+// in this file rather than style.go because it's a layout concern,
+// not a style concern.
+func pluralize(n int, singular, plural string) string {
+	if n == 1 {
+		return "1 " + singular
+	}
+	return intToString(n) + " " + plural
+}
+
+// intToString avoids pulling strconv into a two-line helper. The
+// sessions count is bounded by how many windows a single tmux server
+// can hold in practice (low thousands on any real machine), so a
+// simple base-10 builder is fine.
+func intToString(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	var digits []byte
+	for n > 0 {
+		digits = append([]byte{'0' + byte(n%10)}, digits...)
+		n /= 10
+	}
+	if neg {
+		return "-" + string(digits)
+	}
+	return string(digits)
+}
+
 // Run starts a Bubble Tea program with this Model, using the given
 // input/output writers. `in` is normally os.Stdin and `out` os.Stdout;
 // tests pass pipes so they can drive keystrokes programmatically.
 //
-// We intentionally do NOT use tea.WithAltScreen: the empty-state view
-// is a one-pager and using alt-screen would produce a confusing
-// "terminal flashed, then flashed back" effect on exit. When M3 adds
-// the sidebar / pane layout, that decision will be revisited in the
-// same commit as the layout change.
+// We use tea.WithAltScreen so the sidebar can redraw on each poll
+// without polluting scrollback. Alt-screen does produce a visible
+// "switch in, switch out" on entry/exit, which matches every other
+// full-screen TUI (vim, less, htop). For the bare empty-state case
+// the flash is brief; once the user has even one active session the
+// alt-screen semantics are clearly the right choice.
 //
 // On a successful run, Run returns the final Model so the caller can
-// inspect Action(). On any runtime error (TTY setup, input stream
-// closed unexpectedly) the error is returned and Action is ignored.
+// inspect Action() and SelectedWindowID(). On any runtime error (TTY
+// setup, input stream closed unexpectedly) the error is returned and
+// the intents are ignored.
 func Run(in interface {
 	Read(p []byte) (n int, err error)
 }, out interface {
 	Write(p []byte) (n int, err error)
-}) (Model, error) {
-	p := tea.NewProgram(NewModel(), tea.WithInput(in), tea.WithOutput(out))
+}, lister SessionLister, pollInterval time.Duration) (Model, error) {
+	p := tea.NewProgram(
+		NewModel(lister, pollInterval),
+		tea.WithInput(in),
+		tea.WithOutput(out),
+		tea.WithAltScreen(),
+	)
 	final, err := p.Run()
 	if err != nil {
 		return Model{}, err

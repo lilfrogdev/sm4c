@@ -47,4 +47,13 @@ var (
 	// keeps it from stealing attention from the empty-state message
 	// above it.
 	footerStyle = lipgloss.NewStyle().Faint(true)
+
+	// rowHighlightStyle marks the sidebar row the user is cursoring
+	// over. Reverse is our only reliable "stands out against any
+	// theme" attribute — it guarantees legibility on light terminals
+	// AND dark terminals AND high-contrast accessibility themes
+	// without us picking a color. The whole row (not just the key)
+	// is rendered this way so the highlight is obvious from across
+	// the room.
+	rowHighlightStyle = lipgloss.NewStyle().Reverse(true)
 )
