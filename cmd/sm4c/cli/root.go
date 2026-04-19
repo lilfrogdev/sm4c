@@ -91,6 +91,9 @@ CLI separately; sm4c does not call Anthropic APIs directly.`,
 	cmd.AddCommand(
 		newVersionCmd(),
 		newDoctorCmd(pf),
+		newLsCmd(pf),
+		newStatusCmd(pf),
+		newStopCmd(pf),
 	)
 	return cmd
 }
