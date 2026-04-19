@@ -349,21 +349,27 @@ func TestScheduleNextPollNilWithoutLister(t *testing.T) {
 	}
 }
 
-func TestViewRendersEmptyStateBeforeFirstFetch(t *testing.T) {
+func TestViewBeforeFirstFetchShowsEmptyPlaceholder(t *testing.T) {
 	t.Parallel()
-	// A model with a lister but no fetch result yet MUST stay in
-	// the empty-state view: rendering "0 sessions" before we know
-	// would flash confusingly if a session did exist.
+	// A model with a lister but no fetch result yet MUST render
+	// the sidebar layout with an empty-list placeholder, not a
+	// speculative "0 sessions" count — a slow first fetch
+	// shouldn't flash confusing text if a session turns out to
+	// exist.
 	m := NewModel(stubLister(nil, nil), 0)
 	out := m.View()
-	mustContain(t, out, "no active sessions")
+	mustContain(t, out, "no sessions yet")
 }
 
-func TestViewRendersAllBindingsInEmptyState(t *testing.T) {
+func TestViewEmptyStateRendersSidebarChromeAndBindings(t *testing.T) {
 	t.Parallel()
+	// The sidebar is always visible. With zero sessions we must
+	// still see the title, the key bar for every binding, and
+	// the "press n to start one" empty-state placeholder.
 	out := emptyModel().View()
 	mustContain(t, out, "sm4c")
-	mustContain(t, out, "no active sessions")
+	mustContain(t, out, "no sessions yet")
+	mustContain(t, out, "press n")
 	for _, b := range bindings {
 		mustContain(t, out, b.key)
 		mustContain(t, out, b.desc)
@@ -386,10 +392,25 @@ func TestViewRendersSidebarWhenSessionsPresent(t *testing.T) {
 	// Bindings that only make sense in the sidebar should still be
 	// advertised in the key bar.
 	mustContain(t, out, "attach to session")
-	// Empty-state hint must NOT appear — that view is mutually
-	// exclusive with the sidebar view.
-	if strings.Contains(out, "no active sessions") {
-		t.Fatalf("sidebar view leaked empty-state hint:\n%s", out)
+	// Empty-state placeholder MUST NOT appear when rows exist —
+	// it would be contradictory and steal vertical space.
+	if strings.Contains(out, "no sessions yet") {
+		t.Fatalf("sidebar with rows leaked empty-state placeholder:\n%s", out)
+	}
+}
+
+func TestViewEmptyStateShowsDisclaimerFooter(t *testing.T) {
+	t.Parallel()
+	// The "not affiliated with Anthropic" disclaimer is scoped to
+	// the empty path; a user with live sessions has demonstrated
+	// they understand what sm4c is. Pin both sides of the rule so
+	// this distinction doesn't silently regress.
+	empty := emptyModel().View()
+	mustContain(t, empty, "not affiliated with Anthropic")
+
+	full := withSessions([]Session{{WindowID: "@1", Name: "x"}}).View()
+	if strings.Contains(full, "not affiliated with Anthropic") {
+		t.Fatalf("sidebar with rows should not render disclaimer:\n%s", full)
 	}
 }
 

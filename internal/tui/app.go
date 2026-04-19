@@ -272,20 +272,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // View renders the current screen. It is called on every re-render;
-// returning the same bytes twice is cheap and by design. View
-// dispatches between two layouts based on Model state:
+// returning the same bytes twice is cheap and by design.
 //
-//   - Empty state (no sessions, or first fetch has not returned yet)
-//     keeps the M2c layout: title, hint, key bar, optional help,
-//     disclaimer footer.
+// There is ONE layout — the sidebar — regardless of how many
+// sessions are live. When sessions is empty, the list area shows a
+// faint "press n to start one" placeholder; when sessions is
+// non-empty, it shows one row per window. This keeps the sidebar
+// visible at all times (the user's explicit design request) and
+// avoids a layout jump the moment the first session appears.
 //
-//   - Sidebar (len(sessions) > 0, post-first-fetch) lists each
-//     managed window one per row with the active marker, name, and
-//     window ID. M3b will widen this layout to include the hosted
-//     pane on the right; until then, the sidebar is full-width.
-//
-// Both layouts end in a single newline so Bubble Tea's differ can
-// line-diff renders cleanly.
+// M3b will widen this layout into a left-column sidebar + right-
+// column hosted pane. Until then, the sidebar is full-width and
+// the right column is conceptually present-but-empty.
 func (m Model) View() string {
 	if m.quitting {
 		// Bubble Tea keeps View on screen briefly after tea.Quit
@@ -295,46 +293,7 @@ func (m Model) View() string {
 		// the shell (ActionNone).
 		return ""
 	}
-
-	if m.ready && len(m.sessions) > 0 {
-		return m.renderSidebarView()
-	}
-	return m.renderEmptyView()
-}
-
-// renderEmptyView is the M2c "no active sessions" pane. We reach it
-// when either the first fetch has not returned (ready == false) or
-// the fetch returned zero managed sessions.
-func (m Model) renderEmptyView() string {
-	var sections []string
-
-	sections = append(sections, titleStyle.Render("sm4c"))
-	sections = append(sections, hintStyle.Render("no active sessions"))
-	sections = append(sections, "")
-	sections = append(sections, m.renderKeys())
-
-	if m.listErr != nil {
-		// A fetch error on the empty path is usually a preflight
-		// issue (e.g. tmux socket permissions flipped mid-run). We
-		// surface it faintly so the user sees a clue without the
-		// sidebar becoming a stack trace.
-		sections = append(sections, "")
-		sections = append(sections, hintStyle.Render(
-			"session fetch error: "+m.listErr.Error()))
-	}
-
-	if m.help {
-		sections = append(sections, "")
-		sections = append(sections, m.renderHelp())
-	}
-
-	sections = append(sections, "")
-	sections = append(sections, footerStyle.Render(
-		"sm4c is not affiliated with Anthropic. "+
-			"You must install the official claude CLI separately.",
-	))
-
-	return lipgloss.JoinVertical(lipgloss.Left, sections...) + "\n"
+	return m.renderSidebarView()
 }
 
 // keybind is a row of ("key name", "what it does"). Kept as a flat
@@ -388,23 +347,29 @@ func (m Model) renderHelp() string {
 	return strings.Join(lines, "\n")
 }
 
-// renderSidebarView paints the sessions-list layout. M3a is
-// full-width; M3b will split this into a left-column sidebar + right-
-// column hosted pane. We keep the renderer isolated so that split
-// can land without touching the empty-state path.
+// renderSidebarView paints the single unified layout: title bar,
+// session list (or placeholder when empty), key bar, optional
+// error/help blocks, and — only when the list is empty — the
+// "not affiliated with Anthropic" disclaimer. The disclaimer is
+// scoped to the empty path because a user with live sessions has
+// already demonstrated they know what sm4c is and doesn't benefit
+// from the footer nudge anymore; showing it unconditionally would
+// waste vertical space in the one state where the sidebar actually
+// has rows to render.
 func (m Model) renderSidebarView() string {
 	var sections []string
 
-	header := titleStyle.Render("sm4c") + hintStyle.Render(
-		" — "+pluralize(len(m.sessions), "session", "sessions"),
-	)
-	sections = append(sections, header)
+	sections = append(sections, m.renderHeader())
 	sections = append(sections, "")
 	sections = append(sections, m.renderSessionList())
 	sections = append(sections, "")
 	sections = append(sections, m.renderKeys())
 
 	if m.listErr != nil {
+		// A fetch error is usually a preflight issue (e.g. tmux
+		// socket permissions flipped mid-run). We surface it
+		// faintly so the user sees a clue without the sidebar
+		// becoming a stack trace.
 		sections = append(sections, "")
 		sections = append(sections, hintStyle.Render(
 			"session fetch error: "+m.listErr.Error()))
@@ -413,8 +378,28 @@ func (m Model) renderSidebarView() string {
 		sections = append(sections, "")
 		sections = append(sections, m.renderHelp())
 	}
+	if len(m.sessions) == 0 {
+		sections = append(sections, "")
+		sections = append(sections, footerStyle.Render(
+			"sm4c is not affiliated with Anthropic. "+
+				"You must install the official claude CLI separately.",
+		))
+	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, sections...) + "\n"
+}
+
+// renderHeader builds the title bar. When sessions are present we
+// append a faint pluralized count; when empty we keep the header
+// minimal so the eye is drawn to the empty-state hint below it
+// rather than to a confusing "0 sessions" label.
+func (m Model) renderHeader() string {
+	if len(m.sessions) == 0 {
+		return titleStyle.Render("sm4c")
+	}
+	return titleStyle.Render("sm4c") + hintStyle.Render(
+		" — "+pluralize(len(m.sessions), "session", "sessions"),
+	)
 }
 
 // renderSessionList emits one row per session. The row format is:
@@ -425,10 +410,18 @@ func (m Model) renderSidebarView() string {
 // active window, "  " otherwise), <name> is the sanitized window
 // title, and <window-id> is the opaque tmux ID rendered faintly so
 // the eye treats it as metadata. The highlighted row is painted in
-// reverse video via rowStyle, which is the only "color" decision —
-// and it uses the terminal's native reverse attribute, not a hex
-// color, per the no-theming rule.
+// reverse video via rowHighlightStyle — the only "color" decision —
+// using the terminal's native reverse attribute, not a hex color,
+// per the no-theming rule.
+//
+// When the sessions slice is empty we emit a single faint
+// placeholder row so the sidebar stays visible with its key bar,
+// rather than collapsing to a header + footer. This is the
+// "sidebar is always present" design constraint made literal.
 func (m Model) renderSessionList() string {
+	if len(m.sessions) == 0 {
+		return hintStyle.Render("  no sessions yet — press n to start one")
+	}
 	rows := make([]string, 0, len(m.sessions))
 	for i, s := range m.sessions {
 		marker := "  "

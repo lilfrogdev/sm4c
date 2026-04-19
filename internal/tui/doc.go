@@ -2,19 +2,33 @@
 //
 // Scope in this milestone (M3a):
 //
-//   - Two views, selected automatically by Model state:
+//   - One unified sidebar layout, shown at all times:
 //
-//       * Empty state — no managed sessions yet (or the first fetch
-//         has not returned). Same layout as M2c: title, hint, key
-//         bar, optional help, disclaimer footer.
+//       * Title bar — "sm4c", with a faint pluralized session count
+//         appended when any sessions exist.
 //
-//       * Sidebar — one row per managed session with an active-
-//         marker column, name column, and faint window-id column.
-//         The highlighted row is painted in reverse video. The
-//         sidebar is full-width in M3a; M3b will split the layout
-//         into a left-column sidebar and a right-column hosted
-//         pane so the sidebar remains visible while a session is
-//         live.
+//       * Session list — one row per managed session with an
+//         active-marker column, name column, and faint window-id
+//         column. The highlighted row is painted in reverse video.
+//         When no sessions exist, the list area shows a single
+//         faint placeholder ("no sessions yet — press n to start
+//         one") so the sidebar never collapses to a bare header.
+//
+//       * Key bar — the full binding list, always visible so the
+//         user can see what's available regardless of session
+//         count.
+//
+//       * Disclaimer footer — "sm4c is not affiliated with
+//         Anthropic…" — rendered ONLY in the empty state, where a
+//         first-time user benefits from the context. Users with
+//         live sessions have already internalized what sm4c is and
+//         would just see it as clutter.
+//
+//     The sidebar is full-width in M3a; M3b will split the layout
+//     into a left-column sidebar and a right-column hosted pane so
+//     the sidebar remains visible while a session is live. Keeping
+//     the empty-state and populated states on the SAME layout
+//     avoids a jarring reflow the moment the first session appears.
 //
 //   - Key bindings:
 //
