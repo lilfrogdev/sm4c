@@ -102,6 +102,15 @@ type Model struct {
 	ready            bool
 	listErr          error
 	selectedWindowID string
+
+	// width / height carry the last tea.WindowSizeMsg. They are 0
+	// until the Bubble Tea runtime sends the first resize (which it
+	// always does on startup). The view falls back to an unsized
+	// stacked layout when either is 0, which is what unit tests see
+	// — they drive Update synthetically without emitting a size —
+	// so the substring assertions keep working without a resize.
+	width  int
+	height int
 }
 
 // NewModel constructs a fresh Model. A nil lister is explicitly
@@ -158,8 +167,13 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// Current view is centered and self-adapting; we don't need
-		// to stash width/height until we add multi-column layout.
+		// Stash the terminal dimensions so the view can size the
+		// sidebar column and the right-pane placeholder correctly.
+		// We do NOT emit a cmd: Bubble Tea's default behavior is to
+		// re-render on the next tick, which is exactly what we
+		// want.
+		m.width = msg.Width
+		m.height = msg.Height
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -347,16 +361,68 @@ func (m Model) renderHelp() string {
 	return strings.Join(lines, "\n")
 }
 
-// renderSidebarView paints the single unified layout: title bar,
-// session list (or placeholder when empty), key bar, optional
-// error/help blocks, and — only when the list is empty — the
-// "not affiliated with Anthropic" disclaimer. The disclaimer is
-// scoped to the empty path because a user with live sessions has
-// already demonstrated they know what sm4c is and doesn't benefit
-// from the footer nudge anymore; showing it unconditionally would
-// waste vertical space in the one state where the sidebar actually
-// has rows to render.
+// Layout constants for the split-column view. minSplitWidth is the
+// threshold below which the right-pane column is suppressed and the
+// sidebar falls back to full-width (the narrow-terminal fallback).
+// sidebarMin / sidebarMax bound the sidebar's content width so it
+// stays readable on both 80-col and ultrawide terminals; within
+// that range it scales to about one-third of the viewport.
+const (
+	minSplitWidth = 60
+	sidebarMin    = 24
+	sidebarMax    = 40
+)
+
+// renderSidebarView paints the unified layout. On a terminal wide
+// enough to split (>= minSplitWidth), it renders a visible left
+// sidebar column with a right border, joined horizontally to a
+// right-pane placeholder column ("no active session" for M3a, the
+// hosted claude viewport once M3b lands). On narrow terminals it
+// falls back to a full-width stack — the split would otherwise
+// produce cramped columns of wrapped text.
+//
+// The unit-test path (Update-only, no WindowSizeMsg) hits the
+// width == 0 branch and also gets the stacked fallback, which is
+// why every test assertion uses substring matching rather than
+// line-level layout checks: the stacked form and the split form
+// share the same substrings.
 func (m Model) renderSidebarView() string {
+	content := m.renderSidebarColumn()
+
+	if m.width < minSplitWidth || m.height < 1 {
+		return content + "\n"
+	}
+
+	sidebarW := m.sidebarWidth()
+	// Reserve at least 1 column for the border and leave the rest
+	// for the right pane. lipgloss BorderRight counts as 1 column
+	// outside the declared Width, so rightW is what remains.
+	rightW := m.width - sidebarW - 1
+	if rightW < 1 {
+		// Degenerate: terminal just wide enough to pass the split
+		// threshold but the sidebar ate everything. Fall back to
+		// the stacked layout rather than rendering a 0-col pane.
+		return content + "\n"
+	}
+
+	sidebar := sidebarColumnStyle.
+		Width(sidebarW).
+		Height(m.height).
+		Render(content)
+
+	right := rightPaneStyle.
+		Width(rightW).
+		Height(m.height).
+		Render(m.renderRightPanePlaceholder())
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, right)
+}
+
+// renderSidebarColumn builds the stacked content (title, list, key
+// bar, optional diagnostics, optional footer) that lives inside the
+// sidebar column. Extracted so it can be reused verbatim in both
+// the split layout and the narrow-terminal fallback.
+func (m Model) renderSidebarColumn() string {
 	var sections []string
 
 	sections = append(sections, m.renderHeader())
@@ -386,7 +452,51 @@ func (m Model) renderSidebarView() string {
 		))
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, sections...) + "\n"
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+// renderRightPanePlaceholder is the M3a stand-in for what M3b will
+// replace with the VT-rendered hosted claude pane. It reports the
+// current selection ("(no active session)" vs. the name of the
+// highlighted session) so the split is visibly meaningful even
+// before the pane has content. Keeping it here rather than as a
+// const means M3b only needs to swap this one function.
+func (m Model) renderRightPanePlaceholder() string {
+	var hint string
+	switch {
+	case len(m.sessions) == 0:
+		hint = "no active session"
+	case m.highlight < 0 || m.highlight >= len(m.sessions):
+		hint = "no active session"
+	default:
+		s := m.sessions[m.highlight]
+		name := s.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		hint = "selected: " + name + "  " + s.WindowID
+	}
+	return hintStyle.Render(hint) + "\n" +
+		hintStyle.Render("press enter to attach  (embedded pane lands in M3b)")
+}
+
+// sidebarWidth picks the sidebar column's content width for the
+// current terminal. It clamps within [sidebarMin, sidebarMax] and
+// scales to roughly one-third of viewport width within that band,
+// which keeps the sidebar comfortable on anything from an 80-col
+// terminal to an ultrawide monitor.
+func (m Model) sidebarWidth() int {
+	w := m.width / 3
+	if w < sidebarMin {
+		w = sidebarMin
+	}
+	if w > sidebarMax {
+		w = sidebarMax
+	}
+	// Safety: on a terminal that's just barely above the split
+	// threshold, one-third can still fit even the minimum; when it
+	// can't, the caller (renderSidebarView) falls back to stacked.
+	return w
 }
 
 // renderHeader builds the title bar. When sessions are present we

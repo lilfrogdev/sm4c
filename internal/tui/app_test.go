@@ -164,8 +164,14 @@ func TestUnknownKeyIsNoOp(t *testing.T) {
 	}
 }
 
-func TestWindowSizeDoesNotMutateOrQuit(t *testing.T) {
+func TestWindowSizeStashesDimsAndEmitsNoCmd(t *testing.T) {
 	t.Parallel()
+	// WindowSizeMsg must be absorbed into Model state so the split
+	// layout can size the sidebar and right pane, but it should
+	// not produce a tea.Cmd — Bubble Tea re-renders automatically
+	// on state changes. If either invariant regresses, the
+	// split-column view will either never update on resize or
+	// spam cmd channels.
 	m := emptyModel()
 	next, cmd := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	if cmd != nil {
@@ -175,9 +181,48 @@ func TestWindowSizeDoesNotMutateOrQuit(t *testing.T) {
 	if !ok {
 		t.Fatalf("Update returned %T, expected tui.Model", next)
 	}
-	if !modelsEqual(m, got) {
-		t.Fatalf("WindowSizeMsg mutated Model: before=%+v after=%+v", m, got)
+	if got.width != 120 || got.height != 40 {
+		t.Fatalf("WindowSizeMsg did not stash dims: width=%d height=%d", got.width, got.height)
 	}
+}
+
+func TestSplitLayoutRendersSeparatorAndRightPane(t *testing.T) {
+	t.Parallel()
+	// On a terminal wide enough to split, the view must include a
+	// vertical border glyph AND the right-pane placeholder text.
+	// Without this pin, a future refactor could collapse the split
+	// back to a full-width stack and the "I don't see the sidebar"
+	// regression would come right back.
+	m := emptyModel()
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	got, ok := next.(Model)
+	if !ok {
+		t.Fatalf("Update returned %T, expected tui.Model", next)
+	}
+	out := got.View()
+	// lipgloss's NormalBorder renders the vertical side as U+2502.
+	if !strings.ContainsRune(out, '│') {
+		t.Fatalf("split layout missing vertical border glyph:\n%s", out)
+	}
+	mustContain(t, out, "no active session")
+}
+
+func TestNarrowTerminalFallsBackToStackedLayout(t *testing.T) {
+	t.Parallel()
+	// Below minSplitWidth the view must stack, not split, so the
+	// sidebar content doesn't get squeezed into an unreadable
+	// column. The absence of the border glyph is the signal.
+	m := emptyModel()
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 20})
+	got, ok := next.(Model)
+	if !ok {
+		t.Fatalf("Update returned %T, expected tui.Model", next)
+	}
+	out := got.View()
+	if strings.ContainsRune(out, '│') {
+		t.Fatalf("narrow-terminal view drew split border:\n%s", out)
+	}
+	mustContain(t, out, "no sessions yet")
 }
 
 func TestCtrlBIsNoOpUntilM3b(t *testing.T) {
@@ -480,6 +525,9 @@ func modelsEqual(a, b Model) bool {
 		return false
 	}
 	if a.selectedWindowID != b.selectedWindowID {
+		return false
+	}
+	if a.width != b.width || a.height != b.height {
 		return false
 	}
 	if (a.listErr == nil) != (b.listErr == nil) {

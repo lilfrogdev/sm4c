@@ -56,4 +56,25 @@ var (
 	// is rendered this way so the highlight is obvious from across
 	// the room.
 	rowHighlightStyle = lipgloss.NewStyle().Reverse(true)
+
+	// sidebarColumnStyle frames the left column. BorderRight plus
+	// the default NormalBorder gives us a visible vertical line
+	// between the sidebar and the right pane; we deliberately do
+	// NOT call BorderForeground with a color so the separator uses
+	// the terminal's own foreground — stays readable on every
+	// theme, same rationale as every other "color" choice here.
+	// Padding(0, 1) buys a one-column gutter on each side so the
+	// content never touches the border glyphs.
+	sidebarColumnStyle = lipgloss.NewStyle().
+				BorderStyle(lipgloss.NormalBorder()).
+				BorderRight(true).
+				Padding(0, 1)
+
+	// rightPaneStyle frames the right (hosted-pane) column. In M3a
+	// it only carries a placeholder string; the style is kept thin
+	// so M3b can add child styles without fighting this one. A
+	// matching Padding(0, 1) keeps the inside content from sitting
+	// flush against the border on the left edge.
+	rightPaneStyle = lipgloss.NewStyle().
+			Padding(0, 1)
 )

@@ -24,11 +24,17 @@
 //         live sessions have already internalized what sm4c is and
 //         would just see it as clutter.
 //
-//     The sidebar is full-width in M3a; M3b will split the layout
-//     into a left-column sidebar and a right-column hosted pane so
-//     the sidebar remains visible while a session is live. Keeping
-//     the empty-state and populated states on the SAME layout
-//     avoids a jarring reflow the moment the first session appears.
+//     On a terminal wide enough to split (>= minSplitWidth = 60
+//     cols), the layout renders as a visible left sidebar column
+//     with a vertical border and a right-pane placeholder to its
+//     right ("no active session" / "selected: <name>"). Below that
+//     threshold the view falls back to a full-width stacked form
+//     so the sidebar content doesn't get squeezed into an
+//     unreadable column. M3b replaces the placeholder with the
+//     VT-rendered hosted claude pane; the split geometry is
+//     already in place. Keeping the empty-state and populated
+//     states on the SAME layout avoids a jarring reflow the moment
+//     the first session appears.
 //
 //   - Key bindings:
 //
