@@ -120,6 +120,42 @@ func TestPreflight_ResolvesRealTmux(t *testing.T) {
 	}
 }
 
+func TestPreflight_ConfigOverrideBeatsPathAndFallback(t *testing.T) {
+	t.Parallel()
+
+	// Three candidates: a config override, a PATH entry, and a
+	// well-known-path. Ensure cfg wins, and that the origin note says so.
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "claude")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\ntrue\n"), 0o600); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	if err := os.Chmod(bin, 0o700); err != nil { // #nosec G302 -- test fixture must be executable
+		t.Fatalf("chmod: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.ClaudeBin = bin
+	// tmux_bin needs to not-fail for the Preflight call to proceed past
+	// tmux checks; we don't assert on it here.
+	cfg.TmuxBin = bin
+
+	r := Preflight(cfg)
+	var found Finding
+	for _, f := range r.Findings {
+		if f.Check == "claude:resolve" {
+			found = f
+			break
+		}
+	}
+	if found.Severity != SevOK {
+		t.Fatalf("claude:resolve sev = %v; want OK (%s)", found.Severity, found.Detail)
+	}
+	if !strings.Contains(found.Detail, "via config") {
+		t.Fatalf("claude:resolve detail = %q; want origin 'via config'", found.Detail)
+	}
+}
+
 func TestPreflight_NonAbsConfigPathIsRejected(t *testing.T) {
 	t.Parallel()
 

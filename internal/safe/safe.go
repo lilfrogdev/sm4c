@@ -23,6 +23,13 @@ import (
 // predictable and to bound worst-case render cost.
 const MaxLabelRunes = 64
 
+// MaxLineRunes caps sanitized one-line strings that are longer than a
+// sidebar label but still bounded — diagnostic detail lines, resolved
+// filesystem paths, version strings, error messages. 1 KiB is plenty for
+// any realistic POSIX path plus a parenthetical note and keeps any
+// single `sm4c doctor` row from being unboundedly long.
+const MaxLineRunes = 1024
+
 // ErrUnsafeArg is returned by Arg when the input contains a byte that
 // cannot appear in a subprocess argument (NUL) or a C0 control that could
 // corrupt tmux's control-mode parser.
@@ -42,6 +49,18 @@ var ErrUnsafeArg = errors.New("safe: argument contains an unsafe byte")
 // Label never returns an error. Callers that want to distinguish "was
 // stripped to empty" from "was empty to begin with" should compare lengths.
 func Label(s string) string {
+	return sanitizeLine(s, MaxLabelRunes)
+}
+
+// Line is like Label but caps output at MaxLineRunes. Use Line for
+// diagnostic strings that should be longer than a session label — full
+// file paths, `tmux -V` output, user-facing error detail — while still
+// guaranteeing no ANSI / control bytes survive.
+func Line(s string) string {
+	return sanitizeLine(s, MaxLineRunes)
+}
+
+func sanitizeLine(s string, maxRunes int) string {
 	if s == "" {
 		return ""
 	}
@@ -49,7 +68,7 @@ func Label(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	runes := 0
-	for i := 0; i < len(rs) && runes < MaxLabelRunes; {
+	for i := 0; i < len(rs) && runes < maxRunes; {
 		r := rs[i]
 		if r == 0x1b {
 			i = skipEscape(rs, i)

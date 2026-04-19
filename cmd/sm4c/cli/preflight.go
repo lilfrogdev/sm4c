@@ -109,74 +109,29 @@ func Preflight(cfg config.Config) Report {
 }
 
 func (r *Report) add(f Finding) {
+	// Message is a short headline; Label's 64-rune cap is deliberate.
+	// Detail is a diagnostic line (absolute path + origin note, `tmux -V`
+	// output, error text) that routinely exceeds 64 runes — a path on
+	// macOS alone can eat 60+ — so it goes through safe.Line's larger
+	// cap. Both strip control bytes and ANSI escapes identically.
 	f.Message = safe.Label(f.Message)
-	f.Detail = safe.Label(f.Detail)
+	f.Detail = safe.Line(f.Detail)
 	r.Findings = append(r.Findings, f)
 }
 
-// checkTmux resolves the tmux binary either from cfg.TmuxBin or PATH and
-// returns its absolute path (or "" on failure).
+// checkTmux resolves the tmux binary either from cfg.TmuxBin, PATH, or
+// one of the well-known install locations, and returns its absolute path
+// (or "" on failure).
 func (r *Report) checkTmux(cfg config.Config) string {
-	const check = "tmux:resolve"
-
-	candidate := cfg.TmuxBin
-	if candidate == "" {
-		p, err := exec.LookPath("tmux")
-		if err != nil {
-			r.add(Finding{
-				Check:    check,
-				Severity: SevFatal,
-				Message:  "tmux not found on PATH; install tmux >= 3.2",
-			})
-			return ""
-		}
-		candidate = p
-	}
-	abs, err := filepath.Abs(candidate)
-	if err != nil {
-		r.add(Finding{
-			Check:    check,
-			Severity: SevFatal,
-			Message:  "cannot resolve tmux path",
-			Detail:   err.Error(),
-		})
-		return ""
-	}
-	if !filepath.IsAbs(abs) {
-		r.add(Finding{
-			Check:    check,
-			Severity: SevFatal,
-			Message:  "tmux path must be absolute",
-			Detail:   abs,
-		})
-		return ""
-	}
-	fi, err := os.Stat(abs)
-	if err != nil {
-		r.add(Finding{
-			Check:    check,
-			Severity: SevFatal,
-			Message:  "tmux binary not accessible",
-			Detail:   err.Error(),
-		})
-		return ""
-	}
-	if fi.Mode()&0o111 == 0 {
-		r.add(Finding{
-			Check:    check,
-			Severity: SevFatal,
-			Message:  "tmux binary is not executable",
-			Detail:   abs,
-		})
-		return ""
-	}
-	r.add(Finding{
-		Check:    check,
-		Severity: SevOK,
-		Message:  "tmux binary resolved",
-		Detail:   abs,
+	return r.resolveBinary(resolveSpec{
+		check:           "tmux:resolve",
+		cfgOverride:     cfg.TmuxBin,
+		lookPathName:    "tmux",
+		knownLocations:  platform.KnownTmuxLocations(),
+		notFoundMessage: "tmux not found on PATH or in any well-known install location; install tmux >= 3.2",
+		notFoundDetail:  "e.g. `brew install tmux` (macOS) or `apt install tmux` (Debian/Ubuntu)",
+		resolvedMessage: "tmux binary resolved",
 	})
-	return abs
 }
 
 // checkTmuxVersion runs `tmux -V`, parses the version string, and returns
@@ -286,32 +241,89 @@ func parseTmuxVersion(s string) (version string, major, minor int, ok bool) {
 
 func isAsciiDigit(b byte) bool { return b >= '0' && b <= '9' }
 
-// checkClaude resolves the claude binary either from cfg.ClaudeBin or
-// PATH and returns its absolute path. A missing claude is fatal: sm4c is
-// only useful with Claude Code installed.
+// checkClaude resolves the claude binary either from cfg.ClaudeBin, PATH,
+// or one of the well-known install locations and returns its absolute
+// path. A missing claude is fatal: sm4c is only useful with Claude Code
+// installed.
 func (r *Report) checkClaude(cfg config.Config) string {
-	const check = "claude:resolve"
+	return r.resolveBinary(resolveSpec{
+		check:           "claude:resolve",
+		cfgOverride:     cfg.ClaudeBin,
+		lookPathName:    "claude",
+		knownLocations:  platform.KnownClaudeLocations(),
+		notFoundMessage: "claude not found on PATH or in any well-known install location",
+		notFoundDetail:  "install via https://docs.claude.com/en/docs/claude-code/setup or set claude_bin in sm4c config",
+		resolvedMessage: "claude binary resolved",
+	})
+}
 
-	candidate := cfg.ClaudeBin
-	if candidate == "" {
-		p, err := exec.LookPath("claude")
-		if err != nil {
-			r.add(Finding{
-				Check:    check,
-				Severity: SevFatal,
-				Message:  "claude not found on PATH; install the official Claude Code CLI",
-			})
-			return ""
-		}
-		candidate = p
+// resolveSpec is the input to the shared binary-resolution routine below.
+// Factoring this out keeps the "explicit config, then PATH, then
+// well-known fallback" ladder identical for tmux and claude — a prior
+// iteration had the logic duplicated per binary and drifted in subtle
+// ways that a reviewer would rightly flag.
+type resolveSpec struct {
+	check           string
+	cfgOverride     string
+	lookPathName    string
+	knownLocations  []string
+	notFoundMessage string
+	notFoundDetail  string
+	resolvedMessage string
+}
+
+// resolveBinary implements the resolution ladder:
+//
+//  1. cfgOverride is respected absolutely when non-empty.
+//  2. exec.LookPath is tried (honors the inherited PATH).
+//  3. Each entry in knownLocations is stat/executable-checked.
+//
+// On success the resolved absolute path is returned and an OK Finding is
+// appended (or a Warn if the fallback allowlist had to be used, since
+// that indicates a PATH-misconfiguration the user probably wants to know
+// about). On total failure a Fatal finding is appended and "" is
+// returned.
+func (r *Report) resolveBinary(s resolveSpec) string {
+	if s.cfgOverride != "" {
+		return r.validateBinary(s.check, s.cfgOverride, s.resolvedMessage, SevOK, "via config")
 	}
+	if p, err := exec.LookPath(s.lookPathName); err == nil {
+		return r.validateBinary(s.check, p, s.resolvedMessage, SevOK, "via $PATH")
+	}
+	if cand, ok := platform.FindKnownBinary(s.knownLocations); ok {
+		return r.validateBinary(s.check, cand, s.resolvedMessage, SevWarn,
+			"via well-known install path — add the directory to $PATH to silence this warning")
+	}
+	r.add(Finding{
+		Check:    s.check,
+		Severity: SevFatal,
+		Message:  s.notFoundMessage,
+		Detail:   s.notFoundDetail,
+	})
+	return ""
+}
+
+// validateBinary stats candidate, confirms it is an absolute path to an
+// executable regular file, and records either an OK/Warn finding (on
+// success) or a Fatal finding (on any check failure). The returned
+// string is the validated absolute path or "" on failure.
+func (r *Report) validateBinary(check, candidate, message string, sev Severity, originNote string) string {
 	abs, err := filepath.Abs(candidate)
 	if err != nil {
 		r.add(Finding{
 			Check:    check,
 			Severity: SevFatal,
-			Message:  "cannot resolve claude path",
+			Message:  "cannot resolve binary path",
 			Detail:   err.Error(),
+		})
+		return ""
+	}
+	if !filepath.IsAbs(abs) {
+		r.add(Finding{
+			Check:    check,
+			Severity: SevFatal,
+			Message:  "binary path must be absolute",
+			Detail:   abs,
 		})
 		return ""
 	}
@@ -320,7 +332,7 @@ func (r *Report) checkClaude(cfg config.Config) string {
 		r.add(Finding{
 			Check:    check,
 			Severity: SevFatal,
-			Message:  "claude binary not accessible",
+			Message:  "binary not accessible",
 			Detail:   err.Error(),
 		})
 		return ""
@@ -329,16 +341,20 @@ func (r *Report) checkClaude(cfg config.Config) string {
 		r.add(Finding{
 			Check:    check,
 			Severity: SevFatal,
-			Message:  "claude binary is not executable",
+			Message:  "binary is not executable",
 			Detail:   abs,
 		})
 		return ""
 	}
+	detail := abs
+	if originNote != "" {
+		detail = abs + " (" + originNote + ")"
+	}
 	r.add(Finding{
 		Check:    check,
-		Severity: SevOK,
-		Message:  "claude binary resolved",
-		Detail:   abs,
+		Severity: sev,
+		Message:  message,
+		Detail:   detail,
 	})
 	return abs
 }

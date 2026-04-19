@@ -24,9 +24,44 @@ sm4c is **not affiliated with, endorsed by, or sponsored by Anthropic**. It does
 ## Requirements
 
 - **macOS or Linux** (Windows is not supported in v1).
-- **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and on `PATH`.** Install separately — sm4c does not bundle it.
-- **[tmux](https://github.com/tmux/tmux) ≥ 3.2 on `PATH`.** Install via your package manager (`brew install tmux`, `apt install tmux`, etc.).
+- **[Claude Code CLI](https://docs.claude.com/en/docs/claude-code/setup) installed.** Install separately — sm4c does not bundle it. Both install methods are supported:
+  - The official native installer (`curl -fsSL https://claude.ai/install.sh | bash`) — drops a launcher at `~/.local/bin/claude`.
+  - Homebrew: `brew install claude` — drops a launcher at `/opt/homebrew/bin/claude` (Apple Silicon) or `/usr/local/bin/claude` (Intel).
+  - npm / bun global installs are also detected.
+- **[tmux](https://github.com/tmux/tmux) ≥ 3.2.** Install via your package manager (`brew install tmux`, `apt install tmux`, etc.).
 - **Go 1.22+** (for building from source; not needed if you use a released binary).
+
+### Shell compatibility
+
+sm4c is shell-agnostic. It works identically under **bash**, **zsh**, **fish**, **nushell**, and any other POSIX-ish shell, because:
+
+- sm4c resolves `claude` and `tmux` by (1) explicit config, then (2) the inherited `$PATH`, then (3) a small allowlist of well-known install paths (`~/.local/bin`, `~/.bun/bin`, `~/.npm-global/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`). You do not need `claude` on `$PATH` for sm4c to find it — though `sm4c doctor` will emit a **warn** if the fallback is used, since other tools may still expect it on `$PATH`.
+- Each tmux pane inherits your `$SHELL`, so whatever shell you normally use is the shell you'll see inside sm4c.
+- `claude` is spawned directly (never through a shell wrapper), so your `.bashrc` / `.zshrc` / `config.nu` never affect sm4c's plumbing.
+
+If you installed `claude` via the curl installer and your shell can't find it yet, add `~/.local/bin` to your `$PATH`:
+
+```bash
+# bash: append to ~/.bashrc
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+```zsh
+# zsh: append to ~/.zshrc
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+```fish
+# fish: run once; fish_add_path persists across sessions
+fish_add_path -U ~/.local/bin
+```
+
+```nushell
+# nushell: append to ~/.config/nushell/env.nu
+$env.PATH = ($env.PATH | split row (char esep) | prepend $"($env.HOME)/.local/bin")
+```
+
+Restart your shell after editing its config.
 
 ## Install
 
