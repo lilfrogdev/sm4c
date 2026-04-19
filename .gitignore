@@ -1,0 +1,29 @@
+# Build artifacts
+/sm4c
+/dist/
+/bin/
+*.exe
+*.test
+*.prof
+*.out
+
+# Coverage
+coverage.*
+*.cover
+
+# Go toolchain scratch
+vendor/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Local config / logs (never commit)
+*.log
+/tmp/

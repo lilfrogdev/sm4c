@@ -1,0 +1,43 @@
+# golangci-lint config for sm4c.
+#
+# Rationale per linter:
+#   - govet, staticcheck, errcheck, ineffassign: baseline correctness.
+#   - gosec: security scanner; sm4c's whole job is to be security-conscious.
+#   - revive: light style enforcement without gofmt duplication.
+#   - unconvert, misspell: catch common code-review nits before CR.
+#
+# We intentionally DO NOT enable:
+#   - godot / godox: comment style churn has no security benefit.
+#   - lll / funlen: style-of-the-month; not worth bikeshedding in v0.
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - misspell
+    - revive
+    - staticcheck
+    - unconvert
+    - unused
+    - gosec
+
+  settings:
+    gosec:
+      excludes:
+        # G104 (unchecked errors) is already covered by errcheck with better
+        # context; enabling both doubles up on every log/print site.
+        - G104
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
