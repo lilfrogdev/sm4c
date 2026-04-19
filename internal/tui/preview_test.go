@@ -32,7 +32,7 @@ func TestPreviewRenderedView(t *testing.T) {
 	stubResolver := ActivePaneResolver(func(context.Context, string) (string, error) {
 		return "%11", nil
 	})
-	withPreview := NewModel(stubLister(previewSessions, nil), 0, nil, stubResolver)
+	withPreview := NewModel(stubLister(previewSessions, nil), 0, nil, stubResolver, "")
 	withPreview = withPreview.handleSessions(sessionsMsg{sessions: previewSessions})
 	n1, _ := withPreview.Update(paneResolvedMsg{windowID: "@1", paneID: "%11"})
 	withPreview = n1.(Model)

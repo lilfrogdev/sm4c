@@ -4,93 +4,59 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
-	"syscall"
 	"time"
 
 	"github.com/lilfrogdev/sm4c/internal/tmuxctl"
 	"github.com/spf13/cobra"
 )
 
-// launch.go is the wiring for the bare `sm4c [claude-args…]` invocation.
+// launch.go is the wiring for `sm4c [claude-args…]` when positional
+// arguments are present. Unlike M2c, this path no longer execs into
+// a tmux client — there is no code path in sm4c that hands the
+// terminal to tmux directly. Instead:
 //
-// Design:
+//   1. Preflight resolves claude and tmux (fails fast on missing
+//      dependencies, with a readable error from the user's shell).
 //
-//   - Preflight is mandatory and must resolve both tmux AND claude; a
-//     warn-level resolution (binary found via well-known path rather
-//     than $PATH) is still acceptable because we end up exec'ing tmux
-//     and having tmux spawn claude by absolute path either way.
+//   2. NewClaudeWindow spawns a tagged tmux window running the
+//      requested claude argv on the isolated sm4c socket.
 //
-//   - Claude arguments are forwarded verbatim to NewClaudeWindow, which
-//     handles shell-escaping and the POSIX-/bin/sh default-shell pin on
-//     the sm4c socket. We never render arbitrary argv through Printf
-//     onto the user's terminal; the only thing we print is the message
-//     "launching claude…" which never includes user input.
+//   3. We re-enter the TUI with the freshly-spawned window ID as
+//      the initial highlight, so the sidebar opens already focused
+//      on the session you just created.
 //
-//   - The process model at the end of a successful launch is:
+// The design decision behind step 3: sm4c's whole value proposition
+// is "one surface for multiple concurrent claude sessions". Letting
+// the CLI dump the user into a raw tmux attach would undermine that
+// — they'd be staring at a tmux prefix, not a sidebar. If they wanted
+// a tmux attach, they could use tmux directly. So we route every
+// entry point through the TUI.
 //
-//       sm4c -> exec -> tmux attach-session -t sm4c:@N
+// Security notes carry over from M2c:
 //
-//     i.e. sm4c disappears from the process tree and the tmux client
-//     owns the terminal. This matches how `sudo` and `ssh` hand off.
-//     If the exec fails, we surface a clear error so the user can
-//     recover (the tmux window we created stays around — they can
-//     inspect it via `sm4c ls`).
+//   - Claude arguments are forwarded verbatim to NewClaudeWindow,
+//     which shell-escapes every element and pins tmux's default-shell
+//     to /bin/sh on the sm4c socket. No user input ever reaches a
+//     shell outside that escape boundary.
 //
-//   - Rolling back a successful NewClaudeWindow on exec failure is
-//     deliberately NOT done: if attach fails, the new claude session
-//     has already started and may have already emitted a prompt /
-//     modified files; killing the window silently would lose that
-//     work. We let the user decide via `sm4c ls` and a future close
-//     action.
+//   - We never render arbitrary argv through Printf onto the user's
+//     terminal; status messages are fixed strings.
 //
-// Testing seam:
-//
-//   execAttach is a package-level function variable so tests can
-//   observe the argv that would have been exec'd without actually
-//   replacing the test process. Production code uses execAttachReal
-//   which calls syscall.Exec and never returns on success.
-
-// execAttach is invoked to hand the terminal over to tmux. It must
-// either exec (not return) or return an error describing why exec
-// failed. It is a variable so test code can substitute a recorder.
-var execAttach = execAttachReal
-
-// execAttachReal replaces the current process with tmuxBin+args. On
-// success it does not return. On failure it returns an error that
-// has already been sanitized (exec.Exec's error comes from the
-// kernel, not user input, so it is safe to surface).
-//
-// syscall.Exec is only available on Unix; v1 targets macOS + Linux
-// (see README), so this restriction is acceptable. A future Windows
-// port would need a different handoff strategy anyway because tmux
-// does not run natively there.
-func execAttachReal(argv []string) error {
-	if len(argv) == 0 {
-		return fmt.Errorf("launch: empty exec argv")
-	}
-	// #nosec G204 -- argv[0] is the preflight-validated absolute tmux
-	// path; argv[1..] is sm4c-constructed (flags + window ID of the
-	// form @N), never user input. See tmuxctl.OneShot.AttachArgv.
-	err := syscall.Exec(argv[0], argv, os.Environ())
-	// If Exec returns, it failed. The error is a syscall.Errno value
-	// from the kernel; it does not include user-controlled content.
-	return fmt.Errorf("launch: exec tmux failed: %w", err)
-}
+//   - On NewClaudeWindow failure, no window is left behind (the
+//     spawn helper is atomic). On subsequent TUI failures the window
+//     stays around so the user can inspect it via `sm4c ls` rather
+//     than silently losing a half-initialized claude pane.
 
 // launchTimeout bounds the two tmux round-trips we make before the
-// exec handoff: one to create the window, one to tag it. Neither
-// should take more than milliseconds on a healthy system; a longer
-// wait indicates a stuck tmux server or a misbehaving disk.
+// TUI opens: one to create the window, one to tag it. Neither should
+// take more than milliseconds on a healthy system; a longer wait
+// indicates a stuck tmux server or a misbehaving disk.
 const launchTimeout = 10 * time.Second
 
-// runLaunch implements the `sm4c [claude-args…]` shell shortcut
-// (positional args present). It is one of two callers of
-// spawnAndAttach; the other is runTUI's ActionNewSession branch.
-// Keeping the spawn/attach mechanics in a single helper means there
-// is exactly one place in the codebase where argv flows from
-// user-controlled input into claude, regardless of whether that
-// input came from the shell command line or from a TUI form.
+// runLaunch implements the `sm4c [claude-args…]` invocation. It
+// spawns a new claude window and then hands off to openTUI with the
+// new window ID as the initial highlight, so the TUI opens focused
+// on the session the user just asked for.
 func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 	o, report, _, err := setupOneShot(pf)
 	if err != nil {
@@ -104,46 +70,44 @@ func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(ctx, launchTimeout)
+	spawnCtx, cancel := context.WithTimeout(ctx, launchTimeout)
 	defer cancel()
 
-	return spawnAndAttach(ctx, cmd.OutOrStdout(), o, report.ClaudePath, args)
-}
-
-// spawnAndAttach is the shared spawn-then-exec-attach core. Callers
-// are responsible for preflight (so ClaudePath is guaranteed
-// non-empty and absolute) and for any upstream context deadline. On
-// success it does not return — syscall.Exec takes over the process.
-// On failure it returns a wrapped error; the freshly-created window
-// is intentionally left in place so the user can recover it via
-// `sm4c ls` rather than losing a partially-initialized claude pane.
-//
-// This helper does NOT own the preflight / config steps because the
-// TUI path runs them once *before* showing its view (so a missing
-// claude fails fast with a readable error instead of flashing the
-// empty state and dying). Repeating them here would either
-// double-validate or require smuggling cached state down — both
-// worse than a small helper with a documented contract.
-func spawnAndAttach(ctx context.Context, out io.Writer, o tmuxctl.OneShot, claudeBin string, args []string) error {
-	windowID, err := o.NewClaudeWindow(ctx, claudeBin, args)
+	windowID, err := spawnClaudeWindow(spawnCtx, cmd.OutOrStdout(), o, report.ClaudePath, args)
 	if err != nil {
-		return fmt.Errorf("launch: create claude window: %w", err)
+		return err
 	}
 
-	// Small UX nicety: tell the user what's happening before tmux
-	// paints over the terminal. We deliberately do NOT echo argv,
-	// which could contain a long user prompt.
-	emitLaunching(out, windowID)
+	return openTUI(cmd, o, report.ClaudePath, windowID)
+}
 
-	argv := o.AttachArgv(windowID)
-	return execAttach(argv)
+// spawnClaudeWindow is the thin wrapper around NewClaudeWindow that
+// runLaunch and the TUI's ActionNewSession branch share. Keeping the
+// spawn mechanics in one helper means there is exactly one place in
+// the codebase where argv flows from user-controlled input into
+// claude, whether that input came from the shell command line or
+// from the (future) TUI compose form.
+//
+// The freshly-created window is intentionally left in place on any
+// error that happens after NewClaudeWindow returns: if a later step
+// fails, the claude process inside the window has already started
+// and may have modified files or emitted output. Silently killing
+// it would lose that work. The user can recover manually via
+// `sm4c ls` and a future close action.
+func spawnClaudeWindow(ctx context.Context, out io.Writer, o tmuxctl.OneShot, claudeBin string, args []string) (string, error) {
+	windowID, err := o.NewClaudeWindow(ctx, claudeBin, args)
+	if err != nil {
+		return "", fmt.Errorf("launch: create claude window: %w", err)
+	}
+	emitLaunching(out, windowID)
+	return windowID, nil
 }
 
 // emitLaunching writes a single-line status message. Any write error
-// on stdout is ignored — we are about to hand the terminal to tmux
-// either way, and surfacing an fprint error here would just mask
-// the real failure (e.g. exec errno) that the caller cares about.
+// on stdout is ignored — we are about to hand the terminal over to
+// Bubble Tea either way, and surfacing an fprint error here would
+// just mask the real failure the caller cares about.
 func emitLaunching(out io.Writer, windowID string) {
-	_, _ = fmt.Fprintf(out, "sm4c: launching claude in %s (Ctrl-b d to detach)\n",
+	_, _ = fmt.Fprintf(out, "sm4c: spawned claude in %s\n",
 		tmuxctl.DefaultSessionName+":"+windowID)
 }

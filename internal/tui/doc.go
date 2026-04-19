@@ -61,13 +61,20 @@
 //
 //       * `j` / `↓`    move highlight down (no wrap)
 //       * `k` / `↑`    move highlight up   (no wrap)
-//       * `enter`      commit the highlighted session as the attach
-//                      target (emits ActionAttachSession)
+//       * `enter`      deliberate no-op; reserved for a future focus
+//                      shortcut. sm4c has no exec-into-tmux path by
+//                      design — every session is reached through
+//                      this TUI.
 //       * `n`          request a new session (emits
-//                      ActionNewSession)
-//       * `ctrl+b`     placeholder for M3b's focus toggle; no-op
-//                      here so the binding is pinned before its
-//                      behavior lands
+//                      ActionNewSession). The caller spawns the
+//                      claude window and re-enters the TUI with the
+//                      new window ID as initial highlight, so the
+//                      sidebar reopens focused on the session that
+//                      was just created.
+//       * `ctrl+b`     placeholder for M3c's focus toggle (VSCode-
+//                      style move of focus from sidebar to the
+//                      right pane); no-op here so the binding is
+//                      pinned before its behavior lands.
 //       * `?`          toggle the expanded help block
 //       * `q` / `ctrl+c`  quit (emits ActionNone)
 //
@@ -79,13 +86,14 @@
 //     and every tick issues a fresh fetch. No overlap.
 //
 //   - The compose ("pick cwd + name") sub-view for `n` is
-//     intentionally deferred to M3e. For M3a, `n` is a stopgap that
-//     still falls through to a bare claude launch via the CLI.
+//     intentionally deferred to M3e. Until then, `n` asks the CLI
+//     layer to spawn a bare claude in the process's current working
+//     directory, and the TUI reopens with the new window
+//     highlighted.
 //
 //   - Input routing (M3c) and the status FSM (M3d) are still
-//     deferred. ActionAttachSession continues to be realized by
-//     cmd/sm4c/cli via syscall.Exec into tmux attach-session —
-//     the read-only preview does not yet replace that handoff.
+//     deferred. The pane preview is read-only until M3c lands the
+//     focus toggle + keystroke forwarding path.
 //
 // Design rules enforced here:
 //
@@ -100,8 +108,8 @@
 //     Cmd), which is how the unit tests exercise it.
 //
 //   - No direct import of tmuxctl or os/exec. The TUI signals
-//     "attach to this session" / "spawn a new session" via typed
-//     Action intents, and cmd/sm4c/cli decides how to realize them.
-//     This is the same separation we use for the exec handoff in
-//     launch.go.
+//     "spawn a new session" via a typed Action intent, and
+//     cmd/sm4c/cli decides how to realize it. There is no "attach"
+//     intent by design: the right pane IS how sessions are reached,
+//     and no code path in sm4c execs into tmux.
 package tui

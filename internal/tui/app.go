@@ -10,11 +10,17 @@ import (
 
 // Action is the intent the TUI reports back to its caller after the
 // user has finished interacting with it. The caller (cmd/sm4c/cli)
-// decides how to realize the intent — spawning a claude window or
-// attaching to an existing one is a cmd/sm4c/cli concern, not a TUI
-// concern. This separation mirrors the execAttach seam in
-// cmd/sm4c/cli/launch.go and is what lets us unit-test Update without
-// any subprocess side effects.
+// decides how to realize the intent — spawning a claude window is a
+// cmd/sm4c/cli concern, not a TUI concern. This separation is what
+// lets us unit-test Update without any subprocess side effects.
+//
+// Note: an "attach" action intentionally does not exist. The whole
+// point of sm4c is that the user never leaves the TUI to reach a
+// session; attaching is instead modeled as "highlight the row, let
+// the right pane render the session, route keystrokes when focus
+// lands there." Until input routing ships (M3c), the right pane is
+// read-only, but there is no shortcut that execs into tmux — that
+// escape hatch would undermine the single-surface design.
 type Action int
 
 const (
@@ -24,32 +30,21 @@ const (
 	ActionNone Action = iota
 
 	// ActionNewSession signals "the user pressed `n`; please spawn
-	// a new claude session and attach the terminal to it." The TUI
-	// does not carry the claude binary path, argv, or socket name —
-	// the caller already has all that from preflight / config.
+	// a new claude session." The TUI does not carry the claude
+	// binary path, argv, or socket name — the caller already has
+	// all that from preflight / config. After spawning, the caller
+	// is expected to re-enter the TUI with the new window as the
+	// initial highlight so the user lands on the freshly-created
+	// session; that re-entry loop lives in cmd/sm4c/cli/tui.go.
 	ActionNewSession
-
-	// ActionAttachSession signals "the user highlighted a session in
-	// the sidebar and pressed Enter; please hand the terminal to
-	// that tmux window." The target window ID is read off the Model
-	// via SelectedWindowID() — passing it through Action would make
-	// the enum carry state, which Bubble Tea's message model
-	// disallows.
-	//
-	// In M3a this branch still exec-attaches via tmux; once M3b
-	// lands the embedded pane, cmd/sm4c/cli will realize this
-	// intent by selecting the window in the hosted viewport instead
-	// of exec'ing. The Model stays oblivious to which of the two
-	// it is.
-	ActionAttachSession
 )
 
-// Model is the Bubble Tea model backing the sidebar + empty-state
-// view. Its fields split into two groups: the UX state (help,
-// quitting, action) which decides what to render and what intent to
-// report on exit, and the session-list state (lister, pollInterval,
-// sessions, highlight, ready, listErr, selectedWindowID) which backs
-// the sidebar once managed windows show up.
+// Model is the Bubble Tea model backing the sidebar view. Its
+// fields split into two groups: the UX state (help, quitting,
+// action) which decides what to render and what intent to report on
+// exit, and the session-list state (lister, pollInterval, sessions,
+// highlight, ready, listErr, initialHighlight) which backs the
+// sidebar once managed windows show up.
 //
 //   - help              toggled by `?`; shows the full keybind list.
 //   - quitting          set when the user pressed a quit key; causes
@@ -85,10 +80,14 @@ const (
 //   - listErr           last fetch error, if any. Surfaced as a
 //                       faint single-line notice in the sidebar.
 //                       Does not block rendering of stale sessions.
-//   - selectedWindowID  set by the Enter key when the user commits
-//                       an attach intent. Exposed via
-//                       SelectedWindowID() so the caller can build
-//                       the tmux attach argv.
+//   - initialHighlight  optional tmux window ID the Model should
+//                       snap the highlight to as soon as the first
+//                       sessionsMsg contains a matching row. Used
+//                       by the launch path so `sm4c [claude-args]`
+//                       opens the TUI with the freshly-spawned
+//                       session pre-selected. Cleared once applied
+//                       so later navigation isn't overridden on the
+//                       next poll.
 type Model struct {
 	help     bool
 	quitting bool
@@ -101,7 +100,7 @@ type Model struct {
 	highlight        int
 	ready            bool
 	listErr          error
-	selectedWindowID string
+	initialHighlight string
 
 	// width / height carry the last tea.WindowSizeMsg. They are 0
 	// until the Bubble Tea runtime sends the first resize (which it
@@ -161,6 +160,11 @@ type Model struct {
 //   - A nil PaneEventStream / ActivePaneResolver disables the M3b.1
 //     pane preview; the right pane shows a "(pane preview
 //     unavailable)" hint instead of live bytes.
+//   - An empty initialHighlight lets the Model pick the first row
+//     (index 0) as the default highlight once sessions arrive. A
+//     non-empty value is interpreted as a tmux window ID; the Model
+//     snaps the highlight to that row on the first sessionsMsg that
+//     contains it, then forgets the hint.
 //
 // Production callers (cmd/sm4c/cli/tui.go) pass a lister that wraps
 // tmuxctl.OneShot.ListWindows, a stream backed by
@@ -175,18 +179,20 @@ func NewModel(
 	pollInterval time.Duration,
 	paneStream PaneEventStream,
 	paneResolver ActivePaneResolver,
+	initialHighlight string,
 ) Model {
 	if pollInterval < 0 {
 		pollInterval = 0
 	}
 	m := Model{
-		lister:          lister,
-		pollInterval:    pollInterval,
-		highlight:       -1,
-		paneResolver:    paneResolver,
-		paneByWindow:    make(map[string]string),
-		paneErrByWindow: make(map[string]error),
-		paneBuffers:     make(map[string]*paneBuffer),
+		lister:           lister,
+		pollInterval:     pollInterval,
+		highlight:        -1,
+		initialHighlight: initialHighlight,
+		paneResolver:     paneResolver,
+		paneByWindow:     make(map[string]string),
+		paneErrByWindow:  make(map[string]error),
+		paneBuffers:      make(map[string]*paneBuffer),
 	}
 	if paneStream != nil {
 		m.paneEvents = paneStream()
@@ -200,13 +206,6 @@ func NewModel(
 // before Run returns is meaningless (it'll be ActionNone); the
 // field is only authoritative once tea.Quit has fired.
 func (m Model) Action() Action { return m.action }
-
-// SelectedWindowID reports the tmux window ID the user committed to
-// via Enter. It is only meaningful when Action() == ActionAttachSession;
-// for any other Action the caller MUST NOT read it (it'll be the empty
-// string). The ID is an opaque tmux token like "@3" — the TUI does
-// not validate or parse it.
-func (m Model) SelectedWindowID() string { return m.selectedWindowID }
 
 // Init is the Bubble Tea entry point. It kicks off both concurrent
 // streams the Model depends on:
@@ -298,6 +297,21 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 	m.ready = true
 	m.listErr = msg.err
 	m.sessions = msg.sessions
+	// If the caller asked us to snap to a specific window (e.g. the
+	// launch path just spawned a new claude window and wants the TUI
+	// to open on it), try that first. On success we clear the hint
+	// so subsequent polls don't keep overriding the user's
+	// navigation. A hint that doesn't match any row in this
+	// snapshot is retained; the next fetch may carry it.
+	if m.initialHighlight != "" && len(m.sessions) > 0 {
+		for i, s := range m.sessions {
+			if s.WindowID == m.initialHighlight {
+				m.highlight = i
+				m.initialHighlight = ""
+				break
+			}
+		}
+	}
 	switch {
 	case len(m.sessions) == 0:
 		m.highlight = -1
@@ -403,34 +417,33 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "n":
-		// Signal "spawn a new session" and exit. The caller does the
-		// actual tmux/exec work; this keeps Update free of I/O.
+		// Signal "spawn a new session" and exit the Bubble Tea
+		// runtime so the CLI layer can do the tmux round-trip
+		// without holding the raw-mode terminal. The CLI then re-
+		// enters the TUI with the new window ID as initial
+		// highlight — from the user's perspective the sidebar
+		// briefly blinks and redraws with the new row pre-selected.
 		//
-		// TODO (M3e): replace this placeholder with the real compose
-		// sub-view (cwd picker + optional session name + args). For
-		// M3a, pressing `n` is still equivalent to `sm4c` with no
-		// args under the previous M2c behavior — a bare claude
-		// launch in the process's current working directory. That
-		// keeps the key useful in the sidebar without committing
-		// to a half-built form UX we'd throw away.
+		// TODO (M3e): replace this one-shot exit with an in-TUI
+		// compose sub-view (cwd picker + optional session name +
+		// args). Today pressing `n` spawns a bare claude in the
+		// process's current working directory, which matches the
+		// previous M2c behavior and lets us ship the re-entry
+		// loop before the compose UI is built.
 		m.action = ActionNewSession
 		m.quitting = true
 		return m, tea.Quit
 
 	case "enter":
-		// Commit the highlighted session as the attach target. When
-		// the highlight is out of range (no sessions, or the list is
-		// empty) Enter is a no-op: we do NOT want to emit an
-		// ActionAttachSession with an empty window ID, because
-		// cmd/sm4c/cli would then try to build a tmux argv around
-		// an empty token.
-		if m.highlight < 0 || m.highlight >= len(m.sessions) {
-			return m, nil
-		}
-		m.selectedWindowID = m.sessions[m.highlight].WindowID
-		m.action = ActionAttachSession
-		m.quitting = true
-		return m, tea.Quit
+		// Reserved for M3c input routing (focus the right pane so
+		// keystrokes flow into claude). Today it is a deliberate
+		// no-op — there is no exec-into-tmux shortcut in sm4c by
+		// design: the whole TUI's premise is that you never leave
+		// it to reach a session. Consuming the key here means
+		// Bubble Tea's default Enter handling (which just submits
+		// the current input line) never fires either, keeping the
+		// sidebar completely quiet while you navigate.
+		return m, nil
 
 	case "j", "down":
 		// Move highlight down, no wrap. A no-wrap bottom is the
@@ -448,11 +461,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.resolveHighlightedPaneIfNeeded()
 
 	case "ctrl+b":
-		// Placeholder for M3b's focus toggle. We pin the binding
-		// now so muscle memory carries into M3b without a keymap
-		// rewrite, but Update is a no-op here. If it ever does
-		// become meaningful the help text in bindings[] should
-		// lose the " (M3b)" suffix at the same commit.
+		// Placeholder for M3c's focus toggle (VSCode-style: move
+		// focus between sidebar and the right pane so keystrokes
+		// flow into claude). The binding is reserved now so the
+		// muscle memory carries over once input routing lands.
+		// Until then this is a deliberate no-op; when M3c enables
+		// it, drop the "(coming in M3c)" suffix from bindings[].
 		return m, nil
 
 	case "?":
@@ -474,16 +488,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // visible at all times (the user's explicit design request) and
 // avoids a layout jump the moment the first session appears.
 //
-// M3b will widen this layout into a left-column sidebar + right-
-// column hosted pane. Until then, the sidebar is full-width and
-// the right column is conceptually present-but-empty.
+// M3b.2 swaps the current raw-bytes right pane for a VT-emulated
+// screen grid; M3c adds input routing so focus can move from sidebar
+// to right pane and keystrokes flow into claude. Layout does not
+// change across those milestones — only what the right column renders
+// and what it does with key events.
 func (m Model) View() string {
 	if m.quitting {
 		// Bubble Tea keeps View on screen briefly after tea.Quit
 		// schedules; returning an empty string avoids a flicker of
-		// stale content before the terminal is handed over to
-		// tmux (ActionAttachSession / ActionNewSession) or back to
-		// the shell (ActionNone).
+		// stale content before control returns to cmd/sm4c/cli
+		// (which either spawns a new session via ActionNewSession
+		// and re-enters the TUI, or returns to the shell on
+		// ActionNone).
 		return ""
 	}
 	return m.renderSidebarView()
@@ -506,9 +523,8 @@ type keybind struct {
 // the explicit checkpoint for enabling the binding.
 var bindings = []keybind{
 	{"j/k", "move highlight"},
-	{"enter", "attach to session"},
 	{"n", "new session"},
-	{"ctrl+b", "focus toggle (M3b)"},
+	{"ctrl+b", "focus right pane (coming in M3c)"},
 	{"?", "toggle help"},
 	{"q", "quit"},
 }
@@ -692,7 +708,7 @@ func (m Model) renderRightPaneBody(width, height int) string {
 	}
 	if m.paneResolver == nil && m.paneEvents == nil {
 		return hintStyle.Render("pane preview unavailable") + "\n" +
-			hintStyle.Render("press enter to attach")
+			hintStyle.Render("(input routing lands in M3c)")
 	}
 	if err, ok := m.paneErrByWindow[wid]; ok && err != nil {
 		return hintStyle.Render("pane lookup failed: " + err.Error())
@@ -903,9 +919,15 @@ func intToString(n int) string {
 // alt-screen semantics are clearly the right choice.
 //
 // On a successful run, Run returns the final Model so the caller can
-// inspect Action() and SelectedWindowID(). On any runtime error (TTY
-// setup, input stream closed unexpectedly) the error is returned and
-// the intents are ignored.
+// inspect Action(). On any runtime error (TTY setup, input stream
+// closed unexpectedly) the error is returned and the intents are
+// ignored.
+//
+// initialHighlight is an optional tmux window ID: when non-empty,
+// the first sessionsMsg that contains a matching row snaps the
+// highlight to that row instead of the default first-row behavior.
+// This is how `sm4c [claude-args]` opens the TUI already focused on
+// the freshly-spawned session without any exec-into-tmux shortcut.
 func Run(
 	in interface {
 		Read(p []byte) (n int, err error)
@@ -917,9 +939,10 @@ func Run(
 	pollInterval time.Duration,
 	paneStream PaneEventStream,
 	paneResolver ActivePaneResolver,
+	initialHighlight string,
 ) (Model, error) {
 	p := tea.NewProgram(
-		NewModel(lister, pollInterval, paneStream, paneResolver),
+		NewModel(lister, pollInterval, paneStream, paneResolver, initialHighlight),
 		tea.WithInput(in),
 		tea.WithOutput(out),
 		tea.WithAltScreen(),

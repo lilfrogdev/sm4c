@@ -35,11 +35,12 @@ import (
 // and the lister in cmd/sm4c/cli/tui.go.
 type Session struct {
 	// WindowID is tmux's stable identifier for the window (e.g. "@3").
-	// It is opaque to the TUI — we pass it back verbatim via
-	// SelectedWindowID() when the user commits an attach intent, and
-	// cmd/sm4c/cli uses it to build the tmux attach argv. If tmux's
-	// window ID format ever changes, sm4c's adapter layer is the
-	// only code that needs updating.
+	// It is opaque to the TUI — we pass it back verbatim to the CLI
+	// layer, which uses it to look up the active pane via
+	// ActivePaneResolver and (once input routing lands in M3c) to
+	// address keystrokes at the right tmux target. If tmux's window
+	// ID format ever changes, sm4c's adapter layer is the only code
+	// that needs updating.
 	WindowID string
 
 	// Name is the window title as claude / the user has set it via

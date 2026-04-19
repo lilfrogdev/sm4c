@@ -15,18 +15,15 @@ import (
 	xterm "golang.org/x/term"
 )
 
-// tui.go wires bare `sm4c` (no args, no subcommand) to the Bubble
-// Tea TUI in internal/tui, and realizes any Action the TUI returns
-// after the runtime exits.
+// tui.go wires `sm4c` (and `sm4c [claude-args…]`, via runLaunch)
+// into the Bubble Tea TUI in internal/tui and realizes any Action
+// the TUI returns on exit.
 //
 // Why this lives in cmd/sm4c/cli and not internal/tui:
 //
 //   - internal/tui is deliberately side-effect-free (no tmux, no
 //     subprocess, no filesystem) so it can be unit-tested as a pure
-//     state machine. The realization of "the user asked for a new
-//     session" / "the user asked to attach to @N" is a CLI concern
-//     — same reason execAttach lives here and not in the spawn
-//     package.
+//     state machine. Spawning a new claude window is a CLI concern.
 //
 //   - Preflight is CLI-only too. Running it *before* we hand the
 //     terminal to Bubble Tea means a missing tmux / claude produces
@@ -34,18 +31,19 @@ import (
 //     flashes for a frame and then dies. This matches the "fail
 //     fast with the user's normal error channel" posture we use for
 //     `sm4c ls` / `sm4c status`.
-
-// runTUI is the entry point for the bare `sm4c` invocation. It
-// performs preflight, builds the SessionLister adapter the TUI
-// needs, hands the terminal to the Bubble Tea runtime, and on exit
-// realizes the Model's Action.
 //
-// Stdin MUST be a real TTY for Bubble Tea to work (it needs to put
-// the terminal into raw mode). If stdin is a pipe — typical when
-// sm4c is invoked from a non-interactive context like a CI runner
-// or a shell script — we refuse to open the TUI and instead print a
-// short pointer to the shell shortcuts. This prevents sm4c from
-// hanging waiting for a keystroke that will never come.
+// A note on what this file deliberately does NOT do: there is no
+// exec-into-tmux path anywhere in sm4c. The TUI is the only surface
+// through which users interact with sessions; if they want a plain
+// tmux attach, they can use tmux directly. This decision is
+// reflected in the absence of an "attach" Action in internal/tui
+// and in the loop below, which re-enters the TUI after a spawn
+// rather than handing the terminal to tmux.
+
+// runTUI is the entry point for the bare `sm4c` invocation (no
+// positional args). It performs preflight and hands off to openTUI
+// with no initial-highlight hint, so the sidebar picks the first
+// row as the default cursor.
 func runTUI(cmd *cobra.Command, pf *persistentFlags) error {
 	o, report, _, err := setupOneShot(pf)
 	if err != nil {
@@ -54,7 +52,28 @@ func runTUI(cmd *cobra.Command, pf *persistentFlags) error {
 	if report.ClaudePath == "" {
 		return fmt.Errorf("claude is not available: %s", summarizeFatals(report))
 	}
+	return openTUI(cmd, o, report.ClaudePath, "")
+}
 
+// openTUI is the shared entry into the Bubble Tea runtime. Both
+// `runTUI` (bare `sm4c`) and `runLaunch` (`sm4c [claude-args]`)
+// funnel through here so there is exactly one place in the codebase
+// that decides how to handle interactive-stdin detection, the
+// pane-preview bridge, and the Action-based re-entry loop.
+//
+// The loop exists because `ActionNewSession` no longer exec-attaches
+// into tmux — it spawns a new window outside the TUI and then re-
+// opens the TUI with that window's ID as initial highlight. Each
+// trip through the loop is one Bubble Tea program invocation; the
+// outer `for` just threads the initial-highlight hint forward.
+//
+// Stdin MUST be a real TTY for Bubble Tea to work (it needs to put
+// the terminal into raw mode). If stdin is a pipe — typical when
+// sm4c is invoked from a non-interactive context like a CI runner
+// or a shell script — we refuse to open the TUI and instead return
+// a short pointer to the shell shortcuts. This prevents sm4c from
+// hanging waiting for a keystroke that will never come.
+func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID string) error {
 	if !interactiveStdin() {
 		// Non-interactive stdin: refuse to launch the TUI (it would
 		// hang) and give the user a concrete alternative. We return
@@ -62,56 +81,53 @@ func runTUI(cmd *cobra.Command, pf *persistentFlags) error {
 		// Execute, so we do NOT include it here — doing so produces
 		// "sm4c: sm4c: …" in the user's shell).
 		return fmt.Errorf(
-			"stdin is not a TTY; refusing to open the TUI. For non-interactive use, run `sm4c <prompt>` or `sm4c ls`")
+			"stdin is not a TTY; refusing to open the TUI. For non-interactive use, run `sm4c ls` or `sm4c status`")
 	}
 
-	final, err := runTUIProgram(cmd, o)
-	if err != nil {
-		return fmt.Errorf("tui: %w", err)
-	}
-
-	switch final.Action() {
-	case tui.ActionNone:
-		// Clean exit. Bubble Tea already restored the terminal; we
-		// have nothing more to do.
-		return nil
-
-	case tui.ActionNewSession:
-		// M3a stopgap: bare claude in the process's cwd. M3e will
-		// replace this with the compose sub-view (cwd picker +
-		// optional name + extra args).
-		ctx := cmd.Context()
-		if ctx == nil {
-			ctx = context.Background()
+	highlight := initialWindowID
+	for {
+		final, err := runTUIProgram(cmd, o, highlight)
+		if err != nil {
+			return fmt.Errorf("tui: %w", err)
 		}
-		ctx, cancel := context.WithTimeout(ctx, launchTimeout)
-		defer cancel()
-		return spawnAndAttach(ctx, cmd.OutOrStdout(), o, report.ClaudePath, nil)
 
-	case tui.ActionAttachSession:
-		// The user picked a session in the sidebar and pressed
-		// Enter. We exec into tmux attach-session for that window
-		// ID; sm4c disappears from the process tree and tmux owns
-		// the terminal until the user detaches. M3b will replace
-		// this branch with a hosted-viewport path so the sidebar
-		// stays visible; for M3a this matches the M2c shell-
-		// shortcut handoff shape exactly, just driven from the
-		// TUI instead of from argv.
-		windowID := final.SelectedWindowID()
-		if windowID == "" {
-			// Defensive: Update guards against this, but if a
-			// future refactor accidentally emits the intent with an
-			// empty ID we want a clear error, not a broken argv.
-			return fmt.Errorf("tui: attach action missing window ID")
+		switch final.Action() {
+		case tui.ActionNone:
+			// Clean exit. Bubble Tea already restored the terminal;
+			// we have nothing more to do.
+			return nil
+
+		case tui.ActionNewSession:
+			// M3a stopgap: bare claude in the process's cwd. M3e
+			// will replace this branch with a compose sub-view
+			// driven inside the TUI, at which point this CLI-level
+			// loop can go away entirely.
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			spawnCtx, cancel := context.WithTimeout(ctx, launchTimeout)
+			newID, spawnErr := spawnClaudeWindow(spawnCtx, cmd.OutOrStdout(), o, claudeBin, nil)
+			cancel()
+			if spawnErr != nil {
+				return spawnErr
+			}
+			// Re-enter the TUI focused on the freshly-spawned
+			// window. From the user's perspective the sidebar
+			// blinks and redraws with the new row pre-selected;
+			// that's the same Bubble Tea alt-screen teardown/
+			// setup a `n` keystroke used to cause in M3a, just
+			// with a different post-state.
+			highlight = newID
+			continue
 		}
-		return execAttach(o.AttachArgv(windowID))
-	}
 
-	// Defensive: an Action we don't know how to realize should never
-	// escape the TUI in a released binary, but if a future Action
-	// slips past without a switch arm here, we fail loudly rather
-	// than silently returning.
-	return fmt.Errorf("tui: unhandled action %v", final.Action())
+		// Defensive: an Action we don't know how to realize should
+		// never escape the TUI in a released binary, but if a future
+		// Action slips past without a switch arm here, we fail
+		// loudly rather than silently returning.
+		return fmt.Errorf("tui: unhandled action %v", final.Action())
+	}
 }
 
 // runTUIProgram is a seam so tests can stub the Bubble Tea runtime
@@ -125,7 +141,7 @@ func runTUI(cmd *cobra.Command, pf *persistentFlags) error {
 // relative to setupOneShot.
 var runTUIProgram = runTUIProgramReal
 
-func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot) (tui.Model, error) {
+func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID string) (tui.Model, error) {
 	// Bubble Tea wants the actual process stdin/stdout to drive
 	// raw-mode input and terminal-level escape sequences. cmd.InOrStdin
 	// and cmd.OutOrStdout return interfaces that are os.Stdin /
@@ -155,6 +171,7 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot) (tui.Model, error)
 		tui.DefaultPollInterval,
 		stream,
 		resolver,
+		initialWindowID,
 	)
 }
 

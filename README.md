@@ -79,19 +79,20 @@ make build
 _(M3b.1 ships a read-only raw-bytes pane preview alongside the sidebar. VT-accurate rendering, input routing, status badges, and the compose flow land in M3b.2–M3e.)_
 
 ```bash
-# Open the TUI. What you see depends on whether you have any managed sessions:
-#   - none yet → empty-state screen
-#   - one or more → sidebar view listing them (refreshed every 1s)
-# Bindings available in both views:
-#   j / k / ↑ / ↓   move highlight (sidebar only)
-#   enter           attach to highlighted session (exec into tmux)
+# Open the TUI. The sidebar is always visible:
+#   - no sessions yet   → right pane shows "press n to start a new session"
+#   - one or more       → highlighted row streams a raw-bytes preview on the right
+# Bindings:
+#   j / k / ↑ / ↓   move highlight
 #   n               new claude session (bare; compose flow comes in M3e)
-#   ctrl+b          focus toggle (placeholder; activates in M3b)
+#   ctrl+b          focus right pane (placeholder; activates in M3c)
+#   enter           reserved for M3c focus shortcut; deliberate no-op today
 #   ?               toggle help
 #   q / ^C          quit
 sm4c
 
-# Shell shortcut: skip the TUI and spawn a session directly with claude args.
+# Launch with claude args. This ALSO opens the TUI — focused on the new session.
+# sm4c never exec-attaches into tmux: every surface is the TUI.
 sm4c /help                    # start with /help as the first input
 sm4c -- -n api-refactor       # claude's own -n flag, past sm4c's flag parser
 sm4c -- -c                    # continue most recent conversation
@@ -107,7 +108,7 @@ sm4c stop         # stop the sm4c tmux server (destructive)
 
 Anything after `--` is forwarded verbatim to `claude`. If a claude arg does not start with a dash, you can omit the `--` (e.g. `sm4c /help` just works).
 
-To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename. To detach from a live session without killing it, press `Ctrl-b d` (tmux's default detach) — today this returns you to the shell, not to the sm4c sidebar. The full hosted-pane milestone (M3b.2+) changes that by rendering the claude pane inside sm4c so the sidebar stays visible.
+To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename. sm4c does not expose a tmux detach shortcut; every interaction with a session happens inside the TUI. Once M3c lands input routing, `Ctrl+B` will move focus between sidebar and the active pane so you can type into claude without leaving sm4c.
 
 Planned for M3b.2–M3e (not yet shipped):
 

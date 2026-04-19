@@ -132,7 +132,7 @@ func TestPaneDataBuffersByPaneID(t *testing.T) {
 	t.Parallel()
 	// Deliver two chunks for two different panes; snapshots must
 	// be independent, so bytes from pane A never leak into pane B.
-	m := NewModel(nil, 0, nil, nil)
+	m := NewModel(nil, 0, nil, nil, "")
 	m = m.handlePaneData(paneDataMsg{paneID: "%1", data: []byte("alpha")})
 	m = m.handlePaneData(paneDataMsg{paneID: "%2", data: []byte("beta")})
 	m = m.handlePaneData(paneDataMsg{paneID: "%1", data: []byte(" more")})
@@ -150,7 +150,7 @@ func TestPaneDataWithEmptyIDIsIgnored(t *testing.T) {
 	// A paneDataMsg with an empty pane ID is defensive nonsense
 	// (the CLI bridge filters on OutputEvent, which always has a
 	// pane ID). The Model must not allocate a buffer for it.
-	m := NewModel(nil, 0, nil, nil)
+	m := NewModel(nil, 0, nil, nil, "")
 	m = m.handlePaneData(paneDataMsg{paneID: "", data: []byte("x")})
 	if _, ok := m.paneBuffers[""]; ok {
 		t.Fatalf("empty-paneID data was buffered under key %q", "")
@@ -165,7 +165,7 @@ func TestPaneStreamClosedStopsRearming(t *testing.T) {
 	// (which would spin a hot loop).
 	ch := make(chan PaneEvent)
 	close(ch)
-	m := NewModel(nil, 0, stubStream(ch), nil)
+	m := NewModel(nil, 0, stubStream(ch), nil, "")
 	// Init arms a reader; running it against a closed channel
 	// yields paneStreamClosedMsg.
 	initCmd := m.Init()
@@ -195,7 +195,7 @@ func TestPaneDataMsgRearmsWaiter(t *testing.T) {
 	// keeps pumping the stream. Otherwise the preview would freeze
 	// after the first chunk.
 	ch := make(chan PaneEvent, 1)
-	m := NewModel(nil, 0, stubStream(ch), nil)
+	m := NewModel(nil, 0, stubStream(ch), nil, "")
 	_, cmd := m.Update(paneDataMsg{paneID: "%1", data: []byte("x")})
 	if cmd == nil {
 		t.Fatal("paneDataMsg returned nil cmd; stream reader would stall")

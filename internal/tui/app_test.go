@@ -62,7 +62,7 @@ func applyKey(t *testing.T, m Model, s string) (Model, tea.Cmd) {
 // test used this shape; we keep it as a helper so a future default-
 // constructor change would require touching one place.
 func emptyModel() Model {
-	return NewModel(nil, 0, nil, nil)
+	return NewModel(nil, 0, nil, nil, "")
 }
 
 // stubLister returns a SessionLister that always returns the same
@@ -78,7 +78,7 @@ func stubLister(sessions []Session, err error) SessionLister {
 // sessionsMsg, so its sidebar is ready to render without going
 // through Init's async fetch.
 func withSessions(sessions []Session) Model {
-	m := NewModel(stubLister(sessions, nil), 0, nil, nil)
+	m := NewModel(stubLister(sessions, nil), 0, nil, nil, "")
 	m = m.handleSessions(sessionsMsg{sessions: sessions})
 	return m
 }
@@ -99,7 +99,7 @@ func TestInitReturnsFetchCmdWhenListerPresent(t *testing.T) {
 	// happens before the user sees a frame. We don't run the cmd
 	// here (that would require a live runtime); we just pin that a
 	// non-nil cmd was emitted.
-	m := NewModel(stubLister(nil, nil), DefaultPollInterval, nil, nil)
+	m := NewModel(stubLister(nil, nil), DefaultPollInterval, nil, nil, "")
 	if cmd := m.Init(); cmd == nil {
 		t.Fatal("Init returned nil cmd despite lister being wired; sidebar would never populate")
 	}
@@ -225,13 +225,14 @@ func TestNarrowTerminalFallsBackToStackedLayout(t *testing.T) {
 	mustContain(t, out, "no sessions yet")
 }
 
-func TestCtrlBIsNoOpUntilM3b(t *testing.T) {
+func TestCtrlBIsNoOpUntilM3c(t *testing.T) {
 	t.Parallel()
-	// Ctrl+B is reserved for the focus toggle in M3b. M3a must
-	// ignore it so a user who has already trained the binding
-	// doesn't see an unexpected action before M3b lands. If this
-	// test fails, check that the help-bar suffix for the binding
-	// has been updated in the same commit.
+	// Ctrl+B is reserved for the focus toggle in M3c (VSCode-style
+	// move of focus from sidebar to right pane). Until then pressing
+	// it must be a no-op so a user who has already trained the
+	// binding doesn't see an unexpected action. If this test fails,
+	// check that the help-bar suffix for the binding has been
+	// updated in the same commit that enables the toggle.
 	m := withSessions([]Session{{WindowID: "@1", Name: "a"}})
 	m.highlight = 0
 	before := m
@@ -247,7 +248,7 @@ func TestCtrlBIsNoOpUntilM3b(t *testing.T) {
 func TestSessionsMsgPopulatesAndClampsHighlight(t *testing.T) {
 	t.Parallel()
 	// Drop three sessions in; highlight should land at 0 automatically.
-	m := NewModel(stubLister(nil, nil), 0, nil, nil)
+	m := NewModel(stubLister(nil, nil), 0, nil, nil, "")
 	m = m.handleSessions(sessionsMsg{
 		sessions: []Session{
 			{WindowID: "@1", Name: "one"},
@@ -286,7 +287,7 @@ func TestSessionsMsgPopulatesAndClampsHighlight(t *testing.T) {
 func TestSessionsMsgPreservesLastFetchErr(t *testing.T) {
 	t.Parallel()
 	want := errors.New("tmux socket missing")
-	m := NewModel(stubLister(nil, want), 0, nil, nil)
+	m := NewModel(stubLister(nil, want), 0, nil, nil, "")
 	m = m.handleSessions(sessionsMsg{err: want})
 	if m.listErr == nil || !strings.Contains(m.listErr.Error(), "socket missing") {
 		t.Fatalf("listErr = %v, want wrapping %q", m.listErr, want)
@@ -327,40 +328,99 @@ func TestJKNavigatesWithinBounds(t *testing.T) {
 	}
 }
 
-func TestEnterOnHighlightedSessionEmitsAttachIntent(t *testing.T) {
+func TestEnterIsDeliberateNoOp(t *testing.T) {
 	t.Parallel()
+	// sm4c has no exec-into-tmux path by design. Enter on a
+	// highlighted row MUST NOT produce an action or a cmd — it is
+	// reserved for a future in-TUI focus shortcut. If this test
+	// starts failing, check whether a regression is rewiring Enter
+	// to an attach-style exit (which would undermine the single-
+	// surface design).
 	m := withSessions([]Session{
 		{WindowID: "@1", Name: "one"},
 		{WindowID: "@2", Name: "two"},
 	})
-	m, _ = applyKey(t, m, "j") // highlight @2
+	before := m
 	after, cmd := applyKey(t, m, "enter")
-	if after.Action() != ActionAttachSession {
-		t.Fatalf("Action = %v, want ActionAttachSession", after.Action())
+	if after.Action() != ActionNone {
+		t.Fatalf("Enter: Action = %v, want ActionNone", after.Action())
 	}
-	if got := after.SelectedWindowID(); got != "@2" {
-		t.Fatalf("SelectedWindowID = %q, want %q", got, "@2")
+	if cmd != nil {
+		t.Fatalf("Enter produced cmd %T, expected nil", cmd)
 	}
-	if cmd == nil {
-		t.Fatal("Enter with a valid highlight must return tea.Quit cmd")
+	if !modelsEqual(before, after) {
+		t.Fatalf("Enter mutated Model: before=%+v after=%+v", before, after)
 	}
 }
 
-func TestEnterWithNoSessionsIsNoOp(t *testing.T) {
+func TestEnterOnEmptyStateIsNoOp(t *testing.T) {
 	t.Parallel()
-	// Empty state: pressing Enter must not emit ActionAttachSession
-	// with an empty window ID (cmd/sm4c/cli would build a broken
-	// tmux argv).
+	// The empty-state form of the same invariant. No rows, no
+	// side effects, no cmd.
 	m := emptyModel()
+	before := m
 	after, cmd := applyKey(t, m, "enter")
 	if after.Action() != ActionNone {
-		t.Fatalf("empty-state Enter: Action = %v, want ActionNone", after.Action())
-	}
-	if after.SelectedWindowID() != "" {
-		t.Fatalf("empty-state Enter left SelectedWindowID = %q, want empty", after.SelectedWindowID())
+		t.Fatalf("empty Enter: Action = %v, want ActionNone", after.Action())
 	}
 	if cmd != nil {
-		t.Fatalf("empty-state Enter produced cmd %T, expected nil", cmd)
+		t.Fatalf("empty Enter produced cmd %T, expected nil", cmd)
+	}
+	if !modelsEqual(before, after) {
+		t.Fatalf("empty Enter mutated Model: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestInitialHighlightSnapsToMatchingSession(t *testing.T) {
+	t.Parallel()
+	// The launch path (`sm4c [claude-args]`) builds a Model with a
+	// non-empty initialHighlight equal to the freshly-spawned
+	// tmux window ID. As soon as the first sessionsMsg contains
+	// that row the highlight must land on it (NOT the first row
+	// like the bare `sm4c` case).
+	m := NewModel(stubLister(nil, nil), 0, nil, nil, "@2")
+	m = m.handleSessions(sessionsMsg{
+		sessions: []Session{
+			{WindowID: "@1", Name: "one"},
+			{WindowID: "@2", Name: "two"},
+			{WindowID: "@3", Name: "three"},
+		},
+	})
+	if m.highlight != 1 {
+		t.Fatalf("highlight = %d, want 1 (index of @2)", m.highlight)
+	}
+	if m.initialHighlight != "" {
+		t.Fatalf("initialHighlight retained as %q after successful snap", m.initialHighlight)
+	}
+}
+
+func TestInitialHighlightIsRetainedUntilSessionAppears(t *testing.T) {
+	t.Parallel()
+	// If the first poll hasn't yet included the target window
+	// (tmux can lag a tick behind our own spawn), the hint must
+	// persist across fetches until a matching row shows up.
+	m := NewModel(stubLister(nil, nil), 0, nil, nil, "@7")
+	m = m.handleSessions(sessionsMsg{
+		sessions: []Session{{WindowID: "@1", Name: "one"}},
+	})
+	if m.initialHighlight != "@7" {
+		t.Fatalf("initialHighlight cleared despite no matching row; got %q", m.initialHighlight)
+	}
+	if m.highlight != 0 {
+		t.Fatalf("with no match, highlight should default to 0; got %d", m.highlight)
+	}
+	// Second fetch contains the target — hint must apply now.
+	m = m.handleSessions(sessionsMsg{
+		sessions: []Session{
+			{WindowID: "@1", Name: "one"},
+			{WindowID: "@7", Name: "target"},
+		},
+	})
+	if m.highlight != 1 {
+		t.Fatalf("highlight = %d, want 1 (index of @7)", m.highlight)
+	}
+	if m.initialHighlight != "" {
+		t.Fatalf("initialHighlight retained as %q after successful snap", m.initialHighlight)
 	}
 }
 
@@ -370,7 +430,7 @@ func TestPollTickTriggersFetch(t *testing.T) {
 	// pollTickMsg delivered to Update produces a non-nil fetch cmd.
 	// If this regresses, the sidebar stops refreshing after the
 	// first tick.
-	m := NewModel(stubLister(nil, nil), DefaultPollInterval, nil, nil)
+	m := NewModel(stubLister(nil, nil), DefaultPollInterval, nil, nil, "")
 	next, cmd := m.Update(pollTickMsg{})
 	if _, ok := next.(Model); !ok {
 		t.Fatalf("Update returned %T, expected Model", next)
@@ -388,7 +448,7 @@ func TestScheduleNextPollNilWithoutLister(t *testing.T) {
 		t.Fatalf("scheduleNextPoll returned non-nil cmd %T on inert Model", cmd)
 	}
 	// A nil lister with a positive interval: same deal.
-	m := NewModel(nil, 100*time.Millisecond, nil, nil)
+	m := NewModel(nil, 100*time.Millisecond, nil, nil, "")
 	if cmd := m.scheduleNextPoll(); cmd != nil {
 		t.Fatalf("scheduleNextPoll returned non-nil cmd %T when lister is nil", cmd)
 	}
@@ -401,7 +461,7 @@ func TestViewBeforeFirstFetchShowsEmptyPlaceholder(t *testing.T) {
 	// speculative "0 sessions" count — a slow first fetch
 	// shouldn't flash confusing text if a session turns out to
 	// exist.
-	m := NewModel(stubLister(nil, nil), 0, nil, nil)
+	m := NewModel(stubLister(nil, nil), 0, nil, nil, "")
 	out := m.View()
 	mustContain(t, out, "no sessions yet")
 }
@@ -434,9 +494,9 @@ func TestViewRendersSidebarWhenSessionsPresent(t *testing.T) {
 	mustContain(t, out, "@4")
 	// Count line appears in the sidebar header.
 	mustContain(t, out, "2 sessions")
-	// Bindings that only make sense in the sidebar should still be
-	// advertised in the key bar.
-	mustContain(t, out, "attach to session")
+	// Bindings that must stay visible on the populated sidebar.
+	mustContain(t, out, "move highlight")
+	mustContain(t, out, "new session")
 	// Empty-state placeholder MUST NOT appear when rows exist —
 	// it would be contradictory and steal vertical space.
 	if strings.Contains(out, "no sessions yet") {
@@ -493,7 +553,7 @@ func TestViewSurfacesListError(t *testing.T) {
 	t.Parallel()
 	// With an error and no sessions the user is on the empty path;
 	// the error should appear so they can diagnose without -debug.
-	m := NewModel(stubLister(nil, errors.New("permission denied on socket")), 0, nil, nil)
+	m := NewModel(stubLister(nil, errors.New("permission denied on socket")), 0, nil, nil, "")
 	m = m.handleSessions(sessionsMsg{err: errors.New("permission denied on socket")})
 	out := m.View()
 	mustContain(t, out, "permission denied on socket")
@@ -524,7 +584,7 @@ func modelsEqual(a, b Model) bool {
 	if a.highlight != b.highlight || a.ready != b.ready {
 		return false
 	}
-	if a.selectedWindowID != b.selectedWindowID {
+	if a.initialHighlight != b.initialHighlight {
 		return false
 	}
 	if a.width != b.width || a.height != b.height {
