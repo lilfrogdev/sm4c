@@ -14,3 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - M0: `internal/config` TOML loader with permission checks.
 - M0: CI pipeline (`go vet`, `staticcheck`, `golangci-lint` with `gosec`, `govulncheck`, no-network grep, no-hex-color grep).
 - M0: reproducible-build flags (`-trimpath -buildvcs=true`).
+- M1: `internal/tmuxctl` control-mode client — strict `\ooo` octal unescape for `%output`, line-oriented event parser for `%begin`/`%end`/`%error`/`%output`/`%exit`, golden-file fixture test, and a `Client` that spawns `tmux -L sm4c -C` on an isolated socket with request-pairing, handshake absorption, and backpressure-safe async-event fan-out.
+- M1: unit + fuzz coverage (`FuzzUnescape`, `FuzzParser`) and an opt-in `-tags=integration` live-tmux round-trip test.
+- M1: full `cmd/sm4c/cli/preflight.go` — resolves tmux/claude via config override or `$PATH`, enforces absolute paths + executable bit, probes `tmux -V` and enforces `>= 3.2`, and validates the tmux socket directory ownership + `0700` permissions.
+- M1: `sm4c doctor` now prints each preflight finding with severity and exits non-zero on any fatal finding.
+- M1: `internal/platform` helper package for OS-specific file-owner lookup (shared by `internal/config` and `cmd/sm4c/cli`).

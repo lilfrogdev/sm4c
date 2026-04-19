@@ -7,22 +7,22 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newDoctorCmd runs sm4c's environment self-check. In M0 this is a stub
-// that exercises config loading and reports the defaults. M1 will add
-// tmux/claude version probing, socket-directory perm checks, and a
-// summary of the active FSM thresholds.
+// newDoctorCmd runs sm4c's environment self-check. It reports the resolved
+// config, then runs the shared Preflight routine and prints each finding
+// with its severity. The process exits non-zero iff any finding is
+// SevFatal, so CI and shell scripts can gate on `sm4c doctor`.
 func newDoctorCmd(pf *persistentFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
 		Short: "Run environment and security self-checks",
 		Long: `doctor verifies the local environment sm4c will run in. It reports:
   - the resolved sm4c config (defaults or from --config)
-  - (M1) tmux and claude binary paths + versions
-  - (M1) socket directory ownership and permissions
-  - (M1) active monitor thresholds
+  - the absolute paths of tmux and claude, resolved via $PATH or config
+  - the detected tmux version (must be >= 3.2)
+  - ownership and permissions of the tmux socket directory
 
 doctor never touches the live tmux server and never writes to the filesystem
-outside of transient os.Stat calls.`,
+outside of transient os.Stat calls and a `+"`tmux -V`"+` probe.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load(pf.configPath)
@@ -30,7 +30,7 @@ outside of transient os.Stat calls.`,
 				return fmt.Errorf("doctor: load config: %w", err)
 			}
 
-			cmd.Println("sm4c doctor (M0 skeleton)")
+			cmd.Println("sm4c doctor")
 			cmd.Printf("  config path    : %s\n", orDefault(pf.configPath, "<built-in defaults>"))
 			cmd.Printf("  socket_name    : %s\n", cfg.SocketName)
 			cmd.Printf("  prefix_key     : %s\n", cfg.PrefixKey)
@@ -39,7 +39,18 @@ outside of transient os.Stat calls.`,
 			cmd.Printf("  tmux_bin       : %s\n", orDefault(cfg.TmuxBin, "<resolve via PATH>"))
 			cmd.Printf("  claude_bin     : %s\n", orDefault(cfg.ClaudeBin, "<resolve via PATH>"))
 			cmd.Println("")
-			cmd.Println("NOTE: full tmux/claude preflight is not implemented until M1.")
+
+			report := Preflight(cfg)
+			cmd.Println("checks:")
+			for _, f := range report.Findings {
+				cmd.Printf("  [%-5s] %-20s %s\n", f.Severity, f.Check, f.Message)
+				if f.Detail != "" {
+					cmd.Printf("          %s\n", f.Detail)
+				}
+			}
+			if report.Fatal() {
+				return fmt.Errorf("doctor: one or more fatal checks failed")
+			}
 			return nil
 		},
 	}

@@ -1,0 +1,16 @@
+%sessions-changed
+%session-changed $0 sm4c
+%window-add @0
+%begin 1760000000 1 0
+@0 claude
+%end 1760000000 1 0
+%output %1 \033[?25hclaude> 
+%output %1 Hello! How can I help?\015\012
+%window-renamed @0 claude-refactor
+%begin 1760000001 2 0
+%end 1760000001 2 0
+%output %1 \033[2J\033[Hready\012
+%begin 1760000002 3 0
+no current window
+%error 1760000002 3 0
+%exit server exited

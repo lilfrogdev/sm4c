@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/lilfrogdev/sm4c/internal/platform"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -131,7 +132,7 @@ func checkPathPerms(p string) error {
 	if fi.Mode()&fs.ModeSymlink != 0 {
 		return fmt.Errorf("config: %s is a symlink; refusing to follow: %w", p, ErrUnsafePerms)
 	}
-	uid, ok := ownerUID(fi)
+	uid, ok := platform.OwnerUID(fi)
 	if ok {
 		cur, err := user.Current()
 		if err == nil {
