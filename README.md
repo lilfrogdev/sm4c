@@ -76,39 +76,38 @@ make build
 
 ## Quickstart
 
-_(TUI not yet implemented — this is the v1 target behavior.)_
+_(The full TUI — sidebar, status badges, and in-app session compose flow — lands in M3. This section describes the M2c behavior shipped today.)_
 
 ```bash
-# Launch the TUI; reattaches to any existing sessions.
+# Open the empty-state TUI. From there:
+#   n         — new claude session (bare; prompts come in M3)
+#   ?         — toggle help
+#   q / ^C    — quit
 sm4c
 
-# Launch and create a new named claude session (claude's own -n flag).
-sm4c -n api-refactor
-
-# Pass any claude args through — sm4c forwards everything it doesn't own.
-sm4c -c                       # continue most recent conversation
-sm4c --model opus-4.1
-sm4c -n feature-x -c
+# Shell shortcut: skip the TUI and spawn a session directly with claude args.
+sm4c /help                    # start with /help as the first input
+sm4c -- -n api-refactor       # claude's own -n flag, past sm4c's flag parser
+sm4c -- -c                    # continue most recent conversation
+sm4c -- --model opus-4.1
 
 # Read-only CLI for scripting.
-sm4c ls           # list sessions
+sm4c ls           # list managed sessions (sm4c-tagged tmux windows)
 sm4c status       # server and install status
 sm4c doctor       # security and environment self-check
 sm4c version      # version info
 sm4c stop         # stop the sm4c tmux server (destructive)
 ```
 
-In the TUI, the prefix key is `Ctrl-a` by default. After pressing the prefix:
+Anything after `--` is forwarded verbatim to `claude`. If a claude arg does not start with a dash, you can omit the `--` (e.g. `sm4c /help` just works).
 
-- `n` — new session (prompts for optional claude args)
-- `c` — close active session (sends `/exit`, 5s timeout, then force-confirm)
-- `1..9` / `j`/`k` — switch sessions
-- `s` — fuzzy switcher
-- `u` — toggle the "Unmanaged" section (windows on the sm4c socket that sm4c didn't create)
-- `?` — help
-- `Ctrl-a` — send a literal `Ctrl-a` to the active claude
+To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename. To detach from a live session without killing it, press `Ctrl-b d` (tmux's default detach).
 
-To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename.
+Planned for M3 (not yet shipped):
+
+- Sidebar listing all managed sessions with live status (idle / running / needs input / done) from tmux's monitor flags
+- In-app new-session flow (pick working directory, set session name) replacing today's bare-`claude` stopgap
+- `Ctrl-a`-prefixed keymap for session switching, fuzzy switcher, and `u` to toggle the Unmanaged pane
 
 ## Security
 

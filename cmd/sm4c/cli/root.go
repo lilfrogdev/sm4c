@@ -73,17 +73,21 @@ server and surfaces per-session status.
 sm4c is not affiliated with Anthropic. You must install the official claude
 CLI separately; sm4c does not call Anthropic APIs directly.
 
-Running sm4c with no subcommand spawns a new claude session on the sm4c
-tmux socket and attaches to it. Any positional arguments are forwarded
-verbatim to claude, so ` + "`sm4c /help`" + ` and ` + "`sm4c -- -n my-session`" + `
-both work. Use ` + "`--`" + ` before any dash-prefixed flags you want claude
-to receive; otherwise Cobra will try to parse them as sm4c flags.
+Running sm4c with no arguments opens the empty-state TUI. From there,
+press ` + "`n`" + ` to start a new claude session, ` + "`?`" + ` for the
+full keymap, and ` + "`q`" + ` or ` + "`Ctrl+C`" + ` to exit.
+
+Running sm4c with positional arguments skips the TUI and spawns a new
+claude session directly with those arguments, so ` + "`sm4c /help`" + `
+and ` + "`sm4c -- -n my-session`" + ` both work. Use ` + "`--`" + ` before
+any dash-prefixed flags you want claude to receive; otherwise Cobra
+will try to parse them as sm4c flags.
 
 Subcommands (ls, status, stop, doctor, version) are read-mostly and
 never spawn a claude session.`,
-		Example: `  sm4c                           # launch a new claude session
-  sm4c /help                     # launch with /help as first input
-  sm4c -- -n my-session          # launch with claude flags
+		Example: `  sm4c                           # open the empty-state TUI
+  sm4c /help                     # spawn a session with /help as first input
+  sm4c -- -n my-session          # spawn with claude flags
   sm4c ls                        # list managed sessions
   sm4c doctor                    # preflight self-check`,
 		Version:       Version,
@@ -119,16 +123,27 @@ never spawn a claude session.`,
 	return cmd
 }
 
-// runRoot is the bare `sm4c [claude-args…]` invocation. M2c wires this
-// to the launch path: preflight, spawn a new claude window on the sm4c
-// tmux socket, then exec into `tmux attach-session` so the current
-// process is replaced by the tmux client.
+// runRoot dispatches the two bare-sm4c modes:
 //
-// The TUI (sidebar + pane multiplexing) is still M3+; for now "bare
-// sm4c" is a direct launcher, which is already a strict improvement
-// over raw `tmux -L sm4c` for users and gives us a real usage path to
-// dogfood before M3 lands.
+//   - No positional args  -> runTUI: open the empty-state TUI
+//     (internal/tui). The user picks "new session" / "quit" from
+//     there. This is the default path and matches the UX decision
+//     that `sm4c` alone should never silently spawn a claude session
+//     behind the user's back.
+//
+//   - One or more args    -> runLaunch: shell shortcut. Preflight,
+//     spawn a claude window with the args forwarded verbatim, then
+//     exec into `tmux attach-session`. The shortcut exists because
+//     "I already know what I want to type" is a common power-user
+//     case (e.g. `sm4c /help`, `sm4c -- -n my-session`) and forcing
+//     users through the TUI to realize it would be friction for
+//     zero UX gain.
+//
+// Subcommands never reach runRoot — Cobra dispatches them directly.
 func runRoot(cmd *cobra.Command, args []string, pf *persistentFlags) error {
+	if len(args) == 0 {
+		return runTUI(cmd, pf)
+	}
 	return runLaunch(cmd, args, pf)
 }
 

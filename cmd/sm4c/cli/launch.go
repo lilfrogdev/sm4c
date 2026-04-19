@@ -84,9 +84,13 @@ func execAttachReal(argv []string) error {
 // wait indicates a stuck tmux server or a misbehaving disk.
 const launchTimeout = 10 * time.Second
 
-// runLaunch implements the bare `sm4c [claude-args…]` path. It is
-// called from runRoot (and only from runRoot) so there is exactly one
-// place in the codebase where argv flows from Cobra into claude.
+// runLaunch implements the `sm4c [claude-args…]` shell shortcut
+// (positional args present). It is one of two callers of
+// spawnAndAttach; the other is runTUI's ActionNewSession branch.
+// Keeping the spawn/attach mechanics in a single helper means there
+// is exactly one place in the codebase where argv flows from
+// user-controlled input into claude, regardless of whether that
+// input came from the shell command line or from a TUI form.
 func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 	o, report, _, err := setupOneShot(pf)
 	if err != nil {
@@ -103,7 +107,25 @@ func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 	ctx, cancel := context.WithTimeout(ctx, launchTimeout)
 	defer cancel()
 
-	windowID, err := o.NewClaudeWindow(ctx, report.ClaudePath, args)
+	return spawnAndAttach(ctx, cmd.OutOrStdout(), o, report.ClaudePath, args)
+}
+
+// spawnAndAttach is the shared spawn-then-exec-attach core. Callers
+// are responsible for preflight (so ClaudePath is guaranteed
+// non-empty and absolute) and for any upstream context deadline. On
+// success it does not return — syscall.Exec takes over the process.
+// On failure it returns a wrapped error; the freshly-created window
+// is intentionally left in place so the user can recover it via
+// `sm4c ls` rather than losing a partially-initialized claude pane.
+//
+// This helper does NOT own the preflight / config steps because the
+// TUI path runs them once *before* showing its view (so a missing
+// claude fails fast with a readable error instead of flashing the
+// empty state and dying). Repeating them here would either
+// double-validate or require smuggling cached state down — both
+// worse than a small helper with a documented contract.
+func spawnAndAttach(ctx context.Context, out io.Writer, o tmuxctl.OneShot, claudeBin string, args []string) error {
+	windowID, err := o.NewClaudeWindow(ctx, claudeBin, args)
 	if err != nil {
 		return fmt.Errorf("launch: create claude window: %w", err)
 	}
@@ -111,7 +133,7 @@ func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 	// Small UX nicety: tell the user what's happening before tmux
 	// paints over the terminal. We deliberately do NOT echo argv,
 	// which could contain a long user prompt.
-	emitLaunching(cmd.OutOrStdout(), windowID)
+	emitLaunching(out, windowID)
 
 	argv := o.AttachArgv(windowID)
 	return execAttach(argv)
