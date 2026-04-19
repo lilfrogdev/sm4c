@@ -170,7 +170,7 @@ func buildAttachModel(t *testing.T, id string) tui.Model {
 	lister := func(context.Context) ([]tui.Session, error) {
 		return []tui.Session{{WindowID: id, Name: "t"}}, nil
 	}
-	m := tui.NewModel(lister, 0)
+	m := tui.NewModel(lister, 0, nil, nil)
 
 	// Init emits a fetch tea.Cmd; running it synchronously gives us
 	// the sessionsMsg value, which Update then folds into the

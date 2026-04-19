@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/lilfrogdev/sm4c/internal/tmuxctl"
 	"github.com/lilfrogdev/sm4c/internal/tui"
@@ -130,13 +133,143 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot) (tui.Model, error)
 	// unit tests — the latter don't support raw mode, which is why
 	// the TUI path has runTUIProgram as a seam and tests substitute
 	// it rather than trying to drive tui.Run against a bytes.Buffer.
+	//
+	// Pane preview (M3b.1) is wired here: if the sm4c session already
+	// exists on the socket, we stand up a long-lived tmuxctl.Client
+	// in control mode and bridge its %output notifications into the
+	// TUI as a PaneEventStream. If the session does not exist yet
+	// (the common fresh-install case), we deliberately skip the
+	// Client — standing one up would create a default shell window
+	// as a side effect of tmux's new-session, polluting the sidebar
+	// socket. The user can still press `n` to create the first
+	// session; the next TUI launch will have a session and the
+	// preview will light up.
+	stream, resolver, closer := setupPaneBridge(cmd, o)
+	if closer != nil {
+		defer closer()
+	}
 	return tui.Run(
 		asReader(cmd.InOrStdin()),
 		asWriter(cmd.OutOrStdout()),
 		sessionLister(o),
 		tui.DefaultPollInterval,
+		stream,
+		resolver,
 	)
 }
+
+// setupPaneBridge stands up the M3b.1 pane-preview plumbing: a
+// long-lived tmuxctl.Client plus a goroutine that filters its
+// %output events into a PaneEvent channel the TUI consumes. Returns
+// the stream, the resolver, and a closer that tears the bridge down.
+//
+// All three returns are optional. If we decide to skip the bridge
+// (no sm4c session yet, Client.Start errored, preflight did not
+// produce a tmux path), we return (nil, nil, nil) and the TUI runs
+// with pane preview disabled — the right pane shows a static hint
+// in that case rather than live bytes.
+func setupPaneBridge(cmd *cobra.Command, o tmuxctl.OneShot) (tui.PaneEventStream, tui.ActivePaneResolver, func()) {
+	if o.TmuxBin == "" {
+		return nil, nil, nil
+	}
+
+	startCtx, cancelStart := context.WithTimeout(context.Background(), paneBridgeStartTimeout)
+	defer cancelStart()
+
+	exists, err := o.SessionExists(startCtx)
+	if err != nil || !exists {
+		// Either the socket is unreachable or the session does not
+		// exist yet. In both cases we decline to spawn the control-
+		// mode client — see the rationale above setupPaneBridge.
+		// The TUI will still render the sidebar and empty-state.
+		return nil, nil, nil
+	}
+
+	cfg := tmuxctl.ClientConfig{
+		TmuxBin:     o.TmuxBin,
+		SocketName:  o.SocketName,
+		SessionName: o.SessionName,
+	}
+	// Client.Start blocks until tmux finishes its handshake. A short
+	// bound keeps a hung socket from stalling the TUI; if we time
+	// out the user still gets the TUI, just without live preview.
+	client, err := tmuxctl.Start(startCtx, cfg)
+	if err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+			"sm4c: pane preview disabled: %v\n", err)
+		return nil, nil, nil
+	}
+
+	events := make(chan tui.PaneEvent, paneBridgeBufferSize)
+
+	// The bridge goroutine drains client.Events() for the lifetime
+	// of the Client and forwards every OutputEvent into `events` as
+	// a PaneEvent. Non-output notifications are discarded in M3b.1;
+	// future milestones (status detection, session renaming) will
+	// grow this switch.
+	var once sync.Once
+	closeEvents := func() { once.Do(func() { close(events) }) }
+	go func() {
+		defer closeEvents()
+		for ev := range client.Events() {
+			out, ok := ev.(tmuxctl.OutputEvent)
+			if !ok {
+				continue
+			}
+			// Non-blocking send with drop: if the TUI is too slow
+			// to drain, we prefer to lose a chunk rather than
+			// block the tmux protocol reader.
+			select {
+			case events <- tui.PaneEvent{PaneID: out.PaneID, Data: out.Data}:
+			default:
+			}
+		}
+	}()
+
+	// The PaneEventStream contract is "call once, get back a channel".
+	// We synthesize one that hands out the same shared channel so
+	// the TUI's internal waitForPaneEvent loop observes the same
+	// close semantics no matter how many times it's invoked.
+	stream := func() <-chan tui.PaneEvent { return events }
+
+	// resolver uses OneShot (not the Client's Send) because
+	// display-message is a one-shot semantic by nature and the
+	// Client is busy fan-ing out %output notifications. Using a
+	// fresh subprocess here also isolates resolution failures from
+	// the pane stream: a missing window returns ErrNoSuchPane
+	// without breaking the active preview.
+	resolver := func(ctx context.Context, windowID string) (string, error) {
+		paneID, err := o.ActivePane(ctx, windowID)
+		if errors.Is(err, tmuxctl.ErrNoSuchPane) {
+			return "", err
+		}
+		return paneID, err
+	}
+
+	closer := func() {
+		// Closing the Client makes its Events() channel close,
+		// which lets the bridge goroutine exit, which closes
+		// `events`, which tells the TUI's waiter loop to emit
+		// paneStreamClosedMsg and stop arming reads. One call
+		// tears everything down in order.
+		_ = client.Close()
+	}
+
+	return stream, resolver, closer
+}
+
+// paneBridgeStartTimeout bounds both SessionExists and Client.Start.
+// A slow tmux socket should not block the TUI from opening; we prefer
+// to launch without preview and let the user see the sidebar
+// immediately.
+const paneBridgeStartTimeout = 3 * time.Second
+
+// paneBridgeBufferSize bounds the backpressure window between the
+// tmuxctl event reader and the TUI. A full buffer drops chunks
+// rather than blocking; for a raw-bytes preview that is fine (the
+// user sees the latest state on the next frame), and it keeps the
+// tmux protocol reader responsive.
+const paneBridgeBufferSize = 512
 
 // sessionLister adapts tmuxctl.OneShot.ListWindows to the
 // tui.SessionLister signature. Two responsibilities:

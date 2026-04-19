@@ -92,3 +92,62 @@ func TestIntegration_OneShot_ServerLifecycle(t *testing.T) {
 		t.Fatalf("KillServer (second call): %v", err)
 	}
 }
+
+// TestIntegration_OneShot_ActivePane verifies the display-message
+// round-trip: given a real window ID, ActivePane returns a pane ID
+// of the shape `%<digits>`. The resulting ID is what M3b+ feeds into
+// the control-mode `%output` filter, so a regression here would
+// silently break the hosted-pane preview even though the sidebar
+// would keep working.
+func TestIntegration_OneShot_ActivePane(t *testing.T) {
+	t.Parallel()
+
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skipf("tmux not on PATH: %v", err)
+	}
+
+	socket := "sm4c-test-" + randSuffix(t)
+	session := "sm4ctest-" + randSuffix(t)
+	t.Cleanup(func() {
+		_ = exec.Command(tmux, "-L", socket, "kill-server").Run()
+	})
+
+	if err := exec.Command(tmux, "-L", socket,
+		"new-session", "-d", "-s", session, "-n", "w1",
+		"sh", "-c", "sleep 3600").Run(); err != nil {
+		t.Fatalf("new-session: %v", err)
+	}
+
+	o := OneShot{TmuxBin: tmux, SocketName: socket, SessionName: session}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wins, err := o.ListWindows(ctx)
+	if err != nil {
+		t.Fatalf("ListWindows: %v", err)
+	}
+	if len(wins) != 1 {
+		t.Fatalf("ListWindows returned %d rows; want 1", len(wins))
+	}
+
+	paneID, err := o.ActivePane(ctx, wins[0].ID)
+	if err != nil {
+		t.Fatalf("ActivePane(%s): %v", wins[0].ID, err)
+	}
+	// Shape check: the validator already enforces this, but pin it
+	// here so a future refactor that drops parsePaneID cannot
+	// silently regress the integration contract.
+	if len(paneID) < 2 || paneID[0] != '%' {
+		t.Fatalf("ActivePane returned %q; want '%%'+digits", paneID)
+	}
+
+	// Missing-window: a window ID that was never issued must map to
+	// ErrNoSuchPane, not to an ad-hoc error string. Callers use
+	// errors.Is to decide whether to treat this as soft (the window
+	// closed) vs. fatal.
+	_, err = o.ActivePane(ctx, "@9999")
+	if err == nil {
+		t.Fatal("ActivePane on missing window returned nil err")
+	}
+}

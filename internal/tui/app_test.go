@@ -62,7 +62,7 @@ func applyKey(t *testing.T, m Model, s string) (Model, tea.Cmd) {
 // test used this shape; we keep it as a helper so a future default-
 // constructor change would require touching one place.
 func emptyModel() Model {
-	return NewModel(nil, 0)
+	return NewModel(nil, 0, nil, nil)
 }
 
 // stubLister returns a SessionLister that always returns the same
@@ -78,7 +78,7 @@ func stubLister(sessions []Session, err error) SessionLister {
 // sessionsMsg, so its sidebar is ready to render without going
 // through Init's async fetch.
 func withSessions(sessions []Session) Model {
-	m := NewModel(stubLister(sessions, nil), 0)
+	m := NewModel(stubLister(sessions, nil), 0, nil, nil)
 	m = m.handleSessions(sessionsMsg{sessions: sessions})
 	return m
 }
@@ -99,7 +99,7 @@ func TestInitReturnsFetchCmdWhenListerPresent(t *testing.T) {
 	// happens before the user sees a frame. We don't run the cmd
 	// here (that would require a live runtime); we just pin that a
 	// non-nil cmd was emitted.
-	m := NewModel(stubLister(nil, nil), DefaultPollInterval)
+	m := NewModel(stubLister(nil, nil), DefaultPollInterval, nil, nil)
 	if cmd := m.Init(); cmd == nil {
 		t.Fatal("Init returned nil cmd despite lister being wired; sidebar would never populate")
 	}
@@ -247,7 +247,7 @@ func TestCtrlBIsNoOpUntilM3b(t *testing.T) {
 func TestSessionsMsgPopulatesAndClampsHighlight(t *testing.T) {
 	t.Parallel()
 	// Drop three sessions in; highlight should land at 0 automatically.
-	m := NewModel(stubLister(nil, nil), 0)
+	m := NewModel(stubLister(nil, nil), 0, nil, nil)
 	m = m.handleSessions(sessionsMsg{
 		sessions: []Session{
 			{WindowID: "@1", Name: "one"},
@@ -286,7 +286,7 @@ func TestSessionsMsgPopulatesAndClampsHighlight(t *testing.T) {
 func TestSessionsMsgPreservesLastFetchErr(t *testing.T) {
 	t.Parallel()
 	want := errors.New("tmux socket missing")
-	m := NewModel(stubLister(nil, want), 0)
+	m := NewModel(stubLister(nil, want), 0, nil, nil)
 	m = m.handleSessions(sessionsMsg{err: want})
 	if m.listErr == nil || !strings.Contains(m.listErr.Error(), "socket missing") {
 		t.Fatalf("listErr = %v, want wrapping %q", m.listErr, want)
@@ -370,7 +370,7 @@ func TestPollTickTriggersFetch(t *testing.T) {
 	// pollTickMsg delivered to Update produces a non-nil fetch cmd.
 	// If this regresses, the sidebar stops refreshing after the
 	// first tick.
-	m := NewModel(stubLister(nil, nil), DefaultPollInterval)
+	m := NewModel(stubLister(nil, nil), DefaultPollInterval, nil, nil)
 	next, cmd := m.Update(pollTickMsg{})
 	if _, ok := next.(Model); !ok {
 		t.Fatalf("Update returned %T, expected Model", next)
@@ -388,7 +388,7 @@ func TestScheduleNextPollNilWithoutLister(t *testing.T) {
 		t.Fatalf("scheduleNextPoll returned non-nil cmd %T on inert Model", cmd)
 	}
 	// A nil lister with a positive interval: same deal.
-	m := NewModel(nil, 100*time.Millisecond)
+	m := NewModel(nil, 100*time.Millisecond, nil, nil)
 	if cmd := m.scheduleNextPoll(); cmd != nil {
 		t.Fatalf("scheduleNextPoll returned non-nil cmd %T when lister is nil", cmd)
 	}
@@ -401,7 +401,7 @@ func TestViewBeforeFirstFetchShowsEmptyPlaceholder(t *testing.T) {
 	// speculative "0 sessions" count — a slow first fetch
 	// shouldn't flash confusing text if a session turns out to
 	// exist.
-	m := NewModel(stubLister(nil, nil), 0)
+	m := NewModel(stubLister(nil, nil), 0, nil, nil)
 	out := m.View()
 	mustContain(t, out, "no sessions yet")
 }
@@ -493,7 +493,7 @@ func TestViewSurfacesListError(t *testing.T) {
 	t.Parallel()
 	// With an error and no sessions the user is on the empty path;
 	// the error should appear so they can diagnose without -debug.
-	m := NewModel(stubLister(nil, errors.New("permission denied on socket")), 0)
+	m := NewModel(stubLister(nil, errors.New("permission denied on socket")), 0, nil, nil)
 	m = m.handleSessions(sessionsMsg{err: errors.New("permission denied on socket")})
 	out := m.View()
 	mustContain(t, out, "permission denied on socket")
@@ -528,6 +528,9 @@ func modelsEqual(a, b Model) bool {
 		return false
 	}
 	if a.width != b.width || a.height != b.height {
+		return false
+	}
+	if a.paneStreamClosed != b.paneStreamClosed || a.resolvedWindowID != b.resolvedWindowID {
 		return false
 	}
 	if (a.listErr == nil) != (b.listErr == nil) {

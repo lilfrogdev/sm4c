@@ -152,11 +152,19 @@ type pending struct {
 //
 // The tmux invocation is:
 //
-//	tmux -L <socket> -C new-session -A -D -s <session>
+//	tmux -L <socket> -C new-session -A -s <session>
 //
-// -L isolates us on our own socket. -C runs in control mode. -A + -D on
-// new-session makes it idempotent: reuse an existing session (and detach
-// other clients) or create a fresh one.
+// -L isolates us on our own socket. -C runs in control mode. -A on
+// new-session makes the call idempotent: reuse an existing session or
+// create a fresh one.
+//
+// We deliberately do NOT pass -D (which would detach every other
+// client on that session). Multiple sm4c processes can legitimately
+// share the socket at the same time — e.g. a long-lived TUI in one
+// terminal plus a `sm4c ls` in another — and a stray -D here would
+// tear down an active attach mid-typing. Tmux handles multiple
+// attached clients natively; control-mode clients coexist with
+// interactive tmux attach-session clients without issue.
 func Start(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -168,7 +176,7 @@ func Start(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	args := []string{
 		"-L", cfg.SocketName,
 		"-C",
-		"new-session", "-A", "-D", "-s", cfg.SessionName,
+		"new-session", "-A", "-s", cfg.SessionName,
 	}
 	// #nosec G204 -- cfg.TmuxBin is validated as an absolute path by
 	// cfg.validate() above; every other arg is either a compile-time

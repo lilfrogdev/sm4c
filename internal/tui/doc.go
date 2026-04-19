@@ -1,6 +1,6 @@
 // Package tui is sm4c's Bubble Tea front end.
 //
-// Scope in this milestone (M3a):
+// Scope in this milestone (M3b.1 — read-only raw-bytes pane preview):
 //
 //   - One unified sidebar layout, shown at all times:
 //
@@ -26,15 +26,36 @@
 //
 //     On a terminal wide enough to split (>= minSplitWidth = 60
 //     cols), the layout renders as a visible left sidebar column
-//     with a vertical border and a right-pane placeholder to its
-//     right ("no active session" / "selected: <name>"). Below that
-//     threshold the view falls back to a full-width stacked form
-//     so the sidebar content doesn't get squeezed into an
-//     unreadable column. M3b replaces the placeholder with the
-//     VT-rendered hosted claude pane; the split geometry is
-//     already in place. Keeping the empty-state and populated
-//     states on the SAME layout avoids a jarring reflow the moment
-//     the first session appears.
+//     with a vertical border and a live pane-preview column to its
+//     right. Below that threshold the view falls back to a full-
+//     width stacked form so the sidebar content doesn't get
+//     squeezed into an unreadable column. Keeping the empty-state
+//     and populated states on the SAME layout avoids a jarring
+//     reflow the moment the first session appears.
+//
+//   - Pane preview (right column). When cmd/sm4c/cli has set up the
+//     tmux control-mode bridge, the right column streams %output
+//     events from the highlighted session's active pane into a ring
+//     buffer and paints the latest N lines as raw, printable-ASCII-
+//     only text. Every state the preview can be in has an explicit
+//     rendering:
+//
+//       * no sessions     — "press n to start a new session"
+//       * no stream       — "pane preview unavailable"
+//       * stream closed   — "preview disconnected — tmux control
+//                           channel closed"
+//       * resolving       — "resolving pane…"
+//       * resolver error  — "pane lookup failed: <reason>"
+//       * no bytes yet    — "waiting for output  <pane-id>"
+//       * bytes present   — the last few lines of stripToPrintable
+//                           output, clipped to the right column's
+//                           width and height
+//
+//     The preview is intentionally read-only in M3b.1. M3b.2 swaps
+//     stripToPrintable for a charmbracelet/x/vt emulator; M3b.3
+//     preserves cell attributes; M3b.4 backfills initial screen
+//     state via tmux capture-pane. Input routing and focus toggle
+//     land in M3c. None of those milestones change the sidebar.
 //
 //   - Key bindings:
 //
@@ -61,11 +82,10 @@
 //     intentionally deferred to M3e. For M3a, `n` is a stopgap that
 //     still falls through to a bare claude launch via the CLI.
 //
-//   - The embedded pane (claude output rendered next to the sidebar,
-//     with input routing in M3c and a status FSM in M3d) is
-//     intentionally deferred. ActionAttachSession is realized by
-//     cmd/sm4c/cli via syscall.Exec into tmux attach-session until
-//     M3b lands the hosted viewport.
+//   - Input routing (M3c) and the status FSM (M3d) are still
+//     deferred. ActionAttachSession continues to be realized by
+//     cmd/sm4c/cli via syscall.Exec into tmux attach-session —
+//     the read-only preview does not yet replace that handoff.
 //
 // Design rules enforced here:
 //

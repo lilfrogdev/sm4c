@@ -149,6 +149,52 @@ func TestNewOneShot_PanicsOnEmptyPath(t *testing.T) {
 	_ = NewOneShot("")
 }
 
+func TestParsePaneID(t *testing.T) {
+	t.Parallel()
+
+	// display-message -F '#{pane_id}' prints the value followed by a
+	// trailing newline. parsePaneID must trim it, validate the shape,
+	// and reject anything that does not match %<digits>. If any of
+	// these guards regress, tmuxctl would happily hand a corrupted
+	// pane ID into control-mode output filters, which would silently
+	// fail to match %output notifications at runtime.
+	cases := []struct {
+		name string
+		in   string
+		want string
+		ok   bool
+	}{
+		{"trailing newline", "%7\n", "%7", true},
+		{"multi-digit", "%123\n", "%123", true},
+		{"no newline", "%3", "%3", true},
+		{"leading whitespace", "  %4\n", "%4", true},
+		{"empty", "", "", false},
+		{"whitespace only", "  \n", "", false},
+		{"missing percent", "7\n", "", false},
+		{"non-digit suffix", "%7a\n", "", false},
+		{"percent only", "%\n", "", false},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := parsePaneID([]byte(c.in))
+			if c.ok {
+				if err != nil {
+					t.Fatalf("parsePaneID(%q) err=%v; want nil", c.in, err)
+				}
+				if got != c.want {
+					t.Fatalf("parsePaneID(%q) = %q; want %q", c.in, got, c.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("parsePaneID(%q) err=nil; want non-nil", c.in)
+			}
+		})
+	}
+}
+
 func TestNewOneShot_Defaults(t *testing.T) {
 	t.Parallel()
 

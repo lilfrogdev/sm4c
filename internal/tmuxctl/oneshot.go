@@ -236,6 +236,70 @@ func parseWindows(out []byte) ([]Window, error) {
 	return wins, nil
 }
 
+// ActivePane returns the tmux pane ID of the active pane inside the
+// given window. The returned value is an opaque tmux token like "%4";
+// it is validated to match `%` + decimal digits before being returned,
+// so callers can pass it to tmux control-mode output filters without
+// re-sanitizing.
+//
+// A missing server or a missing window returns ErrNoSuchPane — the
+// TUI translates that into "(pane preview unavailable)" rather than
+// surfacing a fatal error, because windows can legitimately be closed
+// by the user between the moment we decided to resolve the pane and
+// the moment tmux answered.
+func (o OneShot) ActivePane(ctx context.Context, windowID string) (string, error) {
+	if err := safe.Arg(windowID); err != nil {
+		return "", fmt.Errorf("tmuxctl: ActivePane: windowID: %w", err)
+	}
+	// display-message -p prints the formatted value to stdout; -t
+	// scopes the lookup to the window; the format string is a single
+	// tmux variable so the entire response is the pane ID plus a
+	// trailing newline. We deliberately do NOT use list-panes here:
+	// display-message returns exactly one value, which keeps the
+	// parse trivial.
+	out, err := o.run(ctx, "display-message", "-p", "-t", windowID, "-F", "#{pane_id}")
+	if errors.Is(err, ErrServerNotRunning) {
+		return "", ErrNoSuchPane
+	}
+	if err != nil {
+		low := err.Error()
+		if strings.Contains(low, "can't find window") ||
+			strings.Contains(low, "can't find pane") ||
+			strings.Contains(low, "window not found") {
+			return "", ErrNoSuchPane
+		}
+		return "", err
+	}
+	return parsePaneID(out)
+}
+
+// parsePaneID validates a single-line tmux pane ID (`%` + decimal
+// digits). Factored out so a unit test can exercise the happy and
+// malformed paths without needing a live tmux server; the integration
+// test in oneshot_integration_test.go pins the real round-trip.
+func parsePaneID(out []byte) (string, error) {
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return "", fmt.Errorf("tmuxctl: empty pane id from tmux")
+	}
+	if !strings.HasPrefix(s, "%") || len(s) < 2 {
+		return "", fmt.Errorf("tmuxctl: malformed pane id %q (want '%%' + digits)", safe.Line(s))
+	}
+	for _, r := range s[1:] {
+		if r < '0' || r > '9' {
+			return "", fmt.Errorf("tmuxctl: malformed pane id %q (non-digit after '%%')", safe.Line(s))
+		}
+	}
+	return s, nil
+}
+
+// ErrNoSuchPane is returned by ActivePane when the target window does
+// not exist (closed by the user, never existed) or the tmux server is
+// not running. Callers should treat this as a soft failure — the
+// window may simply have been closed between the list-windows call
+// and the active-pane lookup.
+var ErrNoSuchPane = errors.New("tmuxctl: no such pane")
+
 // KillServer terminates the sm4c tmux server. It returns nil if the
 // server was already gone (idempotent teardown is the only sensible
 // behavior for a `sm4c stop`).

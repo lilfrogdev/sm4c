@@ -111,27 +111,87 @@ type Model struct {
 	// so the substring assertions keep working without a resize.
 	width  int
 	height int
+
+	// paneEvents / paneResolver are the M3b.1 dependencies. Both are
+	// optional (nil means "no pane preview"); the right pane degrades
+	// to a static "preview unavailable" line in that case. See
+	// panes.go for the dependency contracts.
+	paneEvents   <-chan PaneEvent
+	paneResolver ActivePaneResolver
+
+	// paneStreamClosed records that the upstream channel has been
+	// closed (the tmuxctl.Client terminated). Once set, the right
+	// pane shows a "preview disconnected" hint and the Model stops
+	// arming further reads.
+	paneStreamClosed bool
+
+	// paneByWindow caches the ActivePaneResolver answer for each
+	// highlighted window ID. Populated by paneResolvedMsg; cleared
+	// by sessionsMsg when the owning window disappears. Keeping
+	// the mapping per-window (rather than per-session-index) means
+	// a session being inserted above the highlighted one does not
+	// invalidate the cached pane ID.
+	paneByWindow map[string]string
+
+	// paneErrByWindow stores the last resolver error per window so
+	// the right pane can show "(pane lookup failed: …)" for the
+	// highlighted selection without hiding live data for other
+	// sessions.
+	paneErrByWindow map[string]error
+
+	// paneBuffers holds the ring buffer for every pane the stream
+	// has delivered bytes for. Keyed by pane ID (as produced by
+	// ActivePaneResolver / %output). Buffers are created lazily on
+	// first write; there is no eviction in M3b.1 because the byte
+	// cap is small and the number of live panes is bounded by the
+	// number of sm4c-managed windows.
+	paneBuffers map[string]*paneBuffer
+
+	// resolvedWindowID is the last window ID we issued a resolver
+	// call for. Used to debounce: if j/k navigates to a row whose
+	// pane we already resolved, we skip the resolver round-trip.
+	resolvedWindowID string
 }
 
-// NewModel constructs a fresh Model. A nil lister is explicitly
-// supported — it keeps the Model in the empty-state view with no
-// polling, which is the shape every pre-M3 unit test already
-// expects. Production callers (cmd/sm4c/cli/tui.go) pass a lister
-// that wraps tmuxctl.OneShot.ListWindows and filters to managed
-// windows.
+// NewModel constructs a fresh Model. Every dependency is optional:
+//
+//   - A nil SessionLister keeps the Model in the empty-state view
+//     with no polling, which is the shape every unit test that does
+//     not care about session data already expects.
+//   - A nil PaneEventStream / ActivePaneResolver disables the M3b.1
+//     pane preview; the right pane shows a "(pane preview
+//     unavailable)" hint instead of live bytes.
+//
+// Production callers (cmd/sm4c/cli/tui.go) pass a lister that wraps
+// tmuxctl.OneShot.ListWindows, a stream backed by
+// tmuxctl.Client.Events(), and a resolver backed by
+// tmuxctl.OneShot.ActivePane.
 //
 // pollInterval is honored only when it's positive; zero or negative
 // means "fetch once at Init and never again", which is useful for
 // tests that want exactly one fetch event.
-func NewModel(lister SessionLister, pollInterval time.Duration) Model {
+func NewModel(
+	lister SessionLister,
+	pollInterval time.Duration,
+	paneStream PaneEventStream,
+	paneResolver ActivePaneResolver,
+) Model {
 	if pollInterval < 0 {
 		pollInterval = 0
 	}
-	return Model{
-		lister:       lister,
-		pollInterval: pollInterval,
-		highlight:    -1,
+	m := Model{
+		lister:          lister,
+		pollInterval:    pollInterval,
+		highlight:       -1,
+		paneResolver:    paneResolver,
+		paneByWindow:    make(map[string]string),
+		paneErrByWindow: make(map[string]error),
+		paneBuffers:     make(map[string]*paneBuffer),
 	}
+	if paneStream != nil {
+		m.paneEvents = paneStream()
+	}
+	return m
 }
 
 // Action reports what the caller should do after the program exits.
@@ -148,13 +208,32 @@ func (m Model) Action() Action { return m.action }
 // not validate or parse it.
 func (m Model) SelectedWindowID() string { return m.selectedWindowID }
 
-// Init is the Bubble Tea entry point. When a SessionLister is wired,
-// we kick off the first fetch immediately so the sidebar paints real
-// data on the first frame instead of "no sessions" flashing for a
-// tick. When no lister is configured (tests, or a deliberately inert
-// Model) Init returns nil — no work, no messages, no tick chain.
+// Init is the Bubble Tea entry point. It kicks off both concurrent
+// streams the Model depends on:
+//
+//   - The session fetch (sessionsMsg chain), so the sidebar paints
+//     real data on the first frame rather than flashing "no sessions"
+//     for one tick.
+//   - The pane event reader (paneDataMsg / paneStreamClosedMsg chain),
+//     so the right pane starts buffering bytes as soon as tmux emits
+//     them.
+//
+// Either dependency may be nil, in which case its chain is simply
+// absent. This is what keeps the unit tests — which run with no
+// lister, no stream, no resolver — from needing to drive message
+// plumbing they do not care about.
 func (m Model) Init() tea.Cmd {
-	return m.fetchSessions()
+	fetch := m.fetchSessions()
+	pane := m.waitForPaneEvent()
+	switch {
+	case fetch != nil && pane != nil:
+		return tea.Batch(fetch, pane)
+	case fetch != nil:
+		return fetch
+	case pane != nil:
+		return pane
+	}
+	return nil
 }
 
 // Update is the pure state-transition function. The only messages
@@ -178,13 +257,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	case sessionsMsg:
-		return m.handleSessions(msg), m.scheduleNextPoll()
+		next := m.handleSessions(msg)
+		return next, tea.Batch(next.scheduleNextPoll(), next.resolveHighlightedPaneIfNeeded())
 	case pollTickMsg:
 		// A tick's only job is to kick off the next fetch. The fetch
 		// itself, once complete, will schedule the following tick.
 		// This keeps the cadence strictly serial — no overlap between
 		// a slow fetch and the next ticker firing.
 		return m, m.fetchSessions()
+	case paneDataMsg:
+		return m.handlePaneData(msg), m.waitForPaneEvent()
+	case paneStreamClosedMsg:
+		// The upstream stream terminated (tmuxctl.Client exited, or
+		// the CLI layer closed the channel on TUI teardown). We do
+		// NOT re-arm — a closed channel would spin a hot loop — and
+		// we flip the flag so the right pane can explain what the
+		// user is seeing.
+		m.paneStreamClosed = true
+		m.paneEvents = nil
+		return m, nil
+	case paneResolvedMsg:
+		return m.handlePaneResolved(msg), nil
 	}
 	return m, nil
 }
@@ -195,6 +288,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // (a session closed while we were polling). Empty lister results and
 // nil returns are normalized to a nil slice + highlight = -1, which
 // makes the "no sessions" branch in View a single len-check.
+//
+// We also prune paneByWindow / paneErrByWindow entries for windows
+// that are no longer in the snapshot. The corresponding paneBuffers
+// are retained: a window closing does not necessarily mean its pane
+// is gone from tmux's point of view within this tick, and the next
+// stream event would simply re-populate them.
 func (m Model) handleSessions(msg sessionsMsg) Model {
 	m.ready = true
 	m.listErr = msg.err
@@ -207,7 +306,87 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 	case m.highlight >= len(m.sessions):
 		m.highlight = len(m.sessions) - 1
 	}
+	// Prune per-window caches. We build a small set of still-live
+	// window IDs rather than iterating sessions inside the loop,
+	// because sessions can grow into the low hundreds once users
+	// run many concurrent workspaces.
+	alive := make(map[string]struct{}, len(m.sessions))
+	for _, s := range m.sessions {
+		alive[s.WindowID] = struct{}{}
+	}
+	for wid := range m.paneByWindow {
+		if _, ok := alive[wid]; !ok {
+			delete(m.paneByWindow, wid)
+		}
+	}
+	for wid := range m.paneErrByWindow {
+		if _, ok := alive[wid]; !ok {
+			delete(m.paneErrByWindow, wid)
+		}
+	}
 	return m
+}
+
+// handlePaneData appends a chunk of bytes into the ring buffer for
+// its pane. Unknown pane IDs are accepted: the stream carries data
+// for every pane on the sm4c socket, not just the one we are
+// previewing, so we happily buffer them and let the render path
+// decide what to show.
+func (m Model) handlePaneData(msg paneDataMsg) Model {
+	if msg.paneID == "" {
+		return m
+	}
+	buf, ok := m.paneBuffers[msg.paneID]
+	if !ok {
+		buf = newPaneBuffer()
+		m.paneBuffers[msg.paneID] = buf
+	}
+	buf.append(msg.data)
+	return m
+}
+
+// handlePaneResolved records the (windowID, paneID) mapping the
+// resolver returned. On error we stash the error so the right pane
+// can surface it, and we intentionally do NOT clear any previously
+// resolved pane ID: a transient resolver failure should not blank
+// out an already-working preview.
+func (m Model) handlePaneResolved(msg paneResolvedMsg) Model {
+	if msg.windowID == "" {
+		return m
+	}
+	if msg.err != nil {
+		m.paneErrByWindow[msg.windowID] = msg.err
+		return m
+	}
+	delete(m.paneErrByWindow, msg.windowID)
+	if msg.paneID != "" {
+		m.paneByWindow[msg.windowID] = msg.paneID
+	}
+	return m
+}
+
+// resolveHighlightedPaneIfNeeded triggers an ActivePaneResolver call
+// when the highlighted session changed and we do not yet have a
+// cached pane ID for it. Called from both the sessions-update path
+// and the key-handling path. Returns nil when no resolution is
+// necessary or possible (no resolver, no highlight, already known).
+func (m *Model) resolveHighlightedPaneIfNeeded() tea.Cmd {
+	if m.paneResolver == nil {
+		return nil
+	}
+	if m.highlight < 0 || m.highlight >= len(m.sessions) {
+		return nil
+	}
+	wid := m.sessions[m.highlight].WindowID
+	if wid == "" || wid == m.resolvedWindowID {
+		return nil
+	}
+	if _, known := m.paneByWindow[wid]; known {
+		m.resolvedWindowID = wid
+		return nil
+	}
+	m.resolvedWindowID = wid
+	return m.resolveActivePane(wid)
 }
 
 // handleKey is factored out of Update so the unit tests can exercise
@@ -260,13 +439,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.highlight < len(m.sessions)-1 {
 			m.highlight++
 		}
-		return m, nil
+		return m, m.resolveHighlightedPaneIfNeeded()
 
 	case "k", "up":
 		if m.highlight > 0 {
 			m.highlight--
 		}
-		return m, nil
+		return m, m.resolveHighlightedPaneIfNeeded()
 
 	case "ctrl+b":
 		// Placeholder for M3b's focus toggle. We pin the binding
@@ -413,7 +592,7 @@ func (m Model) renderSidebarView() string {
 	right := rightPaneStyle.
 		Width(rightW).
 		Height(m.height).
-		Render(m.renderRightPanePlaceholder())
+		Render(m.renderRightPane(rightW, m.height))
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, right)
 }
@@ -455,29 +634,152 @@ func (m Model) renderSidebarColumn() string {
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
-// renderRightPanePlaceholder is the M3a stand-in for what M3b will
-// replace with the VT-rendered hosted claude pane. It reports the
-// current selection ("(no active session)" vs. the name of the
-// highlighted session) so the split is visibly meaningful even
-// before the pane has content. Keeping it here rather than as a
-// const means M3b only needs to swap this one function.
-func (m Model) renderRightPanePlaceholder() string {
-	var hint string
-	switch {
-	case len(m.sessions) == 0:
-		hint = "no active session"
-	case m.highlight < 0 || m.highlight >= len(m.sessions):
-		hint = "no active session"
-	default:
-		s := m.sessions[m.highlight]
-		name := s.Name
-		if name == "" {
-			name = "(unnamed)"
-		}
-		hint = "selected: " + name + "  " + s.WindowID
+// renderRightPane paints the M3b.1 right-hand column: a live raw-
+// bytes preview of the highlighted session's tmux pane, with a
+// fallback for every state that has no preview to show (no lister,
+// no sessions, stream down, pane not yet resolved).
+//
+// M3b.2 will replace the raw-byte path with a VT-rendered screen
+// grid; until then, we strip non-printables so a stray ANSI escape
+// or control byte cannot corrupt the outer terminal. This matches
+// the defensive posture we take for safe.Label on window titles.
+//
+// The width/height args are the interior dimensions of the right
+// column (i.e. after lipgloss padding and border accounting). They
+// bound the preview so the last N visible lines are all that remain
+// visible — older bytes scroll off the top just like a real pane.
+func (m Model) renderRightPane(width, height int) string {
+	header := m.renderRightPaneHeader()
+	body := m.renderRightPaneBody(width, height)
+	return header + "\n\n" + body
+}
+
+// renderRightPaneHeader is the first line of the right pane. It
+// names the currently highlighted session (or explains why the
+// preview is inactive) and carries a compact status like "preview
+// ready" / "resolving…" so the user always knows what state they
+// are in.
+func (m Model) renderRightPaneHeader() string {
+	if len(m.sessions) == 0 {
+		return hintStyle.Render("no active session")
 	}
-	return hintStyle.Render(hint) + "\n" +
-		hintStyle.Render("press enter to attach  (embedded pane lands in M3b)")
+	if m.highlight < 0 || m.highlight >= len(m.sessions) {
+		return hintStyle.Render("no active session")
+	}
+	s := m.sessions[m.highlight]
+	name := s.Name
+	if name == "" {
+		name = "(unnamed)"
+	}
+	line := titleStyle.Render(name) + hintStyle.Render("  "+s.WindowID)
+	return line
+}
+
+// renderRightPaneBody is the body beneath the header. It returns
+// either the last N lines of the selected pane's ring buffer or a
+// state-appropriate hint line. Keeping every branch in one place
+// makes it easy to reason about what the user will see in each
+// configuration.
+func (m Model) renderRightPaneBody(width, height int) string {
+	if len(m.sessions) == 0 || m.highlight < 0 || m.highlight >= len(m.sessions) {
+		return hintStyle.Render("press n to start a new session")
+	}
+	s := m.sessions[m.highlight]
+	wid := s.WindowID
+
+	if m.paneStreamClosed {
+		return hintStyle.Render("preview disconnected — tmux control channel closed")
+	}
+	if m.paneResolver == nil && m.paneEvents == nil {
+		return hintStyle.Render("pane preview unavailable") + "\n" +
+			hintStyle.Render("press enter to attach")
+	}
+	if err, ok := m.paneErrByWindow[wid]; ok && err != nil {
+		return hintStyle.Render("pane lookup failed: " + err.Error())
+	}
+	paneID, ok := m.paneByWindow[wid]
+	if !ok {
+		return hintStyle.Render("resolving pane…")
+	}
+	buf, ok := m.paneBuffers[paneID]
+	if !ok || buf == nil {
+		return hintStyle.Render("waiting for output  " + paneID)
+	}
+	raw := buf.snapshot()
+	if len(raw) == 0 {
+		return hintStyle.Render("waiting for output  " + paneID)
+	}
+	// Reserve two lines for the header + blank separator emitted by
+	// renderRightPane. Subtract a little more for lipgloss padding.
+	maxLines := height - 2
+	if maxLines < 3 {
+		maxLines = 3
+	}
+	return stripToPrintable(raw, width, maxLines)
+}
+
+// stripToPrintable reduces a raw byte slice to something safe to
+// render in the right pane: only printable ASCII + newlines, clipped
+// to the last maxLines rows and the rightmost maxWidth columns per
+// row. This is a deliberately conservative transformation; M3b.2
+// replaces it with a full VT emulator.
+func stripToPrintable(raw []byte, maxWidth, maxLines int) string {
+	if maxWidth < 1 {
+		maxWidth = 1
+	}
+	if maxLines < 1 {
+		maxLines = 1
+	}
+	// Split into lines first; each line is then independently
+	// sanitized + clipped. We use \n as the only delimiter — \r is
+	// treated as a non-printable and dropped, which matches what a
+	// VT emulator would do for a CR at column 0.
+	lines := make([]string, 0, 16)
+	var cur []byte
+	for _, b := range raw {
+		switch {
+		case b == '\n':
+			lines = append(lines, clipLine(cur, maxWidth))
+			cur = cur[:0]
+		case b == '\t':
+			cur = append(cur, ' ', ' ', ' ', ' ')
+		case b >= 0x20 && b < 0x7f:
+			cur = append(cur, b)
+		default:
+			// Non-ASCII byte: render as '?' so the outer terminal
+			// never sees a partial UTF-8 sequence or a control
+			// byte. M3b.2 handles UTF-8 + ANSI properly.
+			cur = append(cur, '?')
+		}
+	}
+	if len(cur) > 0 {
+		lines = append(lines, clipLine(cur, maxWidth))
+	}
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	// Join without lipgloss — we want plain lines; the right pane
+	// style already handles padding and border.
+	out := ""
+	for i, l := range lines {
+		if i > 0 {
+			out += "\n"
+		}
+		out += l
+	}
+	return out
+}
+
+// clipLine keeps the last maxWidth bytes of line (which at this
+// point is already filtered to printable ASCII, so len == column
+// count). Clipping from the left preserves the rightmost — i.e.
+// most recent — columns of tmux output, which is what a user
+// glancing at a pane actually wants.
+func clipLine(line []byte, maxWidth int) string {
+	if len(line) <= maxWidth {
+		return string(line)
+	}
+	return string(line[len(line)-maxWidth:])
 }
 
 // sidebarWidth picks the sidebar column's content width for the
@@ -604,13 +906,20 @@ func intToString(n int) string {
 // inspect Action() and SelectedWindowID(). On any runtime error (TTY
 // setup, input stream closed unexpectedly) the error is returned and
 // the intents are ignored.
-func Run(in interface {
-	Read(p []byte) (n int, err error)
-}, out interface {
-	Write(p []byte) (n int, err error)
-}, lister SessionLister, pollInterval time.Duration) (Model, error) {
+func Run(
+	in interface {
+		Read(p []byte) (n int, err error)
+	},
+	out interface {
+		Write(p []byte) (n int, err error)
+	},
+	lister SessionLister,
+	pollInterval time.Duration,
+	paneStream PaneEventStream,
+	paneResolver ActivePaneResolver,
+) (Model, error) {
 	p := tea.NewProgram(
-		NewModel(lister, pollInterval),
+		NewModel(lister, pollInterval, paneStream, paneResolver),
 		tea.WithInput(in),
 		tea.WithOutput(out),
 		tea.WithAltScreen(),
