@@ -64,17 +64,38 @@ func Execute(args []string) int {
 func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 	pf := &persistentFlags{}
 	cmd := &cobra.Command{
-		Use:   "sm4c",
+		Use:   "sm4c [claude-args...]",
 		Short: "Session manager for the Claude Code CLI",
 		Long: `sm4c is an unofficial TUI session manager that sits on top of the official
-Claude Code CLI. It hosts multiple concurrent claude sessions on an isolated
-tmux server and surfaces per-session status in a sidebar.
+Claude Code CLI. It hosts concurrent claude sessions on an isolated tmux
+server and surfaces per-session status.
 
 sm4c is not affiliated with Anthropic. You must install the official claude
-CLI separately; sm4c does not call Anthropic APIs directly.`,
+CLI separately; sm4c does not call Anthropic APIs directly.
+
+Running sm4c with no subcommand spawns a new claude session on the sm4c
+tmux socket and attaches to it. Any positional arguments are forwarded
+verbatim to claude, so ` + "`sm4c /help`" + ` and ` + "`sm4c -- -n my-session`" + `
+both work. Use ` + "`--`" + ` before any dash-prefixed flags you want claude
+to receive; otherwise Cobra will try to parse them as sm4c flags.
+
+Subcommands (ls, status, stop, doctor, version) are read-mostly and
+never spawn a claude session.`,
+		Example: `  sm4c                           # launch a new claude session
+  sm4c /help                     # launch with /help as first input
+  sm4c -- -n my-session          # launch with claude flags
+  sm4c ls                        # list managed sessions
+  sm4c doctor                    # preflight self-check`,
 		Version:       Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		// ArbitraryArgs disables Cobra's default "unknown command"
+		// error for any positional that doesn't match a registered
+		// subcommand. Combined with SilenceUsage this means a typo
+		// like `sm4c lss` is handed to claude rather than rejected
+		// with a usage dump — which is consistent with the documented
+		// "everything after sm4c's own flags goes to claude" model.
+		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runRoot(cmd, args, pf)
 		},
@@ -98,15 +119,17 @@ CLI separately; sm4c does not call Anthropic APIs directly.`,
 	return cmd
 }
 
-// runRoot is the bare `sm4c` invocation. In M0 this is a placeholder that
-// explains what is not yet implemented. M1 will replace it with the TUI
-// launcher.
+// runRoot is the bare `sm4c [claude-args…]` invocation. M2c wires this
+// to the launch path: preflight, spawn a new claude window on the sm4c
+// tmux socket, then exec into `tmux attach-session` so the current
+// process is replaced by the tmux client.
+//
+// The TUI (sidebar + pane multiplexing) is still M3+; for now "bare
+// sm4c" is a direct launcher, which is already a strict improvement
+// over raw `tmux -L sm4c` for users and gives us a real usage path to
+// dogfood before M3 lands.
 func runRoot(cmd *cobra.Command, args []string, pf *persistentFlags) error {
-	_ = args
-	_ = pf
-	cmd.Println("sm4c: TUI is not implemented yet (M1 milestone).")
-	cmd.Println("Run `sm4c --help` to see available subcommands, or `sm4c doctor` for a self-check.")
-	return nil
+	return runLaunch(cmd, args, pf)
 }
 
 // cobraFlagError is a sentinel type used by Execute to decide whether to
