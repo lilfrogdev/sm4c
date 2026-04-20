@@ -70,6 +70,19 @@ func TestDefaultSessionPollInterval(t *testing.T) {
 	}
 }
 
+// TestDefaultMonitorSilence pins the M3d "idle" threshold at 3s.
+// This is the interval tmux waits after the last byte of %output
+// on a managed window before emitting %silence, which is what
+// flips the sidebar glyph from "working" to "idle / attention".
+// The value is user-visible (it gates how snappy the sidebar
+// feels) and shouldn't drift silently.
+func TestDefaultMonitorSilence(t *testing.T) {
+	t.Parallel()
+	if got := Default().MonitorSilence.AsDuration(); got != 3*time.Second {
+		t.Fatalf("Default().MonitorSilence = %v; want 3s", got)
+	}
+}
+
 func TestLoadRejectsWorldWritable(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("perm checks are unix-only")

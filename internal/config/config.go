@@ -40,10 +40,24 @@ type Config struct {
 	// in tmux key notation (e.g. "C-a", "C-b").
 	PrefixKey string `toml:"prefix_key"`
 
-	// MonitorSilence is the per-pane silence threshold. When a claude pane
-	// produces no output for this duration we mark it as idle/done.
+	// MonitorSilence is the per-pane silence threshold. When a claude
+	// pane produces no output for this duration after a burst of
+	// activity, sm4c marks it as idle/done and lights the "attention"
+	// dot in the sidebar. This is wired to tmux's `monitor-silence`
+	// window option on every managed window at spawn time.
 	//
-	// On disk this is a Go duration string: "5s", "250ms", "1m30s".
+	// The default (3s) is tuned so a claude response that ends at a
+	// prompt flips to idle within one poll tick after streaming
+	// stops, but a brief mid-response pause (typing indicator, a
+	// slow tool call) does not prematurely flip the glyph. Lowering
+	// this to 1s produces a more reactive sidebar at the cost of
+	// occasional flicker; raising it past 5s delays the "ready for
+	// you" cue.
+	//
+	// Zero disables monitor-silence entirely — the sidebar will
+	// still track working/quiet via monitor-activity, but will
+	// never surface an "idle / waiting" state. On disk this is a
+	// Go duration string: "3s", "250ms", "1m30s".
 	MonitorSilence Duration `toml:"monitor_silence"`
 
 	// SessionPollInterval is how often the TUI re-runs `tmux
@@ -68,7 +82,7 @@ func Default() Config {
 	return Config{
 		SocketName:          "sm4c",
 		PrefixKey:           "C-a",
-		MonitorSilence:      Duration(5 * time.Second),
+		MonitorSilence:      Duration(3 * time.Second),
 		SessionPollInterval: Duration(1 * time.Second),
 		LogLevel:            "info",
 	}

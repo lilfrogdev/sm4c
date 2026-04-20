@@ -54,7 +54,7 @@ func runTUI(cmd *cobra.Command, pf *persistentFlags) error {
 	if report.ClaudePath == "" {
 		return fmt.Errorf("claude is not available: %s", summarizeFatals(report))
 	}
-	return openTUI(cmd, o, report.ClaudePath, "", tui.FocusSidebar, cfg.SessionPollInterval.AsDuration())
+	return openTUI(cmd, o, report.ClaudePath, "", tui.FocusSidebar, cfg.SessionPollInterval.AsDuration(), cfg.MonitorSilence.AsDuration())
 }
 
 // openTUI is the shared entry into the Bubble Tea runtime. Both
@@ -75,7 +75,7 @@ func runTUI(cmd *cobra.Command, pf *persistentFlags) error {
 // or a shell script — we refuse to open the TUI and instead return
 // a short pointer to the shell shortcuts. This prevents sm4c from
 // hanging waiting for a keystroke that will never come.
-func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID string, initialFocus tui.Focus, pollInterval time.Duration) error {
+func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID string, initialFocus tui.Focus, pollInterval, silenceThreshold time.Duration) error {
 	if !interactiveStdin() {
 		// Non-interactive stdin: refuse to launch the TUI (it would
 		// hang) and give the user a concrete alternative. We return
@@ -89,7 +89,7 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 	highlight := initialWindowID
 	focus := initialFocus
 	for {
-		final, err := runTUIProgram(cmd, o, highlight, focus, pollInterval)
+		final, err := runTUIProgram(cmd, o, highlight, focus, pollInterval, silenceThreshold)
 		if err != nil {
 			return fmt.Errorf("tui: %w", err)
 		}
@@ -144,7 +144,7 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 // relative to setupOneShot.
 var runTUIProgram = runTUIProgramReal
 
-func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID string, initialFocus tui.Focus, pollInterval time.Duration) (tui.Model, error) {
+func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID string, initialFocus tui.Focus, pollInterval, silenceThreshold time.Duration) (tui.Model, error) {
 	// Bubble Tea wants the actual process stdin/stdout to drive
 	// raw-mode input and terminal-level escape sequences. cmd.InOrStdin
 	// and cmd.OutOrStdout return interfaces that are os.Stdin /
@@ -239,6 +239,7 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 			KeySender:        keys,
 			InitialHighlight: initialWindowID,
 			InitialFocus:     initialFocus,
+			SilenceThreshold: silenceThreshold,
 		},
 	)
 }

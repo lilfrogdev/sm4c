@@ -119,10 +119,18 @@ Anything after `--` is forwarded verbatim to `claude`. If a claude arg does not 
 
 To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename. sm4c does not expose a tmux detach shortcut; every interaction with a session happens inside the TUI.
 
-Planned for M3d–M3e (not yet shipped):
+Session status glyphs (M3d). Each sidebar row starts with a two-column cell that reflects that session's live state:
 
-- M3d: status badges. Live per-session status (idle / running / needs input / done) derived from tmux's `monitor-bell` / `monitor-activity` / `monitor-silence` flags.
-- M3e: compose flow for `n`. Pick the target working directory and set a session name before spawning, replacing today's bare-`claude` stopgap.
+- `·` (faint) — Quiet: the session is alive but hasn't produced any output yet.
+- `|/-\` (animated) — Working: claude is streaming output right now.
+- `●` — Idle: claude finished its response and is waiting for you. Threshold is `monitor_silence` from `config.toml` (default 3s).
+- `●` (amber) — Attention: claude rang the terminal bell (permission prompt, error). The glyph stays amber until you type into that session's pane, which acknowledges the bell.
+
+The animation only runs while at least one session is Working, so a TUI full of idle sessions is visually still. Status is derived entirely from the byte stream sm4c already consumes; no tmux `monitor-*` options are toggled.
+
+Planned for M3e (not yet shipped):
+
+- Compose flow for `n`. Pick the target working directory and set a session name before spawning, replacing today's bare-`claude` stopgap.
 
 ## Security
 

@@ -75,7 +75,7 @@ claude_bin = "/sm4c/tests/no/such/claude"
 
 	calls := 0
 	orig := runTUIProgram
-	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot, _ string, _ tui.Focus, _ time.Duration) (tui.Model, error) {
+	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot, _ string, _ tui.Focus, _, _ time.Duration) (tui.Model, error) {
 		calls++
 		return tui.Model{}, nil
 	}
@@ -123,7 +123,7 @@ claude_bin = "/bin/sh"
 	var seenFocus tui.Focus
 	var seenCount int
 	origTUI := runTUIProgram
-	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot, initialHighlight string, initialFocus tui.Focus, _ time.Duration) (tui.Model, error) {
+	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot, initialHighlight string, initialFocus tui.Focus, _, _ time.Duration) (tui.Model, error) {
 		seenHighlight = initialHighlight
 		seenFocus = initialFocus
 		seenCount++

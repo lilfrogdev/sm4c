@@ -124,6 +124,16 @@ type Deps struct {
 	KeySender        KeySender
 	InitialHighlight string
 	InitialFocus     Focus
+
+	// SilenceThreshold is the per-pane "silence" window used by
+	// the M3d status FSM. A pane that has not emitted any bytes
+	// for at least this duration is considered Idle (claude
+	// response finished, prompt waiting). Zero means "never
+	// flip to Idle" — once a pane has had output, it stays
+	// Working forever; this is the opt-out path for
+	// environments where the Idle signal would be noise.
+	// Defaults to Config.MonitorSilence, default 3s.
+	SilenceThreshold time.Duration
 }
 
 // Model is the Bubble Tea model backing the sidebar view. Its
@@ -358,6 +368,49 @@ type Model struct {
 	// frame, which is indistinguishable from the captured path
 	// for a settled session but correct for a still-booting one.
 	skipCaptureWindow string
+
+	// paneStatuses holds the M3d activity record for each tmux
+	// window sm4c has ever seen output for. Keyed by WINDOW ID
+	// (e.g. "@42") rather than pane ID because status is a
+	// session-level concern — the sidebar shows one row per
+	// window — and because the pane ID underneath a window can
+	// get invalidated and re-resolved during a close-window
+	// storm (see handleWindowClosed). Keying by window ID means
+	// the derived glyph survives that churn: the byte-stream
+	// timestamp is what matters, not which concrete pane ID we
+	// happened to learn first. Populated from handlePaneData,
+	// which looks up the owning window via paneByWindow at
+	// byte-arrival time.
+	paneStatuses map[string]paneStatus
+
+	// paneToWindow is the reverse of paneByWindow: given a pane
+	// ID (the key %output events carry), find the owning window
+	// ID (the key paneStatuses uses). Maintained alongside
+	// paneByWindow in handlePaneResolved so handlePaneData can
+	// do the paneID → windowID lookup without iterating.
+	paneToWindow map[string]string
+
+	// silenceThreshold is the M3d "no output for this long = Idle"
+	// cutoff. Copied from Deps.SilenceThreshold at NewModel time
+	// and never mutated, so the derived-status calculation is
+	// referentially transparent for a given (paneStatus, now)
+	// tuple.
+	silenceThreshold time.Duration
+
+	// statusFrame is the animation counter consumed by
+	// statusGlyph when a pane is Working. Advanced on each
+	// statusFrameTickMsg; wraps implicitly because statusGlyph
+	// takes it modulo len(spinnerFrames).
+	statusFrame int
+
+	// statusTickArmed records that a statusFrameTickMsg is
+	// currently in flight. We use it to ensure we never have
+	// more than one ticker outstanding at a time — otherwise a
+	// Quiet→Working transition that races a still-in-flight
+	// tick would double the animation cadence (and double it
+	// again on the next race, etc.). Set when we schedule a
+	// tick; cleared when the tick arrives.
+	statusTickArmed bool
 }
 
 // paneBackfillBuffer bounds panePending per pane. 64 KiB is
@@ -385,6 +438,10 @@ func NewModel(deps Deps) Model {
 	if pollInterval < 0 {
 		pollInterval = 0
 	}
+	silenceThreshold := deps.SilenceThreshold
+	if silenceThreshold < 0 {
+		silenceThreshold = 0
+	}
 	m := Model{
 		lister:            deps.Lister,
 		pollInterval:      pollInterval,
@@ -403,6 +460,9 @@ func NewModel(deps Deps) Model {
 		paneCaptured:      make(map[string]bool),
 		panePending:       make(map[string][]byte),
 		sizedFor:          make(map[string][2]int),
+		paneStatuses:      make(map[string]paneStatus),
+		paneToWindow:      make(map[string]string),
+		silenceThreshold:  silenceThreshold,
 		paneViewW:         defaultPaneWidth,
 		paneViewH:         defaultPaneHeight,
 		focus:             FocusSidebar,
@@ -496,7 +556,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// a slow fetch and the next ticker firing.
 		return m, m.fetchSessions()
 	case paneDataMsg:
-		return m.handlePaneData(msg), m.waitForPaneEvent()
+		// Three things must happen on a byte chunk:
+		//  1. Fold the bytes into the VT emulator and status
+		//     record (handlePaneData).
+		//  2. Re-arm the pane event reader so the next chunk
+		//     arrives (waitForPaneEvent).
+		//  3. Arm the status animation ticker if this chunk
+		//     just flipped a pane into Working. We record the
+		//     armed flag on the returned Model so concurrent
+		//     paneDataMsg messages can't each mint their own
+		//     ticker (Bubble Tea has no de-dup on tea.Tick).
+		next := m.handlePaneData(msg)
+		cmds := []tea.Cmd{next.waitForPaneEvent()}
+		if tick := next.scheduleStatusTick(); tick != nil {
+			next.statusTickArmed = true
+			cmds = append(cmds, tick)
+		}
+		return next, tea.Batch(cmds...)
+	case statusFrameTickMsg:
+		// Advance the animation frame and, if any pane is
+		// still Working, schedule the next tick. The frame
+		// counter is modulo-applied inside statusGlyph, so
+		// plain integer increment is fine; wrap-around at
+		// math.MaxInt is measured in years of uninterrupted
+		// animation. statusTickArmed is flipped to false FIRST
+		// so scheduleStatusTick's own armed-guard lets the
+		// next tick through.
+		m.statusTickArmed = false
+		m.statusFrame++
+		if tick := m.scheduleStatusTick(); tick != nil {
+			m.statusTickArmed = true
+			return m, tick
+		}
+		return m, nil
 	case paneStreamClosedMsg:
 		// The upstream stream terminated (tmuxctl.Client exited, or
 		// the CLI layer closed the channel on TUI teardown). We do
@@ -600,9 +692,10 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 			m.pendingCloseWindow = ""
 		}
 	}
-	for wid := range m.paneByWindow {
+	for wid, paneID := range m.paneByWindow {
 		if _, ok := alive[wid]; !ok {
 			delete(m.paneByWindow, wid)
+			delete(m.paneToWindow, paneID)
 		}
 	}
 	for wid := range m.paneErrByWindow {
@@ -613,6 +706,11 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 	for wid := range m.sizedFor {
 		if _, ok := alive[wid]; !ok {
 			delete(m.sizedFor, wid)
+		}
+	}
+	for wid := range m.paneStatuses {
+		if _, ok := alive[wid]; !ok {
+			delete(m.paneStatuses, wid)
 		}
 	}
 	return m
@@ -637,6 +735,13 @@ func (m Model) handlePaneData(msg paneDataMsg) Model {
 	if msg.paneID == "" {
 		return m
 	}
+	// Activity tracking runs BEFORE the capturing branch so a
+	// pane that spent its entire lifetime behind a slow capture-
+	// pane round-trip still has its status fields populated when
+	// the capture finally lands and the preview becomes live.
+	// Otherwise the sidebar would show "Quiet" for a pane that
+	// has been emitting bytes the whole time.
+	m.updatePaneStatus(msg.paneID, msg.data)
 	if m.paneCapturing[msg.paneID] {
 		m.appendPending(msg.paneID, msg.data)
 		return m
@@ -648,6 +753,81 @@ func (m Model) handlePaneData(msg paneDataMsg) Model {
 	}
 	term.write(msg.data)
 	return m
+}
+
+// updatePaneStatus folds a fresh byte chunk into paneStatuses
+// for the M3d FSM: records the activity timestamp, flips the
+// everHadOutput bit, and — critically for the Attention state —
+// scans the chunk for BEL (0x07). A BEL anywhere in the chunk
+// sets the sticky bell flag; we do not count them. The flag is
+// cleared only by clearPaneAttention, which runs on the next
+// keystroke the user forwards to this pane (see
+// handleKeyInPaneFocus).
+//
+// Status is keyed by WINDOW ID, but %output events identify the
+// source pane — we translate via paneToWindow, which is kept in
+// sync by handlePaneResolved. If we see bytes from a pane we
+// have not yet resolved to a window (a race on brand-new
+// sessions where the first %output chunk arrives before the
+// resolver round-trip returns), we drop the status update for
+// this chunk; the next chunk after resolution will pick it up.
+// Losing a single chunk's worth of "working" signal on a <1s
+// window is imperceptible in the UI, and the alternative
+// (eagerly caching by pane ID and migrating later) pays
+// complexity costs for no user-visible gain.
+//
+// We deliberately do NOT filter BEL out of the byte stream
+// before writing to the emulator: the VT parser already treats
+// BEL as a no-op renderable, so leaving it in costs nothing and
+// preserves the original bytes for any downstream debugger that
+// later grows a tap on paneTerminals.
+func (m Model) updatePaneStatus(paneID string, data []byte) {
+	if paneID == "" || len(data) == 0 {
+		return
+	}
+	windowID := m.paneToWindow[paneID]
+	if windowID == "" {
+		return
+	}
+	ps := m.paneStatuses[windowID]
+	ps.lastOutputAt = time.Now()
+	ps.everHadOutput = true
+	if !ps.bell {
+		for _, b := range data {
+			if b == 0x07 {
+				ps.bell = true
+				break
+			}
+		}
+	}
+	m.paneStatuses[windowID] = ps
+}
+
+// clearPaneAttention is called when the user sends a keystroke
+// into a pane; it resets the owning window's bell flag so the
+// Attention glyph flips back to the derived-from-activity
+// state. We do not clear lastOutputAt / everHadOutput because
+// those are not "attention" state — a window that was Working
+// before the user typed should keep animating.
+//
+// Takes a pane ID because the call site (handleKeyInPaneFocus)
+// has that identifier in hand; we look up the owning window
+// internally so callers don't have to learn about the
+// window/pane split.
+func (m Model) clearPaneAttention(paneID string) {
+	if paneID == "" {
+		return
+	}
+	windowID := m.paneToWindow[paneID]
+	if windowID == "" {
+		return
+	}
+	ps, ok := m.paneStatuses[windowID]
+	if !ok || !ps.bell {
+		return
+	}
+	ps.bell = false
+	m.paneStatuses[windowID] = ps
 }
 
 // appendPending queues bytes in panePending[paneID] while capture
@@ -776,6 +956,7 @@ func (m Model) handlePaneResolved(msg paneResolvedMsg) (Model, tea.Cmd) {
 		return m, nil
 	}
 	m.paneByWindow[msg.windowID] = msg.paneID
+	m.paneToWindow[msg.paneID] = msg.windowID
 
 	if m.paneCapturer == nil {
 		return m, nil
@@ -1025,6 +1206,13 @@ func (m Model) handleKeyInPaneFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if len(data) == 0 {
 		return m, nil
 	}
+	// A keystroke into a pane is what "acknowledges" that pane's
+	// bell: the user has clearly noticed the session. We clear
+	// the flag here rather than in handleKeysSent so the glyph
+	// flips immediately on input, even if the tmux send-keys
+	// round-trip is still in flight (the user's intent is what
+	// matters; the round-trip is a syscall detail).
+	m.clearPaneAttention(paneID)
 	return m, m.sendKeysToPane(paneID, data)
 }
 
@@ -1097,10 +1285,12 @@ func (m Model) handleWindowClosed(msg windowClosedMsg) (tea.Model, tea.Cmd) {
 		delete(m.paneCapturing, paneID)
 		delete(m.paneCaptured, paneID)
 		delete(m.panePending, paneID)
+		delete(m.paneToWindow, paneID)
 	}
 	delete(m.paneByWindow, msg.windowID)
 	delete(m.paneErrByWindow, msg.windowID)
 	delete(m.sizedFor, msg.windowID)
+	delete(m.paneStatuses, msg.windowID)
 	if m.skipCaptureWindow == msg.windowID {
 		m.skipCaptureWindow = ""
 	}
@@ -1120,6 +1310,15 @@ func (m Model) handleWindowClosed(msg windowClosedMsg) (tea.Model, tea.Cmd) {
 		delete(m.paneCapturing, paneID)
 		delete(m.paneCaptured, paneID)
 		delete(m.panePending, paneID)
+		delete(m.paneToWindow, paneID)
+		// paneStatuses is intentionally NOT cleared here.
+		// Status is keyed by window ID and reflects a rolling
+		// byte-stream timeline; tmux's partial redraw on
+		// window-close does not invalidate whether the
+		// surviving claude is Working or Idle. Leaving the
+		// record in place keeps the sidebar glyph stable
+		// across a close-session event — its recompute via
+		// statusForWindow does not depend on paneByWindow.
 		delete(m.paneByWindow, wid)
 	}
 	// Reset the resolve latch too, otherwise
@@ -1535,15 +1734,22 @@ func (m Model) renderHeader() string {
 
 // renderSessionList emits one row per session. The row format is:
 //
-//	<active-marker> <name> <window-id>
+//	<status-glyph> <name> <window-id>
 //
-// where <active-marker> is a two-column cell ("● " for the tmux-
-// active window, "  " otherwise), <name> is the sanitized window
-// title, and <window-id> is the opaque tmux ID rendered faintly so
-// the eye treats it as metadata. The highlighted row is painted in
-// reverse video via rowHighlightStyle — the only "color" decision —
-// using the terminal's native reverse attribute, not a hex color,
-// per the no-theming rule.
+// where <status-glyph> is a two-column cell painted by
+// statusGlyph (animated spinner for Working, amber dot for
+// Attention, solid dot for Idle, faint middle dot for Quiet),
+// <name> is the sanitized window title, and <window-id> is the
+// opaque tmux ID rendered faintly so the eye treats it as
+// metadata. The highlighted row is painted in reverse video via
+// rowHighlightStyle using the terminal's native reverse
+// attribute, not a hex color, per the no-theming rule.
+//
+// We no longer render tmux's own "active window" marker: sm4c's
+// one-claude-per-window design means every managed window is
+// its own session, so the tmux-active flag is redundant with
+// the user's highlight cursor. Freeing that two-column cell for
+// status is the whole point of M3d.
 //
 // When the sessions slice is empty we emit a single faint
 // placeholder row so the sidebar stays visible with its key bar,
@@ -1553,12 +1759,11 @@ func (m Model) renderSessionList() string {
 	if len(m.sessions) == 0 {
 		return hintStyle.Render("  no sessions yet — press n to start one")
 	}
+	now := time.Now()
 	rows := make([]string, 0, len(m.sessions))
 	for i, s := range m.sessions {
-		marker := "  "
-		if s.Active {
-			marker = "● "
-		}
+		status := m.statusForWindow(s.WindowID, now)
+		glyph := statusGlyph(status, m.statusFrame)
 		name := s.Name
 		if name == "" {
 			// tmux always has a window name; an empty one would
@@ -1566,13 +1771,30 @@ func (m Model) renderSessionList() string {
 			// so the sidebar doesn't become an empty column.
 			name = "(unnamed)"
 		}
-		row := marker + name + "  " + hintStyle.Render(s.WindowID)
+		row := glyph + name + "  " + hintStyle.Render(s.WindowID)
 		if i == m.highlight {
 			row = rowHighlightStyle.Render(row)
 		}
 		rows = append(rows, row)
 	}
 	return strings.Join(rows, "\n")
+}
+
+// statusForWindow resolves a tmux window ID to the user-facing
+// SessionStatus. Because paneStatuses is keyed directly by
+// window ID, this is a single map lookup — no dependency on
+// paneByWindow, which means a transient reset of the
+// pane-resolution cache (see handleWindowClosed) does not
+// flicker the sidebar glyph. A window with no status record
+// (never emitted a byte, or resolver hasn't fired yet) is
+// reported as Quiet; that is the correct "we don't know
+// anything about this session yet" signal.
+func (m Model) statusForWindow(windowID string, now time.Time) SessionStatus {
+	ps, ok := m.paneStatuses[windowID]
+	if !ok {
+		return StatusQuiet
+	}
+	return ps.derivedStatus(now, m.silenceThreshold)
 }
 
 // pluralize is a tiny helper kept inline so the sidebar header's

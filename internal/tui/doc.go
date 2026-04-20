@@ -1,19 +1,26 @@
 // Package tui is sm4c's Bubble Tea front end.
 //
-// Scope in this milestone (M3c — input routing + focus toggle on
-// top of the M3b.3 VT-emulated pane preview):
+// Scope in this milestone (M3d — animated per-session status
+// glyphs on top of the M3c input-routing + focus surface):
 //
 //   - One unified sidebar layout, shown at all times:
 //
 //       * Title bar — "sm4c", with a faint pluralized session count
 //         appended when any sessions exist.
 //
-//       * Session list — one row per managed session with an
-//         active-marker column, name column, and faint window-id
-//         column. The highlighted row is painted in reverse video.
-//         When no sessions exist, the list area shows a single
-//         faint placeholder ("no sessions yet — press n to start
-//         one") so the sidebar never collapses to a bare header.
+//       * Session list — one row per managed session with a
+//         two-column status glyph, name column, and faint
+//         window-id column. The highlighted row is painted in
+//         reverse video. The status glyph (M3d) reflects that
+//         session's live state: faint `·` (Quiet), solid `●`
+//         (Idle), animated `|/-\` spinner (Working), amber `●`
+//         (Attention — claude rang the bell, user hasn't
+//         acknowledged yet). The spinner only runs while at
+//         least one session is Working, so an all-idle TUI is
+//         visually still. When no sessions exist, the list area
+//         shows a single faint placeholder ("no sessions yet —
+//         press n to start one") so the sidebar never collapses
+//         to a bare header.
 //
 //       * Key bar — the full binding list, always visible so the
 //         user can see what's available regardless of session
@@ -140,10 +147,25 @@
 //     directory, and the TUI reopens with the new window
 //     highlighted.
 //
-//   - The status FSM (M3d) is still deferred. Per-session status
-//     glyphs in the sidebar (idle / running / needs-input / done)
-//     land once the tmux monitor-bell / monitor-activity /
-//     monitor-silence wiring is in place.
+//   - Status FSM (M3d). Per-session status is derived from the
+//     pane byte stream sm4c already consumes, NOT from tmux's
+//     monitor-bell / monitor-activity / monitor-silence flags.
+//     Those flags are sticky in tmux (cleared only when a client
+//     "sees" the window) and fit a "notify me about a window
+//     I'm not looking at" use case, not sm4c's reactive sidebar.
+//     Transitions (per pane): Quiet → Working on first byte;
+//     Working → Idle after Deps.SilenceThreshold of no bytes
+//     (plumbed from Config.MonitorSilence, default 3s); Idle →
+//     Working on any byte; any state → Attention on a BEL
+//     (0x07) byte; Attention → derived-from-activity on the
+//     next keystroke the user forwards to that pane (which
+//     acknowledges the bell). The animation ticker
+//     (statusFrameInterval = 250ms) only runs while at least
+//     one pane is Working, so a TUI full of idle sessions does
+//     not burn a background re-render budget. Status is keyed
+//     by tmux window ID in paneStatuses (not pane ID) so the
+//     close-session churn that invalidates paneByWindow for
+//     survivors does not flicker the sidebar glyphs.
 //
 // Design rules enforced here:
 //

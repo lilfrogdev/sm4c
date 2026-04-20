@@ -79,7 +79,7 @@ func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 		return err
 	}
 
-	return openTUI(cmd, o, report.ClaudePath, windowID, tui.FocusPane, cfg.SessionPollInterval.AsDuration())
+	return openTUI(cmd, o, report.ClaudePath, windowID, tui.FocusPane, cfg.SessionPollInterval.AsDuration(), cfg.MonitorSilence.AsDuration())
 }
 
 // spawnClaudeWindow is the thin wrapper around NewClaudeWindow that
