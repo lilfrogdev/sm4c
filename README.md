@@ -76,19 +76,28 @@ make build
 
 ## Quickstart
 
-_(M3b.3 completes the read-only pane preview: VT-emulated rendering, capture-pane backfill on session switch, and pane-size sync with the right-pane viewport. Input routing, status badges, and the compose flow land in M3c–M3e.)_
+_(M3c lands input routing: keystrokes in the highlighted pane flow through to claude, `Ctrl+B` toggles focus between sidebar and pane, startup focus is context-aware, `x` closes the highlighted session with a one-key confirmation, and the session-list poll cadence is configurable via `session_poll_interval` in `sm4c.toml`. Status badges and the compose flow land in M3d–M3e.)_
 
 ```bash
 # Open the TUI. The sidebar is always visible:
 #   - no sessions yet   → right pane shows "press n to start a new session"
 #   - one or more       → highlighted row streams a live VT-emulated preview on the right
-# Bindings:
-#   j / k / ↑ / ↓   move highlight
-#   n               new claude session (bare; compose flow comes in M3e)
-#   ctrl+b          focus right pane (placeholder; activates in M3c)
-#   enter           reserved for M3c focus shortcut; deliberate no-op today
-#   ?               toggle help
-#   q / ^C          quit
+#
+# Focus model (M3c):
+#   - Sidebar focus: sm4c owns the keyboard.
+#       j / k / ↑ / ↓   move highlight
+#       n               new claude session (bare; compose flow comes in M3e)
+#       enter           shortcut for ctrl+b: move focus into the highlighted pane
+#       ctrl+b          toggle focus: move into the highlighted pane
+#       x               arm a close on the highlighted session; press y to confirm,
+#                       any other key cancels. A close sends SIGHUP to claude, same
+#                       lifecycle effect as running /exit inside the pane.
+#       ?               toggle help
+#       q / ^C          quit sm4c (claude sessions keep running on the sm4c socket)
+#   - Pane focus: claude owns the keyboard.
+#       (every keystroke, including ^C, is forwarded to claude)
+#       ctrl+b          toggle focus back to the sidebar
+#       (to quit sm4c from pane focus, press ctrl+b then q or ^C)
 sm4c
 
 # Launch with claude args. This ALSO opens the TUI — focused on the new session.
@@ -108,11 +117,10 @@ sm4c stop         # stop the sm4c tmux server (destructive)
 
 Anything after `--` is forwarded verbatim to `claude`. If a claude arg does not start with a dash, you can omit the `--` (e.g. `sm4c /help` just works).
 
-To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename. sm4c does not expose a tmux detach shortcut; every interaction with a session happens inside the TUI. Once M3c lands input routing, `Ctrl+B` will move focus between sidebar and the active pane so you can type into claude without leaving sm4c.
+To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename. sm4c does not expose a tmux detach shortcut; every interaction with a session happens inside the TUI.
 
-Planned for M3c–M3e (not yet shipped):
+Planned for M3d–M3e (not yet shipped):
 
-- M3c: input routing. `Ctrl+B` toggles focus between sidebar and active session; keystrokes flow to claude when the pane has focus; terminal resizes already propagate to tmux (M3b.3).
 - M3d: status badges. Live per-session status (idle / running / needs input / done) derived from tmux's `monitor-bell` / `monitor-activity` / `monitor-silence` flags.
 - M3e: compose flow for `n`. Pick the target working directory and set a session name before spawning, replacing today's bare-`claude` stopgap.
 

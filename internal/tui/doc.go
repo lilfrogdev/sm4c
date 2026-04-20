@@ -1,7 +1,7 @@
 // Package tui is sm4c's Bubble Tea front end.
 //
-// Scope in this milestone (M3b.3 — read-only VT-emulated pane
-// preview with capture-pane backfill and pane-size sync):
+// Scope in this milestone (M3c — input routing + focus toggle on
+// top of the M3b.3 VT-emulated pane preview):
 //
 //   - One unified sidebar layout, shown at all times:
 //
@@ -62,37 +62,77 @@
 //                           re-emits SGR escapes so the user's
 //                           native terminal palette carries through
 //
-//     The preview is intentionally read-only. Input routing and the
-//     focus toggle land in M3c; nothing about M3c changes the
-//     sidebar, the layout, or the rendering contract above.
+//     Per-pane emulator state, the preview rendering contract, and
+//     the layout itself are unchanged in M3c. What M3c adds is a
+//     focus state that decides where keystrokes go.
 //
-//   - Key bindings:
+//   - Focus state (M3c). Model.focus is one of FocusSidebar (default)
+//     or FocusPane. The right-pane header shows "[focus]" when the
+//     pane has focus and "[ctrl+b to focus]" otherwise, so the user
+//     can always see where keystrokes will land. Deps.InitialFocus
+//     lets the CLI pick the starting focus per entry point:
 //
+//       * bare `sm4c` — starts on the sidebar (there's nothing to
+//         type into yet).
+//       * `sm4c [claude-args…]` and the `n` re-entry — start on the
+//         pane so the user can type into the freshly-spawned session
+//         immediately.
+//
+//     Focus reverts to the sidebar automatically if the highlighted
+//     session disappears or if the active pane returns ErrPaneGone
+//     mid-turn. Transient send errors are absorbed silently to avoid
+//     yanking the user around on a single tmux hiccup.
+//
+//   - Key bindings (focus-sensitive):
+//
+//     Sidebar focus (sm4c owns the keyboard):
 //       * `j` / `↓`    move highlight down (no wrap)
 //       * `k` / `↑`    move highlight up   (no wrap)
-//       * `enter`      deliberate no-op; reserved for a future focus
-//                      shortcut. sm4c has no exec-into-tmux path by
-//                      design — every session is reached through
-//                      this TUI.
+//       * `enter`      shortcut for ctrl+b: move focus into the
+//                      highlighted session's pane. On an empty
+//                      sidebar, enter is a no-op.
 //       * `n`          request a new session (emits
 //                      ActionNewSession). The caller spawns the
 //                      claude window and re-enters the TUI with the
-//                      new window ID as initial highlight, so the
-//                      sidebar reopens focused on the session that
-//                      was just created.
-//       * `ctrl+b`     placeholder for M3c's focus toggle (VSCode-
-//                      style move of focus from sidebar to the
-//                      right pane); no-op here so the binding is
-//                      pinned before its behavior lands.
+//                      new window ID as initial highlight AND
+//                      InitialFocus = FocusPane, so the sidebar
+//                      reopens focused on the new session and the
+//                      user can start typing.
+//       * `ctrl+b`     toggle focus: move into the highlighted
+//                      pane (no-op if no session is highlighted).
+//       * `x`          arm a close on the highlighted session.
+//                      The key bar is replaced by a
+//                      "close <name>? y (any other key cancels)"
+//                      hint; the next keystroke either confirms
+//                      with `y` / `Y` (which calls through
+//                      WindowCloser to kill the tmux window,
+//                      sending SIGHUP to claude — lifecycle-
+//                      identical to /exit) or cancels on anything
+//                      else. No tmux round-trip happens before
+//                      confirmation, so a mis-typed `x` is a safe
+//                      one-step rollback.
 //       * `?`          toggle the expanded help block
-//       * `q` / `ctrl+c`  quit (emits ActionNone)
+//       * `q` / `ctrl+c`  quit (emits ActionNone). Claude sessions
+//                      keep running on the sm4c tmux socket.
+//
+//     Pane focus (claude owns the keyboard):
+//       * `ctrl+b`     toggle focus back to the sidebar.
+//       * any other key — translated to its terminal byte sequence
+//                      by keyMsgToBytes and forwarded to the active
+//                      pane via the KeySender seam. `ctrl+c` is
+//                      forwarded to claude (interrupts the running
+//                      turn); to quit sm4c from pane focus, press
+//                      ctrl+b first, then q or ^C.
 //
 //   - Live session data is fetched via an injected SessionLister.
 //     cmd/sm4c/cli wraps tmuxctl.OneShot.ListWindows and filters to
 //     windows tagged by sm4c; the TUI never imports tmuxctl. The
 //     fetch-tick-fetch loop is strictly serial: Init kicks off the
 //     first fetch, every sessionsMsg schedules the next pollTickMsg,
-//     and every tick issues a fresh fetch. No overlap.
+//     and every tick issues a fresh fetch. No overlap. Cadence is
+//     configurable via Deps.PollInterval; the CLI layer reads
+//     Config.SessionPollInterval (TOML key session_poll_interval,
+//     default "1s") and plumbs it through openTUI.
 //
 //   - The compose ("pick cwd + name") sub-view for `n` is
 //     intentionally deferred to M3e. Until then, `n` asks the CLI
@@ -100,9 +140,10 @@
 //     directory, and the TUI reopens with the new window
 //     highlighted.
 //
-//   - Input routing (M3c) and the status FSM (M3d) are still
-//     deferred. The pane preview is read-only until M3c lands the
-//     focus toggle + keystroke forwarding path.
+//   - The status FSM (M3d) is still deferred. Per-session status
+//     glyphs in the sidebar (idle / running / needs-input / done)
+//     land once the tmux monitor-bell / monitor-activity /
+//     monitor-silence wiring is in place.
 //
 // Design rules enforced here:
 //
