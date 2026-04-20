@@ -803,18 +803,31 @@ func (m Model) updatePaneStatus(paneID string, data []byte) {
 	m.paneStatuses[windowID] = ps
 }
 
-// clearPaneAttention is called when the user sends a keystroke
-// into a pane; it resets the owning window's bell flag so the
-// Attention glyph flips back to the derived-from-activity
-// state. We do not clear lastOutputAt / everHadOutput because
-// those are not "attention" state — a window that was Working
-// before the user typed should keep animating.
+// notePaneKeystroke is called when the user sends a keystroke
+// into a pane. It does two related things:
+//
+//  1. Clears the owning window's sticky bell flag, so the
+//     Attention glyph flips back to the derived-from-activity
+//     state on the very next render. This is the "user noticed
+//     the bell" acknowledgement path.
+//
+//  2. Stamps lastKeystrokeAt = now, which opens an echo-
+//     suppression window (see keystrokeEchoWindow in
+//     status.go). During that window, any bytes arriving in
+//     %output are assumed to be claude's prompt redraw for the
+//     keypress rather than genuine work, and derivedStatus
+//     keeps the glyph on Idle instead of flipping to Working.
+//
+// We do NOT touch lastOutputAt / everHadOutput here: those
+// record historical activity, not user intent, and a window
+// that was Working before the user started typing should still
+// be considered "has bytes" once the echo window expires.
 //
 // Takes a pane ID because the call site (handleKeyInPaneFocus)
 // has that identifier in hand; we look up the owning window
 // internally so callers don't have to learn about the
 // window/pane split.
-func (m Model) clearPaneAttention(paneID string) {
+func (m Model) notePaneKeystroke(paneID string) {
 	if paneID == "" {
 		return
 	}
@@ -822,10 +835,8 @@ func (m Model) clearPaneAttention(paneID string) {
 	if windowID == "" {
 		return
 	}
-	ps, ok := m.paneStatuses[windowID]
-	if !ok || !ps.bell {
-		return
-	}
+	ps := m.paneStatuses[windowID]
+	ps.lastKeystrokeAt = time.Now()
 	ps.bell = false
 	m.paneStatuses[windowID] = ps
 }
@@ -1206,13 +1217,16 @@ func (m Model) handleKeyInPaneFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if len(data) == 0 {
 		return m, nil
 	}
-	// A keystroke into a pane is what "acknowledges" that pane's
-	// bell: the user has clearly noticed the session. We clear
-	// the flag here rather than in handleKeysSent so the glyph
-	// flips immediately on input, even if the tmux send-keys
-	// round-trip is still in flight (the user's intent is what
-	// matters; the round-trip is a syscall detail).
-	m.clearPaneAttention(paneID)
+	// A keystroke into a pane serves two status purposes (see
+	// notePaneKeystroke): it acknowledges any pending bell
+	// (Attention → derived-from-activity) AND it opens the
+	// echo-suppression window so the byte burst that claude
+	// will send back in response to this keypress does not
+	// masquerade as "claude is working". We do this here
+	// rather than in handleKeysSent so both effects take hold
+	// immediately on the user's intent, even while the tmux
+	// send-keys round-trip is still in flight.
+	m.notePaneKeystroke(paneID)
 	return m, m.sendKeysToPane(paneID, data)
 }
 
@@ -1734,16 +1748,22 @@ func (m Model) renderHeader() string {
 
 // renderSessionList emits one row per session. The row format is:
 //
-//	<status-glyph> <name> <window-id>
+//	<status-glyph> <name>
 //
 // where <status-glyph> is a two-column cell painted by
-// statusGlyph (animated spinner for Working, amber dot for
-// Attention, solid dot for Idle, faint middle dot for Quiet),
-// <name> is the sanitized window title, and <window-id> is the
-// opaque tmux ID rendered faintly so the eye treats it as
-// metadata. The highlighted row is painted in reverse video via
-// rowHighlightStyle using the terminal's native reverse
-// attribute, not a hex color, per the no-theming rule.
+// statusGlyph (animated spinner for Working, red dot for
+// Attention, solid dot for Idle, faint middle dot for Quiet)
+// and <name> is the sanitized window title. The highlighted
+// row is painted in reverse video via rowHighlightStyle using
+// the terminal's native reverse attribute, not a hex color,
+// per the no-theming rule.
+//
+// Earlier iterations trailed the row with the opaque tmux
+// window ID ("@3") rendered faintly. Live usage found the ID
+// was pure noise: sm4c users identify sessions by name, never
+// by ID, and the ID column was stealing horizontal space on
+// narrow sidebars. Window IDs are still available via
+// `sm4c ls` for debugging.
 //
 // We no longer render tmux's own "active window" marker: sm4c's
 // one-claude-per-window design means every managed window is
@@ -1771,7 +1791,7 @@ func (m Model) renderSessionList() string {
 			// so the sidebar doesn't become an empty column.
 			name = "(unnamed)"
 		}
-		row := glyph + name + "  " + hintStyle.Render(s.WindowID)
+		row := glyph + name
 		if i == m.highlight {
 			row = rowHighlightStyle.Render(row)
 		}

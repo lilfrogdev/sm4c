@@ -101,6 +101,43 @@ func TestDerivedStatusTransitions(t *testing.T) {
 			want:  StatusWorking,
 			why:   "0 threshold = opt-out of the Idle flip",
 		},
+		{
+			name: "recent keystroke suppresses Working",
+			ps: paneStatus{
+				lastOutputAt:    start,
+				lastKeystrokeAt: start,
+				everHadOutput:   true,
+			},
+			now:   start.Add(100 * time.Millisecond),
+			tThrs: threshold,
+			want:  StatusIdle,
+			why:   "bytes arriving within keystrokeEchoWindow of a keypress are treated as echo",
+		},
+		{
+			name: "keystroke older than echo window releases Working",
+			ps: paneStatus{
+				lastOutputAt:    start.Add(keystrokeEchoWindow + 200*time.Millisecond),
+				lastKeystrokeAt: start,
+				everHadOutput:   true,
+			},
+			now:   start.Add(keystrokeEchoWindow + 250*time.Millisecond),
+			tThrs: threshold,
+			want:  StatusWorking,
+			why:   "once keystrokeEchoWindow elapses, fresh bytes mean claude, not echo",
+		},
+		{
+			name: "bell still wins over recent keystroke",
+			ps: paneStatus{
+				lastOutputAt:    start,
+				lastKeystrokeAt: start,
+				everHadOutput:   true,
+				bell:            true,
+			},
+			now:   start.Add(100 * time.Millisecond),
+			tThrs: threshold,
+			want:  StatusAttention,
+			why:   "bell has priority over every other FSM arrow, including echo suppression",
+		},
 	}
 
 	for _, tc := range cases {
@@ -175,18 +212,15 @@ func TestHandlePaneDataDetectsBEL(t *testing.T) {
 	}
 }
 
-// TestClearPaneAttentionOnKeystroke pins the "user typed, so
-// acknowledge the bell" contract. We drive a forwarded keystroke
-// via the KeySender path and assert the attention flag is gone
-// afterward, while output history is preserved.
-func TestClearPaneAttentionOnKeystroke(t *testing.T) {
+// TestNotePaneKeystrokeClearsBell pins the "user typed, so
+// acknowledge the bell" half of notePaneKeystroke's contract.
+// We invoke it directly — the handleKeyInPaneFocus path also
+// produces a tea.Cmd that would try to run a real KeySender;
+// driving that end-to-end requires a context and a stub sender,
+// and the interesting assertion (bell gets cleared) is the
+// same either way.
+func TestNotePaneKeystrokeClearsBell(t *testing.T) {
 	t.Parallel()
-	// We invoke clearPaneAttention directly — it is the surface
-	// under test here. The handleKeyInPaneFocus path also
-	// produces a tea.Cmd that would try to run a real KeySender;
-	// driving that end-to-end requires a context and a stub
-	// sender, and the interesting assertion (bell gets
-	// cleared) is the same either way.
 	m := NewModel(Deps{SilenceThreshold: 500 * time.Millisecond})
 	m.paneByWindow["@1"] = "%1"
 	m.paneToWindow["%1"] = "@1"
@@ -196,13 +230,76 @@ func TestClearPaneAttentionOnKeystroke(t *testing.T) {
 		bell:          true,
 	}
 
-	m.clearPaneAttention("%1")
+	m.notePaneKeystroke("%1")
 	got := m.paneStatuses["@1"]
 	if got.bell {
-		t.Fatalf("bell flag survived clearPaneAttention")
+		t.Fatalf("bell flag survived notePaneKeystroke")
 	}
 	if !got.everHadOutput {
-		t.Fatalf("clearPaneAttention erased everHadOutput; it should only touch bell")
+		t.Fatalf("notePaneKeystroke erased everHadOutput; it should only touch bell + lastKeystrokeAt")
+	}
+}
+
+// TestNotePaneKeystrokeStampsTimestamp pins the "opens the echo-
+// suppression window" half of notePaneKeystroke's contract: the
+// call must advance lastKeystrokeAt so derivedStatus can see it
+// on the next render. This is the fix for the "spinner animates
+// while I type and freezes when I stop" regression.
+func TestNotePaneKeystrokeStampsTimestamp(t *testing.T) {
+	t.Parallel()
+	m := NewModel(Deps{SilenceThreshold: 500 * time.Millisecond})
+	m.paneByWindow["@1"] = "%1"
+	m.paneToWindow["%1"] = "@1"
+
+	before := time.Now()
+	m.notePaneKeystroke("%1")
+	after := time.Now()
+
+	got := m.paneStatuses["@1"].lastKeystrokeAt
+	if got.IsZero() {
+		t.Fatalf("lastKeystrokeAt is zero after notePaneKeystroke")
+	}
+	if got.Before(before) || got.After(after) {
+		t.Fatalf("lastKeystrokeAt = %v; want within [%v, %v]", got, before, after)
+	}
+}
+
+// TestAnyPaneWorkingRespectsEchoSuppression pins the ticker-gate
+// side of the echo-suppression fix: a pane that is only emitting
+// echo bytes from user keystrokes must NOT keep the animation
+// ticker alive. Before the fix, the ticker would run as long as
+// bytes were flowing; now it only runs when bytes are flowing
+// AND the user hasn't typed recently.
+func TestAnyPaneWorkingRespectsEchoSuppression(t *testing.T) {
+	t.Parallel()
+	m := NewModel(Deps{SilenceThreshold: 500 * time.Millisecond})
+	now := time.Unix(1700000000, 0)
+
+	// User typed and claude immediately echoed (typical for
+	// every single keypress claude processes). Both timestamps
+	// are at "now"; derivedStatus should suppress Working.
+	m.paneStatuses["@1"] = paneStatus{
+		lastOutputAt:    now,
+		lastKeystrokeAt: now,
+		everHadOutput:   true,
+	}
+	if m.anyPaneWorking(now.Add(10 * time.Millisecond)) {
+		t.Fatalf("anyPaneWorking is true during echo suppression window")
+	}
+
+	// Past the echo window, bytes are assumed to be claude
+	// working rather than user echo.
+	if !m.anyPaneWorking(now.Add(keystrokeEchoWindow + 100*time.Millisecond)) {
+		// Note: by this point lastOutputAt is also older than
+		// now, so we need to simulate fresh bytes too.
+		m.paneStatuses["@1"] = paneStatus{
+			lastOutputAt:    now.Add(keystrokeEchoWindow + 50*time.Millisecond),
+			lastKeystrokeAt: now,
+			everHadOutput:   true,
+		}
+		if !m.anyPaneWorking(now.Add(keystrokeEchoWindow + 100*time.Millisecond)) {
+			t.Fatalf("anyPaneWorking stays false after keystrokeEchoWindow elapsed with fresh bytes")
+		}
 	}
 }
 
@@ -425,8 +522,10 @@ func TestSidebarRendersStatusGlyph(t *testing.T) {
 	if !strings.Contains(row, "dev") {
 		t.Fatalf("rendered row missing session name: %q", row)
 	}
-	if !strings.Contains(row, "@1") {
-		t.Fatalf("rendered row missing window ID: %q", row)
+	// The window ID column was removed — sessions are identified
+	// by name only. `sm4c ls` still surfaces IDs for debugging.
+	if strings.Contains(row, "@1") {
+		t.Fatalf("rendered row still contains window ID: %q", row)
 	}
 }
 

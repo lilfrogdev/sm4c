@@ -500,10 +500,16 @@ func TestViewRendersSidebarWhenSessionsPresent(t *testing.T) {
 	out := m.View()
 	mustContain(t, out, "refactor-auth")
 	mustContain(t, out, "spike-queue")
-	mustContain(t, out, "@1")
-	mustContain(t, out, "@4")
 	// Count line appears in the sidebar header.
 	mustContain(t, out, "2 sessions")
+	// Window IDs used to render as faint trailing metadata, but
+	// live usage found they were pure noise on the sidebar —
+	// users identify sessions by name. The rendered view must
+	// no longer carry them (sm4c ls still surfaces them for
+	// debugging).
+	if strings.Contains(out, "@1") || strings.Contains(out, "@4") {
+		t.Fatalf("sidebar leaked window ID:\n%s", out)
+	}
 	// Bindings that must stay visible on the populated sidebar.
 	mustContain(t, out, "move highlight")
 	mustContain(t, out, "new session")

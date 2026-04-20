@@ -21,18 +21,38 @@ import (
 // absence, and bells are the BEL byte (0x07) inside those bytes.
 //
 // State machine per pane, given a silence threshold T (configured
-// via Config.MonitorSilence, default 3s):
+// via Config.MonitorSilence, default 3s) and an echo window E
+// (keystrokeEchoWindow, fixed at 1500ms):
 //
-//	Quiet      ──(first byte)──> Working
+//	Quiet      ──(first byte, no recent keystroke)──> Working
 //	Working    ──(no bytes for T)──> Idle
-//	Idle       ──(new bytes)──> Working
+//	Idle       ──(new bytes, no recent keystroke)──> Working
 //	Any        ──(BEL seen)──> Attention
 //	Attention  ──(keystroke to pane)──> derived-from-bytes
+//	Any        ──(user typed within E)──> Idle/Quiet (echo suppression)
+//
+// The "echo suppression" arc is why this package tracks
+// lastKeystrokeAt as well as lastOutputAt. When the user types
+// into a pane, claude's TUI redraws the prompt line on every
+// keypress — each keystroke produces a burst of bytes in
+// %output. If we counted those as "Working", the spinner would
+// animate while the user types and freeze the moment they stop,
+// which is exactly backwards of what the user wants the spinner
+// to mean ("claude is doing work"). Suppressing Working for a
+// short window after the most recent keystroke means the only
+// bytes that can drive the spinner are ones that clearly aren't
+// user-triggered echo: claude's own "thinking" spinner, its
+// token stream, tool output, etc. The window is deliberately
+// short (1.5s) so that claude's response starting within a
+// second of Enter still lights the spinner almost immediately.
 //
 // Attention is sticky on purpose: a bell that disappears because
 // the user happened to be looking at a different pane in the
 // moment it rang would be worse than no bell at all. Only an
-// explicit keystroke to the ringing pane clears it.
+// explicit keystroke to the ringing pane clears it — which also
+// happens to refresh lastKeystrokeAt, so the echo-suppression
+// arc above subsumes "don't also spin while acknowledging a
+// bell" for free.
 //
 // Rendering lives in statusGlyph; the animation frame comes from
 // Model.statusFrame, which is advanced by statusFrameTickMsg only
@@ -76,13 +96,22 @@ const (
 // paneStatus is the per-pane record we maintain to derive a
 // SessionStatus. It is intentionally small so the Model can carry
 // one entry per pane without worrying about allocation churn;
-// every field is populated by handlePaneData as bytes arrive.
+// every field is populated by handlePaneData as bytes arrive, or
+// by notePaneKeystroke as the user types.
 type paneStatus struct {
 	// lastOutputAt is the monotonic time of the most recent
 	// byte we saw for this pane. Zero means "never seen any
 	// output" (which is also what everHadOutput=false implies;
 	// they travel together for clarity at call sites).
 	lastOutputAt time.Time
+
+	// lastKeystrokeAt is the monotonic time of the most recent
+	// keystroke the user forwarded to this pane. Zero means
+	// "user has never typed into this pane". It is read by
+	// derivedStatus to suppress Working while the user is
+	// actively typing — see keystrokeEchoWindow and the
+	// package-level state-machine diagram.
+	lastKeystrokeAt time.Time
 
 	// everHadOutput gates the Quiet → Working transition. It
 	// stays true once set, even after the pane goes silent
@@ -93,23 +122,61 @@ type paneStatus struct {
 	// bell is set the first time we see 0x07 in this pane's
 	// byte stream and cleared only when the user sends a
 	// keystroke to this pane (the KeySender path calls
-	// clearAttention). It is sticky on purpose — see the
+	// notePaneKeystroke). It is sticky on purpose — see the
 	// package-level comment.
 	bell bool
 }
+
+// keystrokeEchoWindow is how long after the most recent
+// keystroke we assume incoming bytes are echo / redraw from the
+// user's own typing rather than work the TUI should visualize
+// as "claude is thinking". 1.5s is empirically the right shape:
+//
+//   - Short enough that claude's response streaming (which
+//     arrives within a handful of hundreds of ms after Enter for
+//     short prompts and much later for long ones) still lights
+//     the Working spinner almost immediately.
+//   - Long enough that normal burst-typing (a human's ~80ms
+//     inter-key interval, plus claude's slash-command auto-
+//     complete animations that redraw a few frames per key)
+//     lives entirely inside one echo window and does not
+//     spuriously animate the sidebar glyph.
+//
+// Fixed rather than configurable: this is a heuristic, not a
+// policy, and exposing it as a knob would invite users to tune
+// it in ways that hide real bugs (e.g. setting it to 0 to "see
+// the spinner more often" while typing, which is exactly the
+// behavior we are fixing here).
+const keystrokeEchoWindow = 1500 * time.Millisecond
 
 // derivedStatus folds a paneStatus record into the user-facing
 // SessionStatus at the current moment. "Current" is passed as a
 // parameter rather than read from time.Now() so tests can pin a
 // specific instant without racing the test clock.
 //
-// Priority: Attention wins over anything else. Below that, we
-// check output history; an empty history is Quiet. If we have
-// history and the most recent byte is older than the silence
-// threshold, the pane is Idle; otherwise it is Working. This
-// ordering lets a pane with a stuck bell and no output still
-// surface an Attention glyph — the fact that it has nothing to
-// say does not mean the user has nothing to answer.
+// Priority order (top wins):
+//
+//  1. bell  → Attention. Bell always wins; the user's active
+//     attention is what clears it, so even if they are typing
+//     into this very pane the glyph stays amber until the
+//     clearing keystroke is processed (which happens on the
+//     same Update cycle, so the visible flicker is zero).
+//  2. never had output → Quiet.
+//  3. user typed within keystrokeEchoWindow → Idle (echo
+//     suppression, see package comment). We treat the pane as
+//     Idle rather than Quiet because "user has typed here"
+//     implies the pane is live and ready; Quiet is reserved
+//     for panes that have genuinely never done anything.
+//  4. silent longer than silenceThreshold → Idle.
+//  5. otherwise → Working.
+//
+// Note that step 3 is why a pane that has received bytes from
+// user-echo alone (never any work from claude) still leaves
+// everHadOutput = true — the field is "has bytes ever arrived
+// here", not "has claude ever worked here". We cannot
+// distinguish the two without protocol knowledge we do not
+// have, and mis-firing step 3 is preferable to missing step 5
+// when the user genuinely wants to see the spinner.
 func (ps paneStatus) derivedStatus(now time.Time, silenceThreshold time.Duration) SessionStatus {
 	if ps.bell {
 		return StatusAttention
@@ -117,11 +184,15 @@ func (ps paneStatus) derivedStatus(now time.Time, silenceThreshold time.Duration
 	if !ps.everHadOutput {
 		return StatusQuiet
 	}
+	if !ps.lastKeystrokeAt.IsZero() && now.Sub(ps.lastKeystrokeAt) < keystrokeEchoWindow {
+		return StatusIdle
+	}
 	if silenceThreshold <= 0 {
 		// Operator disabled the silence FSM. Once a pane has
 		// had any output it stays Working forever (until a
-		// bell flips it to Attention). This is a deliberate
-		// opt-out shape: `monitor_silence = "0s"` in TOML.
+		// bell flips it to Attention or the echo-window gate
+		// above fires). This is a deliberate opt-out shape:
+		// `monitor_silence = "0s"` in TOML.
 		return StatusWorking
 	}
 	if now.Sub(ps.lastOutputAt) >= silenceThreshold {
@@ -161,17 +232,23 @@ var spinnerFrames = []string{
 // still reading as obviously animated.
 const statusFrameInterval = 100 * time.Millisecond
 
-// attentionStyle renders the Attention glyph in ANSI yellow.
-// Yellow (color 3) resolves to amber/orange on almost every
-// mainstream terminal theme (Iceberg, Solarized, Gruvbox,
-// GitHub Dark, Apple defaults…) which is as close to "Cursor's
-// orange attention dot" as we can get without painting a hex
-// color the no-hex-colors rule forbids. Bright-yellow (color
-// 11) was rejected because on light-background themes it tends
-// to appear washed out and defeats the "this one wants you"
-// signal.
+// attentionStyle renders the Attention glyph in ANSI red.
+// Red (color 1) is the universal "needs you / error / warning"
+// color; every mainstream terminal theme (Solarized, Gruvbox,
+// Iceberg, GitHub Dark, Apple defaults, Nord, Dracula…) paints
+// it as an unambiguously alerting hue, which is exactly the
+// semantic we want for the Attention state.
+//
+// Yellow (color 3) was the first attempt — the idea being "amber
+// is softer than red, so it won't startle" — but in practice
+// yellow resolves to pure-yellow (rather than amber/orange) on a
+// surprising number of themes, which reads as "informational,
+// not urgent". Once the glyph stops reading as "you should look
+// at this", it loses its whole purpose, so we trade softness
+// for clarity. Hex colors are forbidden by the existing CI
+// grep gate; color 1 is the best 0-15 match to the intent.
 var attentionStyle = lipgloss.NewStyle().
-	Foreground(lipgloss.Color("3")).
+	Foreground(lipgloss.Color("1")).
 	Bold(true)
 
 // statusGlyph renders the two-column status cell for one
