@@ -57,6 +57,33 @@ type PaneEventStream func() <-chan PaneEvent
 // treats resolution as disabled.
 type ActivePaneResolver func(ctx context.Context, windowID string) (paneID string, err error)
 
+// PaneCapturer returns the currently-visible screen of a tmux pane
+// as raw bytes with ANSI escapes preserved. The TUI calls it once
+// per pane the first time that pane resolves, so switching to a
+// session shows its current state immediately instead of waiting
+// for the next live chunk. Subsequent %output notifications are
+// appended after the capture is flushed into the emulator.
+//
+// A nil PaneCapturer is supported and disables backfill; the
+// emulator still boots when the first live chunk arrives, so the
+// feature is strictly additive. Production callers pass a func
+// that wraps tmuxctl.OneShot.CapturePane.
+type PaneCapturer func(ctx context.Context, paneID string) (data []byte, err error)
+
+// WindowResizer tells tmux to resize a window's cell grid to
+// (width, height). The TUI invokes it whenever its right-pane
+// viewport changes (terminal resized) or the highlight lands on a
+// different window, so claude always draws into a grid that
+// matches what sm4c renders.
+//
+// A nil WindowResizer disables sync. In that mode wrapping will
+// drift after a terminal resize until the user switches sessions
+// (claude's redraw path reacts to tmux's next size notification,
+// not ours), which is acceptable for tests and for environments
+// where the user's tmux is pre-3.2. Production callers wrap
+// tmuxctl.OneShot.ResizeWindow.
+type WindowResizer func(ctx context.Context, windowID string, width, height int) error
+
 // defaultPaneWidth / defaultPaneHeight are the emulator dimensions
 // used before we have seen a tea.WindowSizeMsg. They roughly match
 // an 80x24 terminal so a fresh model with no resize still produces
@@ -152,6 +179,29 @@ type paneResolvedMsg struct {
 	err      error
 }
 
+// paneCaptureMsg is delivered when PaneCapturer returns. The Model
+// feeds data into the pane's emulator (creating it if missing),
+// flushes any bytes that arrived while the capture was in flight,
+// and marks the pane as backfilled so a second capture is never
+// issued. On err we mark captured anyway — one failed attempt is
+// enough; subsequent live bytes paint the eventual state.
+type paneCaptureMsg struct {
+	paneID string
+	data   []byte
+	err    error
+}
+
+// windowResizedMsg is delivered when WindowResizer returns. The
+// Model absorbs it silently: resize failures (window closed, tmux
+// flaked) manifest as visual drift the user can recover from by
+// switching sessions, which is preferable to a noisy toast on
+// every viewport change. The field is kept for future telemetry
+// (e.g. surfacing repeated failures as a sidebar hint).
+type windowResizedMsg struct {
+	windowID string
+	err      error
+}
+
 // waitForPaneEvent returns a tea.Cmd that reads one PaneEvent from
 // the stream and wraps it as a paneDataMsg. If the channel is closed
 // we emit paneStreamClosedMsg, which stops the re-arm loop in
@@ -184,5 +234,44 @@ func (m Model) resolveActivePane(windowID string) tea.Cmd {
 		defer cancel()
 		paneID, err := resolver(ctx, windowID)
 		return paneResolvedMsg{windowID: windowID, paneID: paneID, err: err}
+	}
+}
+
+// captureActivePane returns a tea.Cmd that asks PaneCapturer for
+// the current screen of paneID and wraps the result in a
+// paneCaptureMsg. Returns nil when no capturer is wired or when
+// the pane ID is empty — both cases are "no backfill possible";
+// the emulator will boot on the first live chunk as before.
+func (m Model) captureActivePane(paneID string) tea.Cmd {
+	if m.paneCapturer == nil || paneID == "" {
+		return nil
+	}
+	capturer := m.paneCapturer
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+		defer cancel()
+		data, err := capturer(ctx, paneID)
+		return paneCaptureMsg{paneID: paneID, data: data, err: err}
+	}
+}
+
+// resizeManagedWindow returns a tea.Cmd that asks WindowResizer to
+// resize windowID to (width, height). Returns nil when no resizer
+// is wired, the window ID is empty, or dimensions are non-positive.
+// The caller is responsible for debouncing duplicate (wid, w, h)
+// invocations; this helper is pure transport.
+func (m Model) resizeManagedWindow(windowID string, width, height int) tea.Cmd {
+	if m.windowResizer == nil || windowID == "" {
+		return nil
+	}
+	if width < 1 || height < 1 {
+		return nil
+	}
+	resizer := m.windowResizer
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+		defer cancel()
+		err := resizer(ctx, windowID, width, height)
+		return windowResizedMsg{windowID: windowID, err: err}
 	}
 }

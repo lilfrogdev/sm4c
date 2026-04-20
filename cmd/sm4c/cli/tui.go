@@ -160,18 +160,48 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 	// socket. The user can still press `n` to create the first
 	// session; the next TUI launch will have a session and the
 	// preview will light up.
+	//
+	// M3b.3 adds two more seams:
+	//
+	//   - PaneCapturer wraps tmuxctl.OneShot.CapturePane so the
+	//     first time we resolve a pane, the TUI seeds its VT
+	//     emulator with that pane's current screen (rather than
+	//     waiting for the next live chunk).
+	//
+	//   - WindowResizer wraps tmuxctl.OneShot.ResizeWindow so the
+	//     TUI keeps tmux's pane grid in sync with its own
+	//     right-pane viewport across terminal resizes and
+	//     session switches.
+	//
+	// Both seams are independent of the control-mode Client — they
+	// use one-shot subprocess invocations — so they stay wired
+	// even when setupPaneBridge declines to spawn the Client.
 	stream, resolver, closer := setupPaneBridge(cmd, o)
 	if closer != nil {
 		defer closer()
 	}
+	var capturer tui.PaneCapturer
+	var resizer tui.WindowResizer
+	if o.TmuxBin != "" {
+		capturer = func(ctx context.Context, paneID string) ([]byte, error) {
+			return o.CapturePane(ctx, paneID)
+		}
+		resizer = func(ctx context.Context, windowID string, width, height int) error {
+			return o.ResizeWindow(ctx, windowID, width, height)
+		}
+	}
 	return tui.Run(
 		asReader(cmd.InOrStdin()),
 		asWriter(cmd.OutOrStdout()),
-		sessionLister(o),
-		tui.DefaultPollInterval,
-		stream,
-		resolver,
-		initialWindowID,
+		tui.Deps{
+			Lister:           sessionLister(o),
+			PollInterval:     tui.DefaultPollInterval,
+			PaneStream:       stream,
+			PaneResolver:     resolver,
+			PaneCapturer:     capturer,
+			WindowResizer:    resizer,
+			InitialHighlight: initialWindowID,
+		},
 	)
 }
 

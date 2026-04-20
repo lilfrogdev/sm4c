@@ -203,3 +203,31 @@ func TestNewOneShot_Defaults(t *testing.T) {
 		t.Errorf("defaults not set: %+v", o)
 	}
 }
+
+func TestIntToDecimal(t *testing.T) {
+	t.Parallel()
+
+	// Pins the format ResizeWindow emits to tmux for the -x / -y
+	// arguments. tmux's resize-window parses a plain base-10
+	// number; any deviation (sign, hex, separators) would be
+	// rejected with a confusing "invalid argument" message, and
+	// this helper is the only code path between the Model and the
+	// tmux CLI.
+	cases := []struct {
+		in   int
+		want string
+	}{
+		{0, "0"},
+		{-1, "0"},
+		{1, "1"},
+		{9, "9"},
+		{10, "10"},
+		{80, "80"},
+		{1024, "1024"},
+	}
+	for _, c := range cases {
+		if got := intToDecimal(c.in); got != c.want {
+			t.Errorf("intToDecimal(%d) = %q; want %q", c.in, got, c.want)
+		}
+	}
+}

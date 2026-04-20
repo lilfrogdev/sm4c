@@ -1,6 +1,7 @@
 // Package tui is sm4c's Bubble Tea front end.
 //
-// Scope in this milestone (M3b.2 — read-only VT-emulated pane preview):
+// Scope in this milestone (M3b.3 — read-only VT-emulated pane
+// preview with capture-pane backfill and pane-size sync):
 //
 //   - One unified sidebar layout, shown at all times:
 //
@@ -38,10 +39,17 @@
 //     events from the highlighted session's active pane into a
 //     per-pane charmbracelet/x/vt emulator and renders the emulator's
 //     ANSI-styled screen on every frame. The emulator is sized to
-//     match the right-pane body on every tea.WindowSizeMsg, so
-//     wrapping and cursor placement stay consistent with the visible
-//     column. Every state the preview can be in has an explicit
-//     rendering:
+//     match the right-pane body on every tea.WindowSizeMsg, and
+//     cmd/sm4c/cli propagates that size to tmux via resize-window
+//     so claude's upstream pane grid tracks what sm4c renders.
+//     On the first resolve for each pane, a capture-pane round-trip
+//     seeds the emulator with the session's current screen so
+//     switching to a long-running session shows its state
+//     immediately — live %output bytes that arrive during the
+//     capture are buffered and flushed in-order after the capture
+//     result lands, so the user never sees a scrambled replay.
+//
+//     Every state the preview can be in has an explicit rendering:
 //
 //       * no sessions     — "press n to start a new session"
 //       * no stream       — "pane preview unavailable"
@@ -54,11 +62,9 @@
 //                           re-emits SGR escapes so the user's
 //                           native terminal palette carries through
 //
-//     The preview is intentionally read-only. M3b.3 will request
-//     tmux to resize the upstream pane to match the emulator's grid
-//     and backfill initial screen state via tmux capture-pane.
-//     Input routing and focus toggle land in M3c. None of those
-//     milestones change the sidebar.
+//     The preview is intentionally read-only. Input routing and the
+//     focus toggle land in M3c; nothing about M3c changes the
+//     sidebar, the layout, or the rendering contract above.
 //
 //   - Key bindings:
 //

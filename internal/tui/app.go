@@ -39,6 +39,48 @@ const (
 	ActionNewSession
 )
 
+// Deps bundles every external seam the Model relies on. Keeping
+// them in a single struct (rather than positional arguments to
+// NewModel / Run) is the scalable shape as milestones accrete
+// dependencies: M3b.1 added PaneStream + PaneResolver, M3b.3 adds
+// PaneCapturer + WindowResizer, and M3c will add input seams too.
+// Every field is optional — the Model degrades gracefully when any
+// combination is nil, which is the contract the unit-test fixtures
+// rely on to stay minimal.
+//
+//   - Lister            SessionLister that drives the sidebar.
+//                       Nil keeps the empty-state view and skips
+//                       all polling.
+//   - PollInterval      cadence for Lister. Zero / negative means
+//                       "fetch once at Init and never again".
+//                       Ignored when Lister is nil.
+//   - PaneStream        factory returning a PaneEvent channel. Nil
+//                       disables live %output; the right pane shows
+//                       a static "preview unavailable" line.
+//   - PaneResolver      async mapper windowID -> paneID. Nil
+//                       disables pane resolution; without a pane
+//                       ID, the stream's events are never tied to
+//                       a highlighted session.
+//   - PaneCapturer      async mapper paneID -> initial screen.
+//                       Nil disables M3b.3 backfill; the emulator
+//                       still boots on the first live chunk.
+//   - WindowResizer     async tmux `resize-window` seam. Nil
+//                       disables M3b.3 viewport sync; wrapping will
+//                       drift after a terminal resize until the
+//                       user switches sessions.
+//   - InitialHighlight  tmux window ID to snap to on the first
+//                       sessionsMsg containing it. Empty defaults
+//                       to row 0 behavior.
+type Deps struct {
+	Lister           SessionLister
+	PollInterval     time.Duration
+	PaneStream       PaneEventStream
+	PaneResolver     ActivePaneResolver
+	PaneCapturer     PaneCapturer
+	WindowResizer    WindowResizer
+	InitialHighlight string
+}
+
 // Model is the Bubble Tea model backing the sidebar view. Its
 // fields split into two groups: the UX state (help, quitting,
 // action) which decides what to render and what intent to report on
@@ -118,6 +160,21 @@ type Model struct {
 	paneEvents   <-chan PaneEvent
 	paneResolver ActivePaneResolver
 
+	// paneCapturer is the M3b.3 backfill seam. When non-nil, the
+	// first paneResolvedMsg for a pane kicks off a capture-pane
+	// round-trip; the result is fed into the emulator before any
+	// live bytes so switching to a session shows its current
+	// screen immediately. Nil disables backfill (tests and
+	// degraded environments).
+	paneCapturer PaneCapturer
+
+	// windowResizer is the M3b.3 viewport-sync seam. When non-nil,
+	// terminal resizes and highlight changes issue a resize-window
+	// so tmux's pane grid matches the TUI's right-pane viewport.
+	// Nil disables the sync (wrapping may drift, but the TUI
+	// still renders correctly).
+	windowResizer WindowResizer
+
 	// paneStreamClosed records that the upstream channel has been
 	// closed (the tmuxctl.Client terminated). Once set, the right
 	// pane shows a "preview disconnected" hint and the Model stops
@@ -159,54 +216,80 @@ type Model struct {
 	// call for. Used to debounce: if j/k navigates to a row whose
 	// pane we already resolved, we skip the resolver round-trip.
 	resolvedWindowID string
+
+	// paneCapturing records panes that have a CapturePane round-
+	// trip in flight. While set for a pane, incoming paneDataMsg
+	// bytes are appended to panePending[paneID] instead of
+	// flushed into the emulator — this preserves the "capture
+	// first, then live" ordering the VT parser needs.
+	paneCapturing map[string]bool
+
+	// paneCaptured is a per-pane "we have attempted a capture"
+	// marker. Once set, a pane never re-enters the capturing
+	// state, even if the attempt returned an error. One failed
+	// backfill is enough; live %output paints the eventual state.
+	paneCaptured map[string]bool
+
+	// panePending buffers live bytes that arrived while a pane's
+	// capture was in flight. It is bounded by paneBackfillBuffer
+	// per pane (a hostile claude cannot exhaust memory during a
+	// slow tmux round-trip); overflow is dropped tail-first, same
+	// as the bridge channel's backpressure posture.
+	panePending map[string][]byte
+
+	// sizedFor records the last (width, height) each window was
+	// resized to via WindowResizer. We re-emit a resize only when
+	// the tuple changes, so rapid j/k navigation or a debounced
+	// stream of tea.WindowSizeMsg events does not spam tmux with
+	// duplicate resize-window commands.
+	sizedFor map[string][2]int
 }
 
-// NewModel constructs a fresh Model. Every dependency is optional:
-//
-//   - A nil SessionLister keeps the Model in the empty-state view
-//     with no polling, which is the shape every unit test that does
-//     not care about session data already expects.
-//   - A nil PaneEventStream / ActivePaneResolver disables the M3b.1
-//     pane preview; the right pane shows a "(pane preview
-//     unavailable)" hint instead of live bytes.
-//   - An empty initialHighlight lets the Model pick the first row
-//     (index 0) as the default highlight once sessions arrive. A
-//     non-empty value is interpreted as a tmux window ID; the Model
-//     snaps the highlight to that row on the first sessionsMsg that
-//     contains it, then forgets the hint.
-//
-// Production callers (cmd/sm4c/cli/tui.go) pass a lister that wraps
-// tmuxctl.OneShot.ListWindows, a stream backed by
-// tmuxctl.Client.Events(), and a resolver backed by
-// tmuxctl.OneShot.ActivePane.
-//
-// pollInterval is honored only when it's positive; zero or negative
-// means "fetch once at Init and never again", which is useful for
-// tests that want exactly one fetch event.
-func NewModel(
-	lister SessionLister,
-	pollInterval time.Duration,
-	paneStream PaneEventStream,
-	paneResolver ActivePaneResolver,
-	initialHighlight string,
-) Model {
+// paneBackfillBuffer bounds panePending per pane. 64 KiB is
+// comfortably larger than any realistic burst of %output during
+// a tmux capture-pane round-trip (sub-100 ms on a healthy socket
+// means tens of KB at worst), and it keeps a pathological case —
+// capturer wedged, %output flooding — from growing memory without
+// bound. Beyond this point we drop pending tail bytes; the VT
+// emulator's eventual state will still reflect the most recent
+// screen on the next live chunk.
+const paneBackfillBuffer = 64 * 1024
+
+// NewModel constructs a fresh Model from the given Deps. Every
+// field of Deps is optional; see the Deps doc for the semantics
+// of each nil case. Production callers (cmd/sm4c/cli/tui.go) fill
+// Lister from tmuxctl.OneShot.ListWindows, PaneStream from
+// tmuxctl.Client.Events(), PaneResolver from
+// tmuxctl.OneShot.ActivePane, PaneCapturer from
+// tmuxctl.OneShot.CapturePane, and WindowResizer from
+// tmuxctl.OneShot.ResizeWindow. Unit tests pass a zero Deps{} or
+// a sparsely-filled one; whatever seams are nil produce a no-op
+// equivalent so the substring assertions keep working.
+func NewModel(deps Deps) Model {
+	pollInterval := deps.PollInterval
 	if pollInterval < 0 {
 		pollInterval = 0
 	}
 	m := Model{
-		lister:           lister,
+		lister:           deps.Lister,
 		pollInterval:     pollInterval,
 		highlight:        -1,
-		initialHighlight: initialHighlight,
-		paneResolver:     paneResolver,
+		initialHighlight: deps.InitialHighlight,
+		paneResolver:     deps.PaneResolver,
+		paneCapturer:     deps.PaneCapturer,
+		windowResizer:    deps.WindowResizer,
 		paneByWindow:     make(map[string]string),
 		paneErrByWindow:  make(map[string]error),
 		paneTerminals:    make(map[string]*paneTerminal),
+		paneCapturing:    make(map[string]bool),
+		paneCaptured:     make(map[string]bool),
+		panePending:      make(map[string][]byte),
+		sizedFor:         make(map[string][2]int),
 		paneViewW:        defaultPaneWidth,
 		paneViewH:        defaultPaneHeight,
 	}
-	if paneStream != nil {
-		m.paneEvents = paneStream()
+	if deps.PaneStream != nil {
+		m.paneEvents = deps.PaneStream()
 	}
 	return m
 }
@@ -262,18 +345,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// active VT emulator to match — claude draws for whatever
 		// grid tmux tells it about, and keeping the emulator sized
 		// to the visible area is what keeps wrapping / cursor
-		// positioning honest. We do NOT emit a cmd: Bubble Tea's
-		// default behavior is to re-render on the next tick, which
-		// is exactly what we want.
+		// positioning honest.
+		//
+		// On geometry change we ALSO tell tmux to resize the
+		// highlighted session's window so the upstream pane grid
+		// matches our emulator. That round-trip is async via a
+		// tea.Cmd so the resize itself never blocks the render.
+		prevW, prevH := m.paneViewW, m.paneViewH
 		m.width = msg.Width
 		m.height = msg.Height
 		m.syncPaneViewport()
+		if m.paneViewW != prevW || m.paneViewH != prevH {
+			return m, m.resizeHighlightedWindow()
+		}
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	case sessionsMsg:
 		next := m.handleSessions(msg)
-		return next, tea.Batch(next.scheduleNextPoll(), next.resolveHighlightedPaneIfNeeded())
+		return next, tea.Batch(
+			next.scheduleNextPoll(),
+			next.resolveHighlightedPaneIfNeeded(),
+			next.resizeHighlightedWindow(),
+		)
 	case pollTickMsg:
 		// A tick's only job is to kick off the next fetch. The fetch
 		// itself, once complete, will schedule the following tick.
@@ -292,7 +386,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.paneEvents = nil
 		return m, nil
 	case paneResolvedMsg:
-		return m.handlePaneResolved(msg), nil
+		next, cmd := m.handlePaneResolved(msg)
+		return next, cmd
+	case paneCaptureMsg:
+		return m.handlePaneCapture(msg), nil
+	case windowResizedMsg:
+		// The WindowResizer round-trip completed. Success or
+		// failure, we have nothing to do here — the emulator is
+		// already sized locally; if the tmux-side resize failed
+		// the user will see drift and can recover by switching
+		// sessions. We deliberately do not surface per-resize
+		// errors in the sidebar; they are too chatty during a
+		// flaky tmux state to be useful.
+		_ = msg
+		return m, nil
 	}
 	return m, nil
 }
@@ -355,6 +462,11 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 			delete(m.paneErrByWindow, wid)
 		}
 	}
+	for wid := range m.sizedFor {
+		if _, ok := alive[wid]; !ok {
+			delete(m.sizedFor, wid)
+		}
+	}
 	return m
 }
 
@@ -365,8 +477,19 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 // decide what to show. Emulators are minted lazily at the current
 // paneViewW / paneViewH so a pane that first appears after a
 // terminal resize is not stuck at the default 80x24.
+//
+// If a CapturePane round-trip is currently in flight for this
+// pane (M3b.3 backfill), the chunk is buffered in panePending
+// instead of flushed into the emulator — this preserves the
+// "capture first, then live" ordering the VT parser depends on.
+// The handlePaneCapture handler flushes the buffer once the
+// capture arrives.
 func (m Model) handlePaneData(msg paneDataMsg) Model {
 	if msg.paneID == "" {
+		return m
+	}
+	if m.paneCapturing[msg.paneID] {
+		m.appendPending(msg.paneID, msg.data)
 		return m
 	}
 	term, ok := m.paneTerminals[msg.paneID]
@@ -375,6 +498,73 @@ func (m Model) handlePaneData(msg paneDataMsg) Model {
 		m.paneTerminals[msg.paneID] = term
 	}
 	term.write(msg.data)
+	return m
+}
+
+// appendPending queues bytes in panePending[paneID] while capture
+// is in flight. The buffer is bounded by paneBackfillBuffer per
+// pane; bytes beyond that are dropped (tail-first, so we keep the
+// earliest post-capture frame) rather than stalling the stream
+// reader — the VT emulator's eventual state will be correct once
+// the next live chunk lands and overwrites the row.
+func (m *Model) appendPending(paneID string, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	cur := m.panePending[paneID]
+	remaining := paneBackfillBuffer - len(cur)
+	if remaining <= 0 {
+		return
+	}
+	if len(data) > remaining {
+		data = data[:remaining]
+	}
+	m.panePending[paneID] = append(cur, data...)
+}
+
+// handlePaneCapture flushes a completed CapturePane round-trip
+// into the pane's emulator:
+//
+//  1. Clear the capturing flag and mark the pane captured (so a
+//     second attempt is never issued, even on failure — one
+//     backfill per pane lifetime).
+//  2. If capture succeeded with non-empty data, create the
+//     emulator (if missing) and write the captured bytes. This
+//     is what paints claude's current screen into the preview.
+//  3. Flush any bytes that arrived while the capture was in
+//     flight, preserving the "capture first, then live" order.
+//  4. Drop the pending buffer.
+//
+// A capture error is absorbed silently: the user sees "waiting
+// for output" until a live chunk arrives, which is acceptable
+// for a one-shot backfill. We do not surface an error hint
+// because a capture failure on one pane should not blank out
+// the preview for other panes.
+func (m Model) handlePaneCapture(msg paneCaptureMsg) Model {
+	paneID := msg.paneID
+	if paneID == "" {
+		return m
+	}
+	delete(m.paneCapturing, paneID)
+	m.paneCaptured[paneID] = true
+
+	if msg.err == nil && len(msg.data) > 0 {
+		term, ok := m.paneTerminals[paneID]
+		if !ok {
+			term = newPaneTerminal(m.paneViewW, m.paneViewH)
+			m.paneTerminals[paneID] = term
+		}
+		term.write(msg.data)
+	}
+	if pending, ok := m.panePending[paneID]; ok && len(pending) > 0 {
+		term, ok2 := m.paneTerminals[paneID]
+		if !ok2 {
+			term = newPaneTerminal(m.paneViewW, m.paneViewH)
+			m.paneTerminals[paneID] = term
+		}
+		term.write(pending)
+	}
+	delete(m.panePending, paneID)
 	return m
 }
 
@@ -433,19 +623,68 @@ func (m Model) rightPaneBodyDims() (int, int) {
 // can surface it, and we intentionally do NOT clear any previously
 // resolved pane ID: a transient resolver failure should not blank
 // out an already-working preview.
-func (m Model) handlePaneResolved(msg paneResolvedMsg) Model {
+//
+// On success, if PaneCapturer is wired and this pane has not yet
+// been captured (or a capture is not already in flight), we return
+// a capture cmd so the right pane shows the current screen of the
+// session the user just focused, rather than waiting for the next
+// live chunk. This is the M3b.3 "switching to a session shows its
+// current state immediately" user-facing promise.
+func (m Model) handlePaneResolved(msg paneResolvedMsg) (Model, tea.Cmd) {
 	if msg.windowID == "" {
-		return m
+		return m, nil
 	}
 	if msg.err != nil {
 		m.paneErrByWindow[msg.windowID] = msg.err
-		return m
+		return m, nil
 	}
 	delete(m.paneErrByWindow, msg.windowID)
-	if msg.paneID != "" {
-		m.paneByWindow[msg.windowID] = msg.paneID
+	if msg.paneID == "" {
+		return m, nil
 	}
-	return m
+	m.paneByWindow[msg.windowID] = msg.paneID
+
+	if m.paneCapturer == nil {
+		return m, nil
+	}
+	if m.paneCaptured[msg.paneID] || m.paneCapturing[msg.paneID] {
+		return m, nil
+	}
+	m.paneCapturing[msg.paneID] = true
+	return m, m.captureActivePane(msg.paneID)
+}
+
+// resizeHighlightedWindow returns a tea.Cmd that asks the
+// WindowResizer to size the currently-highlighted window to the
+// right-pane viewport dimensions. No-op when no resizer is wired,
+// no session is highlighted, the viewport is too narrow to split,
+// or the window has already been sized to these exact dims (the
+// last case debounces rapid j/k or repeated WindowSizeMsg events).
+//
+// This is the single choke-point for "keep tmux's pane grid in
+// sync with our viewport" — the WindowSizeMsg handler, the
+// sessionsMsg handler, and handleKey all funnel through here,
+// so there is exactly one place where the debounce policy lives.
+func (m *Model) resizeHighlightedWindow() tea.Cmd {
+	if m.windowResizer == nil {
+		return nil
+	}
+	if m.highlight < 0 || m.highlight >= len(m.sessions) {
+		return nil
+	}
+	wid := m.sessions[m.highlight].WindowID
+	if wid == "" {
+		return nil
+	}
+	w, h := m.paneViewW, m.paneViewH
+	if w < 1 || h < 1 {
+		return nil
+	}
+	if prev, ok := m.sizedFor[wid]; ok && prev[0] == w && prev[1] == h {
+		return nil
+	}
+	m.sizedFor[wid] = [2]int{w, h}
+	return m.resizeManagedWindow(wid, w, h)
 }
 
 // resolveHighlightedPaneIfNeeded triggers an ActivePaneResolver call
@@ -521,13 +760,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.highlight < len(m.sessions)-1 {
 			m.highlight++
 		}
-		return m, m.resolveHighlightedPaneIfNeeded()
+		return m, tea.Batch(
+			m.resolveHighlightedPaneIfNeeded(),
+			m.resizeHighlightedWindow(),
+		)
 
 	case "k", "up":
 		if m.highlight > 0 {
 			m.highlight--
 		}
-		return m, m.resolveHighlightedPaneIfNeeded()
+		return m, tea.Batch(
+			m.resolveHighlightedPaneIfNeeded(),
+			m.resizeHighlightedWindow(),
+		)
 
 	case "ctrl+b":
 		// Placeholder for M3c's focus toggle (VSCode-style: move
@@ -904,9 +1149,10 @@ func intToString(n int) string {
 	return string(digits)
 }
 
-// Run starts a Bubble Tea program with this Model, using the given
-// input/output writers. `in` is normally os.Stdin and `out` os.Stdout;
-// tests pass pipes so they can drive keystrokes programmatically.
+// Run starts a Bubble Tea program with a Model constructed from
+// deps, using the given input/output writers. `in` is normally
+// os.Stdin and `out` os.Stdout; tests pass pipes so they can drive
+// keystrokes programmatically.
 //
 // We use tea.WithAltScreen so the sidebar can redraw on each poll
 // without polluting scrollback. Alt-screen does produce a visible
@@ -920,11 +1166,12 @@ func intToString(n int) string {
 // closed unexpectedly) the error is returned and the intents are
 // ignored.
 //
-// initialHighlight is an optional tmux window ID: when non-empty,
-// the first sessionsMsg that contains a matching row snaps the
-// highlight to that row instead of the default first-row behavior.
-// This is how `sm4c [claude-args]` opens the TUI already focused on
-// the freshly-spawned session without any exec-into-tmux shortcut.
+// deps.InitialHighlight is an optional tmux window ID: when non-
+// empty, the first sessionsMsg that contains a matching row snaps
+// the highlight to that row instead of the default first-row
+// behavior. This is how `sm4c [claude-args]` opens the TUI already
+// focused on the freshly-spawned session without any exec-into-
+// tmux shortcut.
 func Run(
 	in interface {
 		Read(p []byte) (n int, err error)
@@ -932,14 +1179,10 @@ func Run(
 	out interface {
 		Write(p []byte) (n int, err error)
 	},
-	lister SessionLister,
-	pollInterval time.Duration,
-	paneStream PaneEventStream,
-	paneResolver ActivePaneResolver,
-	initialHighlight string,
+	deps Deps,
 ) (Model, error) {
 	p := tea.NewProgram(
-		NewModel(lister, pollInterval, paneStream, paneResolver, initialHighlight),
+		NewModel(deps),
 		tea.WithInput(in),
 		tea.WithOutput(out),
 		tea.WithAltScreen(),

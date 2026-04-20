@@ -62,7 +62,7 @@ func applyKey(t *testing.T, m Model, s string) (Model, tea.Cmd) {
 // test used this shape; we keep it as a helper so a future default-
 // constructor change would require touching one place.
 func emptyModel() Model {
-	return NewModel(nil, 0, nil, nil, "")
+	return NewModel(Deps{})
 }
 
 // stubLister returns a SessionLister that always returns the same
@@ -78,7 +78,7 @@ func stubLister(sessions []Session, err error) SessionLister {
 // sessionsMsg, so its sidebar is ready to render without going
 // through Init's async fetch.
 func withSessions(sessions []Session) Model {
-	m := NewModel(stubLister(sessions, nil), 0, nil, nil, "")
+	m := NewModel(Deps{Lister: stubLister(sessions, nil)})
 	m = m.handleSessions(sessionsMsg{sessions: sessions})
 	return m
 }
@@ -99,7 +99,7 @@ func TestInitReturnsFetchCmdWhenListerPresent(t *testing.T) {
 	// happens before the user sees a frame. We don't run the cmd
 	// here (that would require a live runtime); we just pin that a
 	// non-nil cmd was emitted.
-	m := NewModel(stubLister(nil, nil), DefaultPollInterval, nil, nil, "")
+	m := NewModel(Deps{Lister: stubLister(nil, nil), PollInterval: DefaultPollInterval})
 	if cmd := m.Init(); cmd == nil {
 		t.Fatal("Init returned nil cmd despite lister being wired; sidebar would never populate")
 	}
@@ -248,7 +248,7 @@ func TestCtrlBIsNoOpUntilM3c(t *testing.T) {
 func TestSessionsMsgPopulatesAndClampsHighlight(t *testing.T) {
 	t.Parallel()
 	// Drop three sessions in; highlight should land at 0 automatically.
-	m := NewModel(stubLister(nil, nil), 0, nil, nil, "")
+	m := NewModel(Deps{Lister: stubLister(nil, nil)})
 	m = m.handleSessions(sessionsMsg{
 		sessions: []Session{
 			{WindowID: "@1", Name: "one"},
@@ -287,7 +287,7 @@ func TestSessionsMsgPopulatesAndClampsHighlight(t *testing.T) {
 func TestSessionsMsgPreservesLastFetchErr(t *testing.T) {
 	t.Parallel()
 	want := errors.New("tmux socket missing")
-	m := NewModel(stubLister(nil, want), 0, nil, nil, "")
+	m := NewModel(Deps{Lister: stubLister(nil, want)})
 	m = m.handleSessions(sessionsMsg{err: want})
 	if m.listErr == nil || !strings.Contains(m.listErr.Error(), "socket missing") {
 		t.Fatalf("listErr = %v, want wrapping %q", m.listErr, want)
@@ -378,7 +378,7 @@ func TestInitialHighlightSnapsToMatchingSession(t *testing.T) {
 	// tmux window ID. As soon as the first sessionsMsg contains
 	// that row the highlight must land on it (NOT the first row
 	// like the bare `sm4c` case).
-	m := NewModel(stubLister(nil, nil), 0, nil, nil, "@2")
+	m := NewModel(Deps{Lister: stubLister(nil, nil), InitialHighlight: "@2"})
 	m = m.handleSessions(sessionsMsg{
 		sessions: []Session{
 			{WindowID: "@1", Name: "one"},
@@ -399,7 +399,7 @@ func TestInitialHighlightIsRetainedUntilSessionAppears(t *testing.T) {
 	// If the first poll hasn't yet included the target window
 	// (tmux can lag a tick behind our own spawn), the hint must
 	// persist across fetches until a matching row shows up.
-	m := NewModel(stubLister(nil, nil), 0, nil, nil, "@7")
+	m := NewModel(Deps{Lister: stubLister(nil, nil), InitialHighlight: "@7"})
 	m = m.handleSessions(sessionsMsg{
 		sessions: []Session{{WindowID: "@1", Name: "one"}},
 	})
@@ -430,7 +430,7 @@ func TestPollTickTriggersFetch(t *testing.T) {
 	// pollTickMsg delivered to Update produces a non-nil fetch cmd.
 	// If this regresses, the sidebar stops refreshing after the
 	// first tick.
-	m := NewModel(stubLister(nil, nil), DefaultPollInterval, nil, nil, "")
+	m := NewModel(Deps{Lister: stubLister(nil, nil), PollInterval: DefaultPollInterval})
 	next, cmd := m.Update(pollTickMsg{})
 	if _, ok := next.(Model); !ok {
 		t.Fatalf("Update returned %T, expected Model", next)
@@ -448,7 +448,7 @@ func TestScheduleNextPollNilWithoutLister(t *testing.T) {
 		t.Fatalf("scheduleNextPoll returned non-nil cmd %T on inert Model", cmd)
 	}
 	// A nil lister with a positive interval: same deal.
-	m := NewModel(nil, 100*time.Millisecond, nil, nil, "")
+	m := NewModel(Deps{PollInterval: 100 * time.Millisecond})
 	if cmd := m.scheduleNextPoll(); cmd != nil {
 		t.Fatalf("scheduleNextPoll returned non-nil cmd %T when lister is nil", cmd)
 	}
@@ -461,7 +461,7 @@ func TestViewBeforeFirstFetchShowsEmptyPlaceholder(t *testing.T) {
 	// speculative "0 sessions" count — a slow first fetch
 	// shouldn't flash confusing text if a session turns out to
 	// exist.
-	m := NewModel(stubLister(nil, nil), 0, nil, nil, "")
+	m := NewModel(Deps{Lister: stubLister(nil, nil)})
 	out := m.View()
 	mustContain(t, out, "no sessions yet")
 }
@@ -553,7 +553,7 @@ func TestViewSurfacesListError(t *testing.T) {
 	t.Parallel()
 	// With an error and no sessions the user is on the empty path;
 	// the error should appear so they can diagnose without -debug.
-	m := NewModel(stubLister(nil, errors.New("permission denied on socket")), 0, nil, nil, "")
+	m := NewModel(Deps{Lister: stubLister(nil, errors.New("permission denied on socket"))})
 	m = m.handleSessions(sessionsMsg{err: errors.New("permission denied on socket")})
 	out := m.View()
 	mustContain(t, out, "permission denied on socket")

@@ -300,6 +300,135 @@ func parsePaneID(out []byte) (string, error) {
 // and the active-pane lookup.
 var ErrNoSuchPane = errors.New("tmuxctl: no such pane")
 
+// ErrNoSuchWindow is the window-scoped counterpart to ErrNoSuchPane:
+// the tmux server is reachable but the requested window ID does not
+// exist. ResizeWindow (and any future window-addressed one-shot)
+// returns this sentinel so callers can treat "window closed between
+// list and op" as a soft, recoverable outcome rather than a fatal
+// error. Missing server is also mapped here: from the caller's
+// point of view, both cases mean "the target is gone".
+var ErrNoSuchWindow = errors.New("tmuxctl: no such window")
+
+// CapturePane reads the currently-visible screen of a tmux pane and
+// returns it as raw bytes with ANSI escape sequences preserved (the
+// `-e` flag). This is the initial-screen payload the TUI seeds into
+// its VT emulator on first resolve so switching to a session shows
+// its current state immediately, instead of waiting for the next
+// keystroke to trigger a fresh %output.
+//
+// paneID must be in the `%<digits>` shape (the same format ActivePane
+// returns). We validate before passing it to tmux so a malformed or
+// empty ID never becomes a shell-like argument to capture-pane.
+//
+// A missing pane or a missing server is returned as ErrNoSuchPane,
+// matching ActivePane's soft-failure semantics: the TUI treats both
+// as "skip backfill, fall through to live bytes". Any other tmux
+// error is wrapped verbatim (with stderr sanitized).
+func (o OneShot) CapturePane(ctx context.Context, paneID string) ([]byte, error) {
+	if err := safe.Arg(paneID); err != nil {
+		return nil, fmt.Errorf("tmuxctl: CapturePane: paneID: %w", err)
+	}
+	if _, err := parsePaneID([]byte(paneID)); err != nil {
+		return nil, fmt.Errorf("tmuxctl: CapturePane: %w", err)
+	}
+	// -p prints to stdout, -e preserves ANSI escape sequences
+	// (colors + cursor motion — required to replay into the VT
+	// emulator without information loss), -t scopes the capture
+	// to a specific pane. We deliberately do NOT pass -S / -E
+	// here: capturing only the visible screen keeps the payload
+	// bounded (tmux's default scrollback is 2000 lines and a
+	// hostile claude could fill it), and the emulator receives
+	// live %output for everything that scrolls past afterwards.
+	out, err := o.run(ctx, "capture-pane", "-p", "-e", "-t", paneID)
+	if errors.Is(err, ErrServerNotRunning) {
+		return nil, ErrNoSuchPane
+	}
+	if err != nil {
+		low := err.Error()
+		if strings.Contains(low, "can't find pane") ||
+			strings.Contains(low, "can't find window") ||
+			strings.Contains(low, "pane not found") ||
+			strings.Contains(low, "window not found") {
+			return nil, ErrNoSuchPane
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
+// ResizeWindow tells tmux to resize the given window to width x height
+// cells. This is how the TUI keeps each claude pane sized to the
+// right-pane viewport: whenever the emulator's body dimensions change
+// (terminal resize, highlight moved to a different window that may
+// have drifted), sm4c issues one ResizeWindow so wrapping and cursor
+// positioning stay honest.
+//
+// windowID must be in the `@<digits>` shape. width and height are
+// cells (columns × rows) and must both be positive; zero or negative
+// is rejected before reaching tmux because resize-window accepts them
+// silently but produces a useless 1x1 pane.
+//
+// A missing window or missing server returns ErrNoSuchWindow — the
+// caller treats this as "session closed between highlight and
+// resize", logs nothing, and moves on. This mirrors ActivePane's
+// soft-failure posture and keeps a single closed session from
+// blowing up the TUI.
+//
+// Setting `window-size manual` on the sm4c session (done in spawn.go)
+// is what makes this call authoritative; without it tmux would
+// bounce the window back to a client-derived size on the next
+// %sizechanged notification.
+func (o OneShot) ResizeWindow(ctx context.Context, windowID string, width, height int) error {
+	if err := safe.Arg(windowID); err != nil {
+		return fmt.Errorf("tmuxctl: ResizeWindow: windowID: %w", err)
+	}
+	if _, err := parseWindowID([]byte(windowID)); err != nil {
+		return fmt.Errorf("tmuxctl: ResizeWindow: %w", err)
+	}
+	if width < 1 || height < 1 {
+		return fmt.Errorf("tmuxctl: ResizeWindow: non-positive dims %dx%d", width, height)
+	}
+	_, err := o.run(ctx,
+		"resize-window",
+		"-t", windowID,
+		"-x", intToDecimal(width),
+		"-y", intToDecimal(height),
+	)
+	if errors.Is(err, ErrServerNotRunning) {
+		return ErrNoSuchWindow
+	}
+	if err != nil {
+		low := err.Error()
+		if strings.Contains(low, "can't find window") ||
+			strings.Contains(low, "window not found") ||
+			strings.Contains(low, "can't find session") {
+			return ErrNoSuchWindow
+		}
+		return err
+	}
+	return nil
+}
+
+// intToDecimal renders a non-negative int as its base-10 string
+// without pulling strconv into this file (the rest of the package
+// avoids strconv for parity with the intToString helper in
+// internal/tui). The caller guarantees n >= 0 (ResizeWindow
+// rejects negatives before this point); a defensive 0 fallback
+// keeps the function well-defined outside that contract.
+func intToDecimal(n int) string {
+	if n <= 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}
+
 // KillServer terminates the sm4c tmux server. It returns nil if the
 // server was already gone (idempotent teardown is the only sensible
 // behavior for a `sm4c stop`).
