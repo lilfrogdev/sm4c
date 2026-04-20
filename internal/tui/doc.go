@@ -1,16 +1,30 @@
 // Package tui is sm4c's Bubble Tea front end.
 //
-// Scope in this milestone (M3d — animated per-session status
-// glyphs on top of the M3c input-routing + focus surface):
+// Scope in this milestone (M3e — sidebar zoom, session-card
+// layout with cwd, and card-style full-width highlight, on
+// top of the M3d status-glyph surface):
 //
-//   - One unified sidebar layout, shown at all times:
+//   - One unified sidebar layout, shown at all times (unless
+//     the user has zoomed it away — see "Sidebar zoom" below):
 //
 //       * Title bar — "sm4c", with a faint pluralized session count
 //         appended when any sessions exist.
 //
-//       * Session list — one row per managed session with a
-//         two-column status glyph and a name column. The
-//         highlighted row is painted in reverse video. The
+//       * Session list — one "card" per managed session. A card
+//         is up to two lines: a header line (status glyph + name)
+//         and a faint second line showing the active pane's
+//         working directory, shortened with "~/…" when it lives
+//         under the user's home directory and truncated from the
+//         head with "…" when it would overflow the column. Cards
+//         are separated by a blank line so the list reads as
+//         discrete items. The highlighted card is padded to the
+//         full sidebar content width and rendered with Reverse,
+//         producing a visible "band" that the eye picks out from
+//         across the room rather than a tight reverse-video text
+//         run that ends at the glyph. The unit-test path (no
+//         WindowSizeMsg, unknown content width) falls back to the
+//         pre-M3e single-run highlight, so substring-based tests
+//         keep working unchanged. The
 //         status glyph (M3d) reflects that session's live
 //         state: faint `·` (Quiet), solid `●` (Idle), animated
 //         braille spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ — Working), `✓`
@@ -149,12 +163,35 @@
 //                      else. No tmux round-trip happens before
 //                      confirmation, so a mis-typed `x` is a safe
 //                      one-step rollback.
+//       * `z`          hide the sidebar (tmux-style zoom). The
+//                      flip is atomic: sidebarHidden = true AND
+//                      focus = FocusPane both take effect in the
+//                      same Update tick, the pane viewport is
+//                      re-measured to full terminal width, and
+//                      tmux is issued a resize-window so claude
+//                      redraws for the new grid. Requires at
+//                      least one highlightable session — zoom
+//                      on an empty sidebar is a no-op so the
+//                      user cannot trap themselves in a blank
+//                      viewport with no binding to spawn a
+//                      session. `Ctrl+Shift+B` was the user's
+//                      first-pass request, but in terminals
+//                      without the Kitty keyboard protocol
+//                      enabled it collapses to the same byte
+//                      as `Ctrl+B` and bubbletea can't tell
+//                      them apart.
 //       * `?`          toggle the expanded help block
 //       * `q` / `ctrl+c`  quit (emits ActionNone). Claude sessions
 //                      keep running on the sm4c tmux socket.
 //
 //     Pane focus (claude owns the keyboard):
-//       * `ctrl+b`     toggle focus back to the sidebar.
+//       * `ctrl+b`     toggle focus back to the sidebar. If the
+//                      sidebar was zoomed away via `z`, this
+//                      also un-hides it and rescales the pane
+//                      viewport back to the split layout in the
+//                      same tick — single-binding symmetry so
+//                      users do not need to learn a second
+//                      shortcut for restoration.
 //       * any other key — translated to its terminal byte sequence
 //                      by keyMsgToBytes and forwarded to the active
 //                      pane via the KeySender seam. `ctrl+c` is
@@ -172,8 +209,33 @@
 //     Config.SessionPollInterval (TOML key session_poll_interval,
 //     default "1s") and plumbs it through openTUI.
 //
+//   - Sidebar zoom (M3e). Model.sidebarHidden collapses the
+//     sidebar column so the right pane takes the entire
+//     viewport, and is always paired with FocusPane while set.
+//     Toggled via `z` (in sidebar focus) to enter zoom and
+//     `ctrl+b` (from pane focus) to leave — both transitions
+//     re-run rightPaneBodyDims, re-size every live emulator,
+//     and emit a resize-window so claude's upstream grid
+//     matches what the TUI draws. The flag does NOT persist
+//     across sm4c launches: every fresh TUI starts with the
+//     sidebar visible so a first-time observer is never handed
+//     a blank pane with no obvious way back to the session
+//     list. The right-pane header grows a "[ctrl+b: show
+//     sidebar]" hint while zoomed so the restoration path is
+//     always self-explanatory.
+//
+//   - Session working directory (M3e). tmuxctl's list-windows
+//     format string now includes #{pane_current_path}, surfaced
+//     to the TUI as Session.Cwd. The sidebar renders this as a
+//     faint second line per card, shortPath()'d to "~/…" under
+//     the home directory and truncLeft()-truncated when the
+//     path would overflow the sidebar column. Empty Cwd (tmux
+//     couldn't resolve a path, or the test stub doesn't set it)
+//     omits the line cleanly so no blank-indent row leaks into
+//     the view.
+//
 //   - The compose ("pick cwd + name") sub-view for `n` is
-//     intentionally deferred to M3e. Until then, `n` asks the CLI
+//     intentionally deferred to a later milestone. Until then, `n` asks the CLI
 //     layer to spawn a bare claude in the process's current working
 //     directory, and the TUI reopens with the new window
 //     highlighted.

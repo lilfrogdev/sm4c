@@ -172,6 +172,16 @@ type Window struct {
 	Active      bool
 	SessionName string
 	Kind        string // e.g. KindClaude, or "" for unmanaged
+
+	// CurrentPath is the active pane's working directory as tmux
+	// reports it via `#{pane_current_path}`. Empty when tmux
+	// could not resolve one (e.g. the pane's process has exited
+	// between list-windows row generation and field expansion).
+	// Sanitized via safe.Line so it is safe to render directly.
+	// Used by the TUI sidebar to show a "where am I working?"
+	// hint under each session name, in the same spirit as
+	// claude-squad and Cursor's grouped-by-repo sidebar.
+	CurrentPath string
 }
 
 // Managed reports whether this window was created by sm4c (tagged with
@@ -183,15 +193,25 @@ func (w Window) Managed() bool { return w.Kind == KindClaude }
 // The untrusted free-form field (window_name) is placed LAST so that any
 // tab or stray byte in the name is absorbed into the remainder by the
 // splitter below instead of corrupting field boundaries. Every other
-// field has a restricted charset:
+// field has a restricted charset — except #{pane_current_path}, which
+// is a filesystem path and CAN in principle contain a tab character.
+// In practice tabs in paths are vanishingly rare (no mainstream
+// package or repo convention uses them) and our defensive parser
+// tolerates the degenerate case: an extra tab in the path would shift
+// the tail into window_name's slot and safe.Label/safe.Line would
+// strip the embedded control byte on sanitization, producing a
+// slightly garbled display rather than corrupting structural state.
+// Sanitization + the trailing free-form slot together keep this
+// safe-by-construction without adding a dedicated escape dance.
 //
-//   - #{window_id}       : "@" + decimal digits
-//   - #{window_active}   : "0" or "1"
-//   - #{session_name}    : controlled by sm4c ("sm4c")
-//   - #{@sm4c-kind}      : controlled by sm4c ("" or "claude")
-//   - #{window_flags}    : subset of "*+-!#~M"
-//   - #{window_name}     : untrusted
-const listWindowsFormat = "#{window_id}\t#{window_active}\t#{session_name}\t#{@sm4c-kind}\t#{window_flags}\t#{window_name}"
+//   - #{window_id}           : "@" + decimal digits
+//   - #{window_active}       : "0" or "1"
+//   - #{session_name}        : controlled by sm4c ("sm4c")
+//   - #{@sm4c-kind}          : controlled by sm4c ("" or "claude")
+//   - #{window_flags}        : subset of "*+-!#~M"
+//   - #{pane_current_path}   : active pane's cwd, absolute path
+//   - #{window_name}         : untrusted
+const listWindowsFormat = "#{window_id}\t#{window_active}\t#{session_name}\t#{@sm4c-kind}\t#{window_flags}\t#{pane_current_path}\t#{window_name}"
 
 // ListWindows returns every window visible on the sm4c tmux server, in
 // tmux's native ordering. If the server is not running this returns
@@ -217,10 +237,11 @@ func parseWindows(out []byte) ([]Window, error) {
 		if len(rawLine) == 0 {
 			continue
 		}
-		// Splitn with N=6 so that any tabs present in the free-form
-		// window_name stay bundled into the final field.
-		parts := strings.SplitN(string(rawLine), "\t", 6)
-		if len(parts) != 6 {
+		// Splitn with N=7 so that any tabs present in the free-form
+		// window_name stay bundled into the final field. See
+		// listWindowsFormat for the slot order.
+		parts := strings.SplitN(string(rawLine), "\t", 7)
+		if len(parts) != 7 {
 			return nil, fmt.Errorf("tmuxctl: malformed list-windows row: %q", safe.Line(string(rawLine)))
 		}
 		w := Window{
@@ -228,7 +249,8 @@ func parseWindows(out []byte) ([]Window, error) {
 			SessionName: parts[2],
 			Kind:        parts[3],
 			Flags:       parts[4],
-			Name:        safe.Label(parts[5]),
+			CurrentPath: safe.Line(parts[5]),
+			Name:        safe.Label(parts[6]),
 			Active:      parts[1] == "1",
 		}
 		wins = append(wins, w)

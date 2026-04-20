@@ -11,9 +11,9 @@ func TestParseWindows_Basic(t *testing.T) {
 	// Three rows: an active managed window, a background managed
 	// window, and an unmanaged window created outside sm4c.
 	in := []byte("" +
-		"@1\t1\tsm4c\tclaude\t*\trefactor-api\n" +
-		"@2\t0\tsm4c\tclaude\t#\ttests\n" +
-		"@3\t0\tsm4c\t\t\trogue-shell\n")
+		"@1\t1\tsm4c\tclaude\t*\t/home/user/proj/refactor-api\trefactor-api\n" +
+		"@2\t0\tsm4c\tclaude\t#\t/home/user/proj/tests\ttests\n" +
+		"@3\t0\tsm4c\t\t\t/tmp\trogue-shell\n")
 
 	got, err := parseWindows(in)
 	if err != nil {
@@ -25,11 +25,43 @@ func TestParseWindows_Basic(t *testing.T) {
 	if got[0].ID != "@1" || !got[0].Active || got[0].Name != "refactor-api" || got[0].Flags != "*" || got[0].Kind != "claude" {
 		t.Errorf("row 0 mismatch: %+v", got[0])
 	}
+	if got[0].CurrentPath != "/home/user/proj/refactor-api" {
+		t.Errorf("row 0 CurrentPath = %q; want %q", got[0].CurrentPath, "/home/user/proj/refactor-api")
+	}
 	if !got[0].Managed() {
 		t.Errorf("row 0 Managed() want true")
 	}
 	if got[2].ID != "@3" || got[2].Kind != "" || got[2].Managed() {
 		t.Errorf("row 2 (unmanaged) mismatch: %+v", got[2])
+	}
+	if got[2].CurrentPath != "/tmp" {
+		t.Errorf("row 2 CurrentPath = %q; want %q", got[2].CurrentPath, "/tmp")
+	}
+}
+
+// TestParseWindows_EmptyCurrentPath pins tolerance for tmux returning
+// an empty #{pane_current_path} — happens briefly when the active
+// pane's process is mid-exit, so the parser must not choke on it.
+// Both the happy-path "normal path" case and the "empty string"
+// case need to land cleanly in the struct; a fetch failure on a
+// transient empty path would flicker the sidebar every time a
+// session exits.
+func TestParseWindows_EmptyCurrentPath(t *testing.T) {
+	t.Parallel()
+
+	in := []byte("@1\t1\tsm4c\tclaude\t*\t\tmy-session\n")
+	got, err := parseWindows(in)
+	if err != nil {
+		t.Fatalf("parseWindows: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 row; got %d", len(got))
+	}
+	if got[0].CurrentPath != "" {
+		t.Errorf("CurrentPath = %q; want empty", got[0].CurrentPath)
+	}
+	if got[0].Name != "my-session" {
+		t.Errorf("Name = %q; want %q", got[0].Name, "my-session")
 	}
 }
 
@@ -40,7 +72,7 @@ func TestParseWindows_SanitizesName(t *testing.T) {
 	// case from the plan. parseWindows must strip it before handing
 	// back, so nothing a hostile claude title can do will corrupt the
 	// outer terminal when the sidebar renders it.
-	in := []byte("@1\t1\tsm4c\tclaude\t*\tevil\x1b[2Jname\n")
+	in := []byte("@1\t1\tsm4c\tclaude\t*\t/tmp\tevil\x1b[2Jname\n")
 
 	got, err := parseWindows(in)
 	if err != nil {
@@ -63,10 +95,10 @@ func TestParseWindows_NameWithTabs(t *testing.T) {
 
 	// If a window name contains a literal tab (unlikely but possible —
 	// tmux does not strip them), the name field must absorb it because
-	// SplitN's N=6 bundles everything past the 5th tab into parts[5].
+	// SplitN's N=7 bundles everything past the 6th tab into parts[6].
 	// safe.Label then strips control bytes (including \t) so the
 	// stored Name is tab-free without losing the surrounding chars.
-	in := []byte("@1\t1\tsm4c\tclaude\t*\ta\tb\tc\n")
+	in := []byte("@1\t1\tsm4c\tclaude\t*\t/tmp\ta\tb\tc\n")
 	got, err := parseWindows(in)
 	if err != nil {
 		t.Fatalf("parseWindows: %v", err)
@@ -96,7 +128,7 @@ func TestParseWindows_EmptyInput(t *testing.T) {
 func TestParseWindows_Malformed(t *testing.T) {
 	t.Parallel()
 
-	// Fewer than 6 fields: must error rather than panic.
+	// Fewer than 7 fields: must error rather than panic.
 	in := []byte("@1\t1\tsm4c\tclaude\n")
 	if _, err := parseWindows(in); err == nil {
 		t.Fatal("parseWindows: want error on malformed row; got nil")

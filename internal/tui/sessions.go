@@ -54,6 +54,16 @@ type Session struct {
 	// dot marker) and is informational only — the highlight index
 	// the user drives with j/k is independent of this flag.
 	Active bool
+
+	// Cwd is the active pane's current working directory, as tmux
+	// reports it via #{pane_current_path}. Empty when the backend
+	// could not resolve one (the pane's process is mid-exit, or the
+	// window is brand new and tmux has not yet observed a cwd). The
+	// sidebar renders this as a faint second line under the session
+	// name, giving the user a "which repo?" hint without having to
+	// remember the mapping from session name to filesystem. Purely
+	// informational; sm4c itself never chdir's based on it.
+	Cwd string
 }
 
 // SessionLister is the TUI's seam onto tmux. It is injected by the

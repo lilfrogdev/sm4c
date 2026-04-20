@@ -2,7 +2,9 @@ package tui
 
 import (
 	"errors"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -346,6 +348,23 @@ type Model struct {
 	// active pane via keySender. See the Focus docstring for
 	// the full semantics.
 	focus Focus
+
+	// sidebarHidden collapses the sidebar column so the right
+	// pane takes the entire viewport — the "zoom" mode from
+	// tmux-land. It is always paired with FocusPane while hidden,
+	// because the only way out is ctrl+b (which re-shows the
+	// sidebar and pulls focus back). A single flag captures the
+	// whole UX: renderSidebarView reads it to skip drawing the
+	// sidebar column, and rightPaneBodyDims reads it to stretch
+	// the emulator grid across the full width. Toggling the flag
+	// therefore implies a resize on the highlighted window so
+	// tmux (and claude) observe the new grid immediately.
+	//
+	// We intentionally do NOT persist sidebarHidden across
+	// re-launches of sm4c: each TUI session starts with the
+	// sidebar visible so a first-time observer is never handed
+	// a blank pane with no obvious way back to the session list.
+	sidebarHidden bool
 
 	// pendingFocus records a FocusPane request that could not be
 	// honored yet because no session was available at startup
@@ -958,7 +977,15 @@ func (m *Model) syncPaneViewport() {
 // caller keeps the defaults. The numbers account for the one-col
 // padding lipgloss applies inside rightPaneStyle and for the header
 // + blank separator line renderRightPane prepends.
+//
+// When the sidebar is zoomed away (sidebarHidden), the right pane
+// takes the full terminal width instead of the one-third split.
+// Both paths converge on rightPaneInteriorDims so the padding/
+// header math stays in one place.
 func (m Model) rightPaneBodyDims() (int, int) {
+	if m.sidebarHidden {
+		return rightPaneBodyDimsFullWidth(m.width, m.height)
+	}
 	return RightPaneBodyDims(m.width, m.height)
 }
 
@@ -1212,6 +1239,43 @@ func (m Model) handleKeyInSidebarFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.pendingCloseWindow = wid
 		return m, nil
 
+	case "z":
+		// "Zoom": hide the sidebar and move focus into the pane
+		// so the right pane gets the full viewport. This is the
+		// tmux <prefix>-z convention, adapted to sm4c's single-
+		// window layout. Two gates:
+		//
+		//   - A session must be highlightable. Without one, the
+		//     zoomed view would be a blank right pane with no way
+		//     to spawn a session (the `n` binding lives in the
+		//     sidebar). We no-op instead of trapping the user.
+		//   - paneResolver must be wired. On the test / headless
+		//     path we have no pane to focus into; hiding the
+		//     sidebar there would hide the only visible UI.
+		//
+		// The sidebar is restored via ctrl+b from pane focus,
+		// which also pulls focus back. Keeping the restoration
+		// path on the existing ctrl+b binding means users do not
+		// need to learn a second shortcut — and pairs naturally
+		// with the "ctrl+b always gets you to the sidebar"
+		// mental model.
+		if m.highlight < 0 || m.highlight >= len(m.sessions) {
+			return m, nil
+		}
+		m.sidebarHidden = true
+		m.focus = FocusPane
+		// The viewport geometry changed: the right pane just
+		// grew to full width. Push the new dims into the pane
+		// emulator and tell tmux so claude redraws for the new
+		// grid. Without this, the emulator keeps drawing into
+		// the smaller pre-zoom width and the pane looks
+		// truncated until the next real WindowSizeMsg.
+		m.syncPaneViewport()
+		return m, tea.Batch(
+			m.resolveHighlightedPaneIfNeeded(),
+			m.resizeHighlightedWindow(),
+		)
+
 	case "?":
 		// Toggle the expanded help block. Unlike quit/new, this does
 		// not exit — it just flips a render flag.
@@ -1238,6 +1302,24 @@ func (m Model) handleKeyInSidebarFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleKeyInPaneFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "ctrl+b" {
 		m.focus = FocusSidebar
+		// If the sidebar was zoomed away, ctrl+b is the single
+		// restoration path: pull the sidebar back AND shrink the
+		// right pane to re-accommodate it. We re-run the viewport
+		// sync and push a fresh resize to tmux so claude redraws
+		// for the reduced grid instead of clipping at the old
+		// full-width geometry. The same flow runs on every ctrl+b
+		// whether or not the sidebar was hidden — the resize is a
+		// no-op via syncPaneViewport's prev==curr guard when
+		// dimensions did not actually change, so we pay nothing
+		// extra in the common case.
+		if m.sidebarHidden {
+			m.sidebarHidden = false
+			m.syncPaneViewport()
+			return m, tea.Batch(
+				m.resolveHighlightedPaneIfNeeded(),
+				m.resizeHighlightedWindow(),
+			)
+		}
 		return m, nil
 	}
 	if m.highlight < 0 || m.highlight >= len(m.sessions) {
@@ -1456,13 +1538,15 @@ var sidebarBindings = []keybind{
 	{"ctrl+b", "focus session"},
 	{"n", "new session"},
 	{"x", "close session"},
+	{"z", "hide sidebar"},
 	{"?", "toggle help"},
 	{"q", "quit"},
 }
 
 // paneBindings is the list shown when focus is on the pane. In
 // this mode every keystroke goes to claude; the only sm4c-
-// reserved shortcut is ctrl+b (back to the sidebar). The help
+// reserved shortcut is ctrl+b (back to the sidebar, also
+// un-hides the sidebar if it was collapsed via `z`). The help
 // block spells out that q / ctrl+c now forward to claude so the
 // user is not surprised.
 var paneBindings = []keybind{
@@ -1558,6 +1642,12 @@ const (
 // stacked-fallback threshold the renderer uses) or the computed
 // body region is non-positive. Callers should treat (0, 0) as
 // "no pre-sizing hint" and skip the resize round-trip.
+//
+// This function assumes the sidebar is VISIBLE. The zoomed
+// (sidebar-hidden) layout is internal to the Model and flows
+// through rightPaneBodyDimsFullWidth below; callers outside this
+// package (the CLI pre-sizer) always see the sidebar-visible
+// geometry because a freshly-launched TUI never starts zoomed.
 func RightPaneBodyDims(termW, termH int) (int, int) {
 	if termW < minSplitWidth || termH < 1 {
 		return 0, 0
@@ -1573,8 +1663,30 @@ func RightPaneBodyDims(termW, termH int) (int, int) {
 	if rightW < 1 {
 		return 0, 0
 	}
+	return rightPaneInteriorDims(rightW, termH)
+}
+
+// rightPaneBodyDimsFullWidth returns the right-pane interior
+// dimensions when the sidebar is collapsed (zoom mode). It is
+// the sibling of RightPaneBodyDims for the sidebar-hidden path.
+// Kept internal because no out-of-package caller has a reason
+// to pre-size for the zoomed layout — zoom is always entered
+// interactively, never at launch.
+func rightPaneBodyDimsFullWidth(termW, termH int) (int, int) {
+	if termW < 1 || termH < 1 {
+		return 0, 0
+	}
+	return rightPaneInteriorDims(termW, termH)
+}
+
+// rightPaneInteriorDims converts "outer right-pane column width"
+// into "body width × body height" by subtracting the padding and
+// header chrome that rightPaneStyle / renderRightPane each add.
+// Single source of truth so the visible and the zoomed layouts
+// cannot drift on future edits.
+func rightPaneInteriorDims(colW, termH int) (int, int) {
 	// rightPaneStyle has Padding(0, 1) — 1 col on each side.
-	bodyW := rightW - 2
+	bodyW := colW - 2
 	if bodyW < 1 {
 		return 0, 0
 	}
@@ -1600,6 +1712,28 @@ func RightPaneBodyDims(termW, termH int) (int, int) {
 // line-level layout checks: the stacked form and the split form
 // share the same substrings.
 func (m Model) renderSidebarView() string {
+	// Zoom path: sidebar is collapsed, the right pane takes the
+	// entire viewport. We deliberately skip the sidebar column AND
+	// its right border here instead of rendering a 0-wide column,
+	// because lipgloss would still paint the border glyph of a
+	// zero-width bordered style and leave a dangling line on the
+	// left edge. Zoom is the only mode where we render the right
+	// pane alone; every other path flows through the split layout
+	// below.
+	if m.sidebarHidden {
+		if m.width < 1 || m.height < 1 {
+			// No geometry yet (test path / mid-launch). Fall
+			// back to the stacked sidebar render so the user
+			// is not looking at literally nothing while bubbletea
+			// boots.
+			return m.renderSidebarColumn() + "\n"
+		}
+		return rightPaneStyle.
+			Width(m.width).
+			Height(m.height).
+			Render(m.renderRightPane())
+	}
+
 	content := m.renderSidebarColumn()
 
 	if m.width < minSplitWidth || m.height < 1 {
@@ -1839,6 +1973,15 @@ func (m Model) renderRightPaneHeader() string {
 	// renders it identically.
 	if m.focus == FocusPane {
 		line += "  " + keyStyle.Render("[focus]")
+		// When the sidebar is zoomed away, spell out the
+		// restoration path right next to the focus chip —
+		// the only reserved shortcut in this mode is ctrl+b,
+		// and "show sidebar" carries more semantic weight than
+		// "back to sidebar" because there is no visible sidebar
+		// to go back to.
+		if m.sidebarHidden {
+			line += "  " + hintStyle.Render("[ctrl+b: show sidebar]")
+		}
 	} else {
 		line += "  " + hintStyle.Render("[ctrl+b to focus]")
 	}
@@ -1909,30 +2052,42 @@ func (m Model) renderHeader() string {
 	)
 }
 
-// renderSessionList emits one row per session. The row format is:
+// renderSessionList emits one "card" per session. The card is up
+// to two lines:
 //
 //	<status-glyph> <name>
+//	  <short-cwd>                              [faint, optional]
 //
-// where <status-glyph> is a two-column cell painted by
-// statusGlyph (animated spinner for Working, red dot for
-// Attention, solid dot for Idle, faint middle dot for Quiet)
-// and <name> is the sanitized window title. The highlighted
-// row is painted in reverse video via rowHighlightStyle using
-// the terminal's native reverse attribute, not a hex color,
-// per the no-theming rule.
+// The second line is omitted when Session.Cwd is empty (tmux has
+// not yet observed a cwd for the pane, or the backend is the
+// test stub). shortPath trims the home prefix to "~" and
+// truncates the head to "…" when the path would overflow the
+// sidebar column, so the line is always single-wrap-safe at
+// sidebarMax.
 //
-// Earlier iterations trailed the row with the opaque tmux
-// window ID ("@3") rendered faintly. Live usage found the ID
-// was pure noise: sm4c users identify sessions by name, never
-// by ID, and the ID column was stealing horizontal space on
-// narrow sidebars. Window IDs are still available via
+// Highlight is a full-width "card" band: the row styled with
+// lipgloss.Width(sidebarContentW) is padded with spaces out to
+// the column edge before the Reverse attribute is applied, so
+// the selection reads as a light block spanning the whole
+// sidebar instead of a reverse-video run that ends at the glyph
+// text. This matches the claude-squad / Cursor convention and
+// makes the cursor obvious at a glance, even on themes where
+// reverse-video alone is subtle. On the unit-test path (width
+// == 0) we fall back to the single-line rowHighlightStyle so
+// the "highlighted row contains <name> in reverse" contract
+// stays stable for Tests that never emit a WindowSizeMsg.
+//
+// Cards are separated by a single blank line so the list reads
+// as discrete items rather than a tight table — breathing room
+// is the secondary visual channel that carries the "this is a
+// set of separate sessions, not lines of a single document"
+// mental model.
+//
+// Earlier iterations trailed the first line with the opaque
+// tmux window ID ("@3") rendered faintly. Live usage found the
+// ID was pure noise and the ID column was stealing horizontal
+// space on narrow sidebars. Window IDs are still available via
 // `sm4c ls` for debugging.
-//
-// We no longer render tmux's own "active window" marker: sm4c's
-// one-claude-per-window design means every managed window is
-// its own session, so the tmux-active flag is redundant with
-// the user's highlight cursor. Freeing that two-column cell for
-// status is the whole point of M3d.
 //
 // When the sessions slice is empty we emit a single faint
 // placeholder row so the sidebar stays visible with its key bar,
@@ -1943,7 +2098,8 @@ func (m Model) renderSessionList() string {
 		return hintStyle.Render("  no sessions yet — press n to start one")
 	}
 	now := time.Now()
-	rows := make([]string, 0, len(m.sessions))
+	contentW := m.sidebarContentWidth()
+	cards := make([]string, 0, len(m.sessions))
 	for i, s := range m.sessions {
 		status := m.statusForWindow(s.WindowID, now)
 		glyph := statusGlyph(status, m.statusFrame)
@@ -1954,13 +2110,147 @@ func (m Model) renderSessionList() string {
 			// so the sidebar doesn't become an empty column.
 			name = "(unnamed)"
 		}
-		row := glyph + name
-		if i == m.highlight {
-			row = rowHighlightStyle.Render(row)
-		}
-		rows = append(rows, row)
+		card := m.renderSessionCard(glyph, name, s.Cwd, contentW, i == m.highlight)
+		cards = append(cards, card)
 	}
-	return strings.Join(rows, "\n")
+	return strings.Join(cards, "\n\n")
+}
+
+// renderSessionCard formats a single session row. Extracted so
+// the multi-branch logic (one-line vs two-line; padded-card vs
+// inline-highlight) lives in one readable place instead of
+// being inlined into the loop above.
+func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highlighted bool) string {
+	header := glyph + name
+
+	// Second line: the short path. Indent by two columns so it
+	// lines up visually under the name (the status glyph
+	// occupies the leading two cells). We render the indent as
+	// part of the unstyled string and let faintStyle color only
+	// the path portion — this way a reverse-video highlight
+	// covers the indentation too, and the card reads as a
+	// contiguous band.
+	var body string
+	if short := shortPath(cwd); short != "" {
+		// Clamp the path to the content width minus the indent
+		// so the faint line never wraps into a third row. On
+		// the unit-test path (contentW == 0) the path is left
+		// un-truncated; lipgloss will not force a wrap without
+		// a Width constraint on the enclosing style.
+		if contentW > 2 {
+			short = truncLeft(short, contentW-2)
+		}
+		body = "  " + hintStyle.Render(short)
+	}
+
+	card := header
+	if body != "" {
+		card = header + "\n" + body
+	}
+
+	// Highlight path: pad to the full sidebar content width so
+	// the Reverse band covers the whole column. When contentW
+	// is zero (test / stacked-fallback geometry) we degrade to
+	// the pre-M3e single-glyph highlight so existing tests keep
+	// matching on substring assertions.
+	if contentW > 0 {
+		style := lipgloss.NewStyle().Width(contentW)
+		if highlighted {
+			style = style.Reverse(true)
+		}
+		return style.Render(card)
+	}
+	if highlighted {
+		return rowHighlightStyle.Render(card)
+	}
+	return card
+}
+
+// sidebarContentWidth returns the content-area width inside the
+// sidebar column (sidebarColumnStyle applies Padding(0, 1)). On
+// the test / narrow-terminal paths where we never got a
+// WindowSizeMsg, returns 0 to signal "unconstrained" — callers
+// downgrade to pre-M3e rendering paths that don't depend on a
+// known column width.
+func (m Model) sidebarContentWidth() int {
+	if m.width < minSplitWidth || m.height < 1 {
+		return 0
+	}
+	w := m.sidebarWidth() - 2 // Padding(0, 1) on each side.
+	if w < 1 {
+		return 0
+	}
+	return w
+}
+
+// shortPath normalizes an absolute filesystem path for display
+// in the narrow sidebar column. Two transforms, in order:
+//
+//  1. Replace the user's home directory prefix with "~" (the
+//     same convention shells and most developer TUIs use). If
+//     homeDir() can't be resolved, we skip this step rather
+//     than risk mis-trimming.
+//  2. Leave overflow handling to truncLeft, which is applied
+//     later at render time once the column width is known.
+//
+// Returns "" for empty input so callers can skip the whole
+// "render a second line" branch with a cheap string check.
+func shortPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	if home := homeDir(); home != "" && strings.HasPrefix(p, home) {
+		rest := strings.TrimPrefix(p, home)
+		switch {
+		case rest == "":
+			return "~"
+		case strings.HasPrefix(rest, "/"):
+			return "~" + rest
+		}
+	}
+	return p
+}
+
+// homeDir returns the current user's home directory, cached for
+// the life of the process. We look it up lazily (not at init) so
+// a test that changes HOME before calling shortPath sees the new
+// value on first invocation; subsequent calls hit the cache so
+// render-time path shortening stays allocation-free. A lookup
+// failure collapses to "" which makes shortPath a no-op and we
+// fall back to the absolute path — degraded but still correct.
+var (
+	homeDirOnce sync.Once
+	homeDirVal  string
+)
+
+func homeDir() string {
+	homeDirOnce.Do(func() {
+		if h, err := os.UserHomeDir(); err == nil {
+			homeDirVal = h
+		}
+	})
+	return homeDirVal
+}
+
+// truncLeft shortens s to at most max visible runes by dropping
+// the head and prepending an ellipsis when necessary. We trim
+// from the LEFT (not the right) because the meaningful portion
+// of a working-directory path is the tail — "~/Repos/proj" is
+// more useful than "~/Repositor…" when the user is trying to
+// tell two sessions apart. Returns "" for non-positive max so
+// the caller can skip rendering entirely.
+func truncLeft(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= max {
+		return s
+	}
+	if max == 1 {
+		return "…"
+	}
+	return "…" + string(rs[len(rs)-(max-1):])
 }
 
 // statusForWindow resolves a tmux window ID to the user-facing
