@@ -17,14 +17,17 @@
 //         under the user's home directory and truncated from the
 //         head with "…" when it would overflow the column. Cards
 //         are separated by a blank line so the list reads as
-//         discrete items. The highlighted card is padded to the
-//         full sidebar content width and rendered with Reverse,
-//         producing a visible "band" that the eye picks out from
-//         across the room rather than a tight reverse-video text
-//         run that ends at the glyph. The unit-test path (no
-//         WindowSizeMsg, unknown content width) falls back to the
-//         pre-M3e single-run highlight, so substring-based tests
-//         keep working unchanged. The
+//         discrete items. The highlighted card wears a rounded-
+//         corner border over an ANSI bright-black (color "8")
+//         background — a lighter, calmer selection than the old
+//         reverse-video band, while still relying exclusively on
+//         the user's terminal palette. Non-highlighted cards
+//         carry a matching horizontal margin so both variants
+//         consume the same outer width and the list does not
+//         visibly shift as the cursor moves. The unit-test path
+//         (no WindowSizeMsg, unknown content width) falls back
+//         to the pre-M3e single-run reverse-video highlight, so
+//         substring-based tests keep working unchanged. The
 //         status glyph (M3d) reflects that session's live
 //         state: faint `·` (Quiet), solid `●` (Idle), animated
 //         braille spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ — Working), `✓`

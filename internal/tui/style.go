@@ -55,7 +55,57 @@ var (
 	// without us picking a color. The whole row (not just the key)
 	// is rendered this way so the highlight is obvious from across
 	// the room.
+	//
+	// This is the FALLBACK highlight used only when the sidebar
+	// column width is unknown (test path / narrow stacked layout).
+	// The primary highlight in the split layout is the rounded-
+	// card variant below, which matches the visual the user
+	// asked for in M3e polish.
 	rowHighlightStyle = lipgloss.NewStyle().Reverse(true)
+
+	// cardBaseStyle is the non-highlighted session-card chrome:
+	// inner padding for breathing room plus a matching horizontal
+	// margin that reserves exactly the same outer width the
+	// highlighted card consumes once its rounded border is drawn.
+	// Keeping the outer widths identical prevents the column from
+	// "jumping" as the user cursors through the list — only the
+	// selected card grows a visible border, everything else slots
+	// into the same horizontal band.
+	cardBaseStyle = lipgloss.NewStyle().
+			Padding(0, 1).
+			Margin(0, 1)
+
+	// cardHighlightStyle is the selected session card. Three
+	// decisions worth calling out, all driven by the M3e polish
+	// pass:
+	//
+	//   1. RoundedBorder — the user asked for slightly rounded
+	//      corners. RoundedBorder uses ╭╮╰╯ which every modern
+	//      terminal renders correctly; we deliberately avoid any
+	//      border-foreground color so the outline inherits the
+	//      user's default foreground and stays legible on any
+	//      theme.
+	//
+	//   2. ANSI bright-black background ("8"). The pre-polish
+	//      highlight was Reverse, which on a light terminal
+	//      produces a near-black band that reads as harsh. ANSI
+	//      8 is the canonical "slightly brighter than bg on dark
+	//      themes, slightly dimmer than fg on light themes"
+	//      shade — the same color neovim's CursorLine and most
+	//      TUI selection backgrounds land on. It honors the
+	//      terminal-native-colors rule (no hex, no 256-index)
+	//      and works across both theme polarities without us
+	//      picking a specific shade.
+	//
+	//   3. Padding(0, 1) plus Border's implicit 1-col side =
+	//      2 cols of "air" between the edge of the band and the
+	//      text — the extra left/right padding the user asked
+	//      for, matched by cardBaseStyle's Margin(0, 1) so the
+	//      outer width stays identical.
+	cardHighlightStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				Padding(0, 1).
+				Background(lipgloss.Color("8"))
 
 	// sidebarColumnStyle frames the left column. BorderRight plus
 	// the default NormalBorder gives us a visible vertical line

@@ -5,7 +5,15 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
+
+// lipglossWidth is a tiny adapter so the tests can use
+// lipgloss.Width by a short local name. Keeping the wrapper
+// avoids sprinkling `lipgloss.Width` across every width-based
+// assertion and makes it trivial to swap the implementation
+// (e.g. to runewidth) in one place if we ever need to.
+func lipglossWidth(s string) int { return lipgloss.Width(s) }
 
 // sidebar_ui_test.go covers three related surfaces of the M3e
 // TUI polish pass:
@@ -262,7 +270,80 @@ func TestTruncLeft(t *testing.T) {
 	}
 }
 
-// TestSidebarHiddenStretchesPaneViewport pins that toggling
+// TestSessionCardHighlightUsesRoundedBorder pins the M3e polish
+// selection chrome: when the sidebar has a known content width,
+// the highlighted card renders with RoundedBorder glyphs. We
+// assert on the top-left and top-right corner characters
+// (╭ / ╮) because those are specific to RoundedBorder — swapping
+// to NormalBorder (┌ / ┐) or dropping the border entirely would
+// flip these assertions. The non-highlighted row MUST NOT carry
+// the corner glyphs, which pins the "only the selected card
+// grows a visible border" contract that keeps the sidebar from
+// looking like a grid of outlined boxes.
+func TestSessionCardHighlightUsesRoundedBorder(t *testing.T) {
+	t.Parallel()
+	m := withSessions([]Session{
+		{WindowID: "@1", Name: "sel"},
+		{WindowID: "@2", Name: "other"},
+	})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = next.(Model)
+
+	list := m.renderSessionList()
+	if !strings.Contains(list, "╭") || !strings.Contains(list, "╮") {
+		t.Fatalf("highlighted card missing rounded top corners: %q", list)
+	}
+	if !strings.Contains(list, "╰") || !strings.Contains(list, "╯") {
+		t.Fatalf("highlighted card missing rounded bottom corners: %q", list)
+	}
+	// Only one card should be highlighted at a time, so exactly
+	// one pair of ╭/╮ should appear. strings.Count gives us a
+	// cheap regression guard against every card accidentally
+	// wearing the border.
+	if n := strings.Count(list, "╭"); n != 1 {
+		t.Fatalf("expected exactly 1 highlighted card border; got %d in %q", n, list)
+	}
+}
+
+// TestSessionCardBaseReservesChromeSpace pins the anti-jump
+// contract: cardBaseStyle's horizontal Margin must match
+// cardHighlightStyle's border so the two variants have the
+// same outer width. We render both a highlighted and a non-
+// highlighted card into the same list and assert that the
+// lines containing the session names have the same visual
+// width (measured via lipgloss.Width, which accounts for
+// wide runes and ANSI escapes). Without the margin, the
+// highlighted row would be 2 cols wider than its neighbors
+// and the eye would catch the list "jumping" as the cursor
+// moves.
+func TestSessionCardBaseReservesChromeSpace(t *testing.T) {
+	t.Parallel()
+	m := withSessions([]Session{
+		{WindowID: "@1", Name: "highlighted"},
+		{WindowID: "@2", Name: "plain"},
+	})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = next.(Model)
+
+	contentW := m.sidebarContentWidth()
+	if contentW <= 0 {
+		t.Fatalf("expected non-zero sidebar content width at 120x30; got %d", contentW)
+	}
+
+	hi := m.renderSessionCard("● ", "highlighted", "", contentW, true)
+	base := m.renderSessionCard("● ", "plain", "", contentW, false)
+
+	// Both rendered blocks must be as wide as the sidebar
+	// content column. lipgloss.Width counts visible cells and
+	// ignores ANSI styling, so it's the right measure for
+	// "does this line fill the column?".
+	if w := lipglossWidth(hi); w != contentW {
+		t.Fatalf("highlighted card width = %d; want contentW = %d (%q)", w, contentW, hi)
+	}
+	if w := lipglossWidth(base); w != contentW {
+		t.Fatalf("base card width = %d; want contentW = %d (%q)", w, contentW, base)
+	}
+}
 // sidebarHidden on causes rightPaneBodyDims to return the full-
 // width geometry instead of the one-third split. This is the
 // mechanism by which claude redraws for the whole viewport

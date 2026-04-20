@@ -76,7 +76,7 @@ make build
 
 ## Quickstart
 
-_(M3e polish: session rows are now two-line cards (name + faint working directory), the selection highlight spans the full sidebar column, and `z` hides the sidebar entirely so claude takes the full viewport. Status badges, close-session confirmation, configurable poll cadence, and input routing carried over from M3c/M3d. The compose flow for `n` is the last remaining M3e item.)_
+*(M3e polish: session rows are now two-line cards (name + faint working directory), the selection highlight spans the full sidebar column, and `z` hides the sidebar entirely so claude takes the full viewport. Status badges, close-session confirmation, configurable poll cadence, and input routing carried over from M3c/M3d. The compose flow for `n` is the last remaining M3e item.)*
 
 ```bash
 # Open the TUI. The sidebar is always visible:

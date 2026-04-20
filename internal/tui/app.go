@@ -2117,28 +2117,57 @@ func (m Model) renderSessionList() string {
 }
 
 // renderSessionCard formats a single session row. Extracted so
-// the multi-branch logic (one-line vs two-line; padded-card vs
+// the multi-branch logic (one-line vs two-line; rounded-card vs
 // inline-highlight) lives in one readable place instead of
 // being inlined into the loop above.
+//
+// Width accounting (M3e polish). Lipgloss's Width() sizes the
+// content-plus-padding box; border and margin are added on
+// top. Both card variants are paired so their outer widths
+// match:
+//
+//   - cardHighlightStyle: Border(Rounded) + Padding(0,1)
+//     → outer = Width + 2 (border) cols
+//   - cardBaseStyle:      Margin(0,1)    + Padding(0,1)
+//     → outer = Width + 2 (margin) cols
+//
+// We therefore pass `Width(contentW - cardOuterChromeW)` to
+// both styles so the block always lands at exactly `contentW`
+// columns, keeping the sidebar column stable as the highlight
+// moves. The cwd truncation target subtracts the inner padding
+// AND the 2-column indent that lines the path up under the
+// session name.
 func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highlighted bool) string {
 	header := glyph + name
+
+	// widthParam is what we hand to lipgloss's Width(). It is
+	// content+padding; lipgloss will add the 2-col border (on
+	// highlighted) or 2-col margin (on base) to reach contentW.
+	// textW is the width available for actual glyphs inside the
+	// padding — used to truncate the cwd line so it never wraps.
+	widthParam := 0
+	textW := 0
+	if contentW > cardOuterChromeW {
+		widthParam = contentW - cardOuterChromeW
+		textW = widthParam - cardInnerChromeW
+	}
 
 	// Second line: the short path. Indent by two columns so it
 	// lines up visually under the name (the status glyph
 	// occupies the leading two cells). We render the indent as
-	// part of the unstyled string and let faintStyle color only
-	// the path portion — this way a reverse-video highlight
-	// covers the indentation too, and the card reads as a
-	// contiguous band.
+	// part of the unstyled string and let hintStyle color only
+	// the path portion — this way the card's background (and
+	// the fallback reverse-video highlight) covers the
+	// indentation too and the card reads as a contiguous band.
 	var body string
 	if short := shortPath(cwd); short != "" {
-		// Clamp the path to the content width minus the indent
-		// so the faint line never wraps into a third row. On
-		// the unit-test path (contentW == 0) the path is left
+		// Clamp the path to the text width minus the indent so
+		// the faint line never wraps into a third row. On the
+		// unit-test path (textW == 0) the path is left
 		// un-truncated; lipgloss will not force a wrap without
 		// a Width constraint on the enclosing style.
-		if contentW > 2 {
-			short = truncLeft(short, contentW-2)
+		if textW > 2 {
+			short = truncLeft(short, textW-2)
 		}
 		body = "  " + hintStyle.Render(short)
 	}
@@ -2148,23 +2177,38 @@ func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highligh
 		card = header + "\n" + body
 	}
 
-	// Highlight path: pad to the full sidebar content width so
-	// the Reverse band covers the whole column. When contentW
-	// is zero (test / stacked-fallback geometry) we degrade to
-	// the pre-M3e single-glyph highlight so existing tests keep
-	// matching on substring assertions.
-	if contentW > 0 {
-		style := lipgloss.NewStyle().Width(contentW)
+	// Highlight path: the selected card renders with a rounded
+	// border on an ANSI-8 lighter background (see
+	// cardHighlightStyle in style.go). The base card renders
+	// with a matching margin so both occupy the same outer
+	// width and the list stays visually stable as the user
+	// cursors through it. When contentW is zero (test /
+	// stacked-fallback geometry) we degrade to the pre-M3e
+	// single-glyph highlight so existing tests keep matching on
+	// substring assertions.
+	if widthParam > 0 {
 		if highlighted {
-			style = style.Reverse(true)
+			return cardHighlightStyle.Width(widthParam).Render(card)
 		}
-		return style.Render(card)
+		return cardBaseStyle.Width(widthParam).Render(card)
 	}
 	if highlighted {
 		return rowHighlightStyle.Render(card)
 	}
 	return card
 }
+
+// cardOuterChromeW is the horizontal chrome lipgloss adds OUTSIDE
+// of the Width() box — the rounded border on the highlighted
+// card and the matching margin on the base card, each costing
+// 1 col per side. cardInnerChromeW is the chrome lipgloss counts
+// INSIDE Width() — the Padding(0, 1) on both variants. Kept as
+// two small constants so the Width accounting in
+// renderSessionCard stays legible and matches style.go exactly.
+const (
+	cardOuterChromeW = 2
+	cardInnerChromeW = 2
+)
 
 // sidebarContentWidth returns the content-area width inside the
 // sidebar column (sidebarColumnStyle applies Padding(0, 1)). On
