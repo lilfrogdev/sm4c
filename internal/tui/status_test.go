@@ -208,9 +208,14 @@ func TestClearPaneAttentionOnKeystroke(t *testing.T) {
 
 // TestStatusGlyphShape pins the visual surface of each state.
 // We match on substring because the Working glyph is an animated
-// spinner frame (one of "|/-\"), and because the Attention glyph
-// is wrapped in an ANSI color escape — asserting the escape
-// would couple the test to lipgloss internals.
+// braille spinner frame (one of spinnerFrames), and because the
+// Attention glyph is wrapped in an ANSI color escape — asserting
+// the escape would couple the test to lipgloss internals.
+//
+// The Working-frame cases are derived from spinnerFrames rather
+// than hardcoded so a future change to the spinner glyph set does
+// not require a parallel test edit. The wrap assertion still
+// pins the modulo contract: frame len == frame 0.
 func TestStatusGlyphShape(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -222,11 +227,10 @@ func TestStatusGlyphShape(t *testing.T) {
 		{StatusQuiet, 0, "·", "quiet is a middle dot"},
 		{StatusIdle, 0, "●", "idle is a solid dot"},
 		{StatusAttention, 0, "●", "attention is a solid dot (color-differentiated)"},
-		{StatusWorking, 0, "|", "working frame 0 is |"},
-		{StatusWorking, 1, "/", "working frame 1 is /"},
-		{StatusWorking, 2, "-", "working frame 2 is -"},
-		{StatusWorking, 3, "\\", "working frame 3 is \\"},
-		{StatusWorking, 4, "|", "working frame wraps at len(spinnerFrames)"},
+		{StatusWorking, 0, spinnerFrames[0], "working frame 0 is first braille glyph"},
+		{StatusWorking, 1, spinnerFrames[1], "working frame 1 is second braille glyph"},
+		{StatusWorking, 2, spinnerFrames[2], "working frame 2 is third braille glyph"},
+		{StatusWorking, len(spinnerFrames), spinnerFrames[0], "working frame wraps at len(spinnerFrames)"},
 	}
 	for _, tc := range cases {
 		tc := tc
@@ -237,6 +241,28 @@ func TestStatusGlyphShape(t *testing.T) {
 				t.Fatalf("statusGlyph(%v, %d) = %q; want substring %q", tc.status, tc.frame, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSpinnerFramesAreBraille pins the "we chose braille, and
+// every frame is one cell wide" contract. It guards against
+// accidental edits that would reintroduce ASCII glyphs (which
+// would regress visual smoothness) or mix in wider codepoints
+// (which would jitter the sidebar column width).
+func TestSpinnerFramesAreBraille(t *testing.T) {
+	t.Parallel()
+	if len(spinnerFrames) == 0 {
+		t.Fatalf("spinnerFrames is empty")
+	}
+	for i, f := range spinnerFrames {
+		runes := []rune(f)
+		if len(runes) != 1 {
+			t.Fatalf("spinnerFrames[%d] = %q has %d runes; want 1", i, f, len(runes))
+		}
+		r := runes[0]
+		if r < 0x2800 || r > 0x28FF {
+			t.Fatalf("spinnerFrames[%d] = %q (U+%04X) is not in the Braille Patterns block (U+2800..U+28FF)", i, f, r)
+		}
 	}
 }
 
@@ -419,9 +445,11 @@ func TestSidebarRendersWorkingSpinner(t *testing.T) {
 		everHadOutput: true,
 	}
 	row := m.renderSessionList()
-	// The working glyph at frame 0 starts with '|'. If
-	// spinnerFrames ever changes, update this assertion.
-	wantChar := string(spinnerFrames[0])
+	// Read frame 0 through spinnerFrames so this test
+	// survives edits to the spinner character set — only the
+	// "the sidebar renders frame 0 of the spinner for a
+	// Working pane" contract is under test here.
+	wantChar := spinnerFrames[0]
 	if !strings.Contains(row, wantChar) {
 		t.Fatalf("rendered row missing Working glyph %q: %q", wantChar, row)
 	}

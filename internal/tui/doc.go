@@ -13,11 +13,11 @@
 //         window-id column. The highlighted row is painted in
 //         reverse video. The status glyph (M3d) reflects that
 //         session's live state: faint `·` (Quiet), solid `●`
-//         (Idle), animated `|/-\` spinner (Working), amber `●`
-//         (Attention — claude rang the bell, user hasn't
-//         acknowledged yet). The spinner only runs while at
-//         least one session is Working, so an all-idle TUI is
-//         visually still. When no sessions exist, the list area
+//         (Idle), animated braille spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ —
+//         Working), amber `●` (Attention — claude rang the
+//         bell, user hasn't acknowledged yet). The spinner
+//         only runs while at least one session is Working, so
+//         an all-idle TUI is visually still. When no sessions exist, the list area
 //         shows a single faint placeholder ("no sessions yet —
 //         press n to start one") so the sidebar never collapses
 //         to a bare header.
@@ -160,8 +160,9 @@
 //     (0x07) byte; Attention → derived-from-activity on the
 //     next keystroke the user forwards to that pane (which
 //     acknowledges the bell). The animation ticker
-//     (statusFrameInterval = 250ms) only runs while at least
-//     one pane is Working, so a TUI full of idle sessions does
+//     (statusFrameInterval = 100ms, for a 1s rotation across
+//     the 10 braille frames) only runs while at least one
+//     pane is Working, so a TUI full of idle sessions does
 //     not burn a background re-render budget. Status is keyed
 //     by tmux window ID in paneStatuses (not pane ID) so the
 //     close-session churn that invalidates paneByWindow for

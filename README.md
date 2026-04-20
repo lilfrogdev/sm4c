@@ -122,7 +122,7 @@ To rename a session, type `/rename <newname>` directly inside the claude pane �
 Session status glyphs (M3d). Each sidebar row starts with a two-column cell that reflects that session's live state:
 
 - `·` (faint) — Quiet: the session is alive but hasn't produced any output yet.
-- `|/-\` (animated) — Working: claude is streaming output right now.
+- `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` (animated braille spinner) — Working: claude is streaming output right now.
 - `●` — Idle: claude finished its response and is waiting for you. Threshold is `monitor_silence` from `config.toml` (default 3s).
 - `●` (amber) — Attention: claude rang the terminal bell (permission prompt, error). The glyph stays amber until you type into that session's pane, which acknowledges the bell.
 

@@ -130,23 +130,36 @@ func (ps paneStatus) derivedStatus(now time.Time, silenceThreshold time.Duration
 	return StatusWorking
 }
 
-// spinnerFrames is the classic 4-frame ASCII spinner. We pick
-// ASCII over braille / box-drawing characters to honor the user
-// ask for "ASCII animations similar to Cursor" and to render
-// identically in every terminal sm4c targets (including narrow
-// single-byte locales). The order of frames produces a
-// clockwise-rotating bar at ~120ms/frame = ~480ms/cycle, which
-// reads as "working" without being distractingly fast.
-const spinnerFrames = `|/-\`
+// spinnerFrames is the classic 10-frame braille spinner used by
+// ora, spin.js, oclif, and most modern CLI tooling. Each frame
+// is a U+28xx Braille Patterns codepoint that lights a subset of
+// the 2×4 dot matrix; stepped in order they read as a single
+// dot rotating clockwise around the cell. Braille gives us a
+// smoother-looking spinner than the 4-frame ASCII `|/-\` at the
+// cost of requiring a UTF-8 terminal with a font that covers
+// U+2800..U+28FF — which is every terminal sm4c targets on
+// macOS and Linux in 2026 (Terminal.app, iTerm2, Alacritty,
+// Kitty, WezTerm, Ghostty, GNOME Terminal, Konsole…). Fixed-
+// width font coverage means every frame occupies exactly one
+// terminal cell, so the two-cell status column never jitters.
+//
+// It is a []string rather than a string because the codepoints
+// are three bytes each in UTF-8; byte-indexing would slice
+// them apart and render garbage. String-slice indexing is
+// O(1) per frame and the slice header is constant.
+var spinnerFrames = []string{
+	"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+}
 
 // statusFrameInterval is how often statusFrameTickMsg fires
-// while at least one pane is Working. 250ms is the sweet spot:
-// fast enough that the spinner visibly moves, slow enough that
-// the Model's Update runs cheaply. Lowering it to ~80ms would
-// feel smoother but would also re-render the sidebar ~12x/sec,
-// which taxes any remote session the user might be tunneling
-// over.
-const statusFrameInterval = 250 * time.Millisecond
+// while at least one pane is Working. 100ms at 10 frames is a
+// 1s rotation, which matches the rotation cadence of the old
+// 4-frame / 250ms ASCII spinner — identical "speed" feel, just
+// a smoother glyph. Going faster (e.g. 80ms, the ora default)
+// pushes the sidebar re-render rate to ~12/s, which starts to
+// tax a sluggish SSH link; 100ms keeps that cost at 10/s while
+// still reading as obviously animated.
+const statusFrameInterval = 100 * time.Millisecond
 
 // attentionStyle renders the Attention glyph in ANSI yellow.
 // Yellow (color 3) resolves to amber/orange on almost every
@@ -179,7 +192,7 @@ func statusGlyph(status SessionStatus, frame int) string {
 		if idx < 0 {
 			idx += len(spinnerFrames)
 		}
-		return string(spinnerFrames[idx]) + " "
+		return spinnerFrames[idx] + " "
 	case StatusAttention:
 		return attentionStyle.Render("●") + " "
 	case StatusIdle:
