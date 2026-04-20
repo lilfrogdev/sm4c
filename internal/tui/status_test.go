@@ -323,7 +323,7 @@ func TestStatusGlyphShape(t *testing.T) {
 	}{
 		{StatusQuiet, 0, "·", "quiet is a middle dot"},
 		{StatusIdle, 0, "●", "idle is a solid dot"},
-		{StatusAttention, 0, "●", "attention is a solid dot (color-differentiated)"},
+		{StatusAttention, 0, attentionGlyph, "attention is a shape-distinct glyph (survives reverse-video)"},
 		{StatusWorking, 0, spinnerFrames[0], "working frame 0 is first braille glyph"},
 		{StatusWorking, 1, spinnerFrames[1], "working frame 1 is second braille glyph"},
 		{StatusWorking, 2, spinnerFrames[2], "working frame 2 is third braille glyph"},

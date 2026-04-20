@@ -13,12 +13,17 @@
 //         highlighted row is painted in reverse video. The
 //         status glyph (M3d) reflects that session's live
 //         state: faint `·` (Quiet), solid `●` (Idle), animated
-//         braille spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ — Working), red `●`
+//         braille spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ — Working), red `!`
 //         (Attention — claude rang the bell, user hasn't
-//         acknowledged yet). The spinner only runs while at
-//         least one session is Working, so an all-idle TUI is
-//         visually still. The Working state is suppressed for
-//         keystrokeEchoWindow (1.5s) after every forwarded
+//         acknowledged yet). The Attention glyph is a bang
+//         (not a dot) so the "this needs you" signal carries
+//         through the reverse-video attribute that paints the
+//         highlighted row, since reverse swaps foreground and
+//         background and can hide a foreground-only color
+//         change. The spinner only runs while at least one
+//         session is Working, so an all-idle TUI is visually
+//         still. The Working state is suppressed for
+//         keystrokeEchoWindow (400ms) after every forwarded
 //         keystroke, so claude's per-keypress redraw bytes do
 //         not masquerade as "claude is thinking" — only bytes
 //         that arrive outside the echo window (response
@@ -166,10 +171,10 @@
 //     (0x07) byte; Attention → derived-from-activity on the
 //     next keystroke the user forwards to that pane (which
 //     acknowledges the bell). Bytes arriving within
-//     keystrokeEchoWindow (1.5s) of the most recent keystroke
-//     are treated as claude's prompt redraw rather than claude
-//     working — they leave the glyph on Idle instead of
-//     flipping it to Working. Without this arc, every keypress
+//     keystrokeEchoWindow (400ms) of the most recent
+//     keystroke are treated as claude's prompt redraw rather
+//     than claude working — they leave the glyph on Idle
+//     instead of flipping it to Working. Without this arc, every keypress
 //     the user sent would spin the glyph for 3s while nothing
 //     was actually happening (claude was not thinking, the
 //     bytes were just echo). The animation ticker

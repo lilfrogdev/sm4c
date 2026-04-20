@@ -130,24 +130,30 @@ type paneStatus struct {
 // keystrokeEchoWindow is how long after the most recent
 // keystroke we assume incoming bytes are echo / redraw from the
 // user's own typing rather than work the TUI should visualize
-// as "claude is thinking". 1.5s is empirically the right shape:
+// as "claude is thinking".
 //
-//   - Short enough that claude's response streaming (which
-//     arrives within a handful of hundreds of ms after Enter for
-//     short prompts and much later for long ones) still lights
-//     the Working spinner almost immediately.
-//   - Long enough that normal burst-typing (a human's ~80ms
-//     inter-key interval, plus claude's slash-command auto-
-//     complete animations that redraw a few frames per key)
-//     lives entirely inside one echo window and does not
-//     spuriously animate the sidebar glyph.
+// 400ms was chosen empirically: claude's per-keystroke redraw
+// (the input line bouncing back) lands on the order of tens of
+// milliseconds in local usage and rarely exceeds 200ms even
+// over a slow SSH hop. 400ms buys enough headroom that a burst
+// of three or four fast keystrokes all "chain" into one echo
+// window, while still being short enough that claude's actual
+// response streaming — which for simple prompts starts within
+// ~500ms of Enter and for anything non-trivial runs for
+// multiple seconds — spends the overwhelming majority of its
+// lifetime outside the echo window and therefore animates the
+// sidebar spinner.
+//
+// An earlier revision used 1500ms and left users reporting "the
+// spinner never moves" because short claude responses to simple
+// prompts finished entirely inside the suppression window. The
+// right mental model is "echo is near-instant; claude is
+// seconds-scale"; 400ms stays firmly in the gap.
 //
 // Fixed rather than configurable: this is a heuristic, not a
 // policy, and exposing it as a knob would invite users to tune
-// it in ways that hide real bugs (e.g. setting it to 0 to "see
-// the spinner more often" while typing, which is exactly the
-// behavior we are fixing here).
-const keystrokeEchoWindow = 1500 * time.Millisecond
+// it in ways that hide real bugs.
+const keystrokeEchoWindow = 400 * time.Millisecond
 
 // derivedStatus folds a paneStatus record into the user-facing
 // SessionStatus at the current moment. "Current" is passed as a
@@ -232,24 +238,55 @@ var spinnerFrames = []string{
 // still reading as obviously animated.
 const statusFrameInterval = 100 * time.Millisecond
 
-// attentionStyle renders the Attention glyph in ANSI red.
-// Red (color 1) is the universal "needs you / error / warning"
-// color; every mainstream terminal theme (Solarized, Gruvbox,
-// Iceberg, GitHub Dark, Apple defaults, Nord, Dracula…) paints
-// it as an unambiguously alerting hue, which is exactly the
-// semantic we want for the Attention state.
+// attentionStyle renders the Attention glyph in ANSI red plus
+// bold. Red (color 1) is the universal "needs you / error /
+// warning" color across every mainstream terminal theme
+// (Solarized, Gruvbox, Iceberg, GitHub Dark, Apple defaults,
+// Nord, Dracula), which is the semantic we want.
 //
-// Yellow (color 3) was the first attempt — the idea being "amber
-// is softer than red, so it won't startle" — but in practice
-// yellow resolves to pure-yellow (rather than amber/orange) on a
-// surprising number of themes, which reads as "informational,
-// not urgent". Once the glyph stops reading as "you should look
-// at this", it loses its whole purpose, so we trade softness
-// for clarity. Hex colors are forbidden by the existing CI
-// grep gate; color 1 is the best 0-15 match to the intent.
+// Hex colors are forbidden by the existing CI grep gate; color
+// 1 is the best 0-15 match to the intent. Bright-red (9) looks
+// slightly louder on dark themes but tends to wash out on light
+// themes, whereas color 1 paints consistently across both.
+//
+// Important rendering note: the Attention glyph itself
+// (attentionGlyph below) is intentionally a shape-distinct
+// character, not a colored dot. Earlier iterations used `●`
+// with a red foreground, which worked fine on unhighlighted
+// rows but surfaced a "color around the dot changes, not the
+// dot itself" complaint on the highlighted row. Reason: the
+// highlighted row is painted with rowHighlightStyle
+// (Reverse(true)), which — per ANSI SGR semantics — swaps
+// foreground and background at render time. Applied on top of
+// a `Foreground(red)` glyph, that swap pushes red into the
+// background channel and leaves the glyph drawn in the default
+// foreground. So the user saw "a red-backed cell with a
+// default-colored dot inside", not "a red dot". Using a
+// character whose shape alone screams "attention" means the
+// signal survives the swap: even if red becomes background on
+// the highlighted row, the glyph is still obviously different
+// from the Idle/Quiet dots and the Working spinner. Color is
+// now a reinforcement, not the sole carrier.
 var attentionStyle = lipgloss.NewStyle().
 	Foreground(lipgloss.Color("1")).
 	Bold(true)
+
+// attentionGlyph is the character we render for a pane in the
+// Attention state. `!` was chosen because:
+//
+//   - It is universally understood as "alert / warning"
+//     regardless of writing system or terminal theme.
+//   - It occupies exactly one cell in every terminal font so
+//     the two-cell status column never jitters.
+//   - Its vertical-stroke shape is unmistakably different from
+//     the round dots (`·`, `●`) used for Quiet/Idle, the
+//     braille spinner used for Working, and anything else the
+//     sidebar is likely to render, which means the attention
+//     signal survives even if the foreground color does not
+//     (see attentionStyle's rendering note).
+//   - ASCII means no font-coverage risk; every terminal sm4c
+//     runs on renders it identically, full stop.
+const attentionGlyph = "!"
 
 // statusGlyph renders the two-column status cell for one
 // session, given the current status and the animation frame.
@@ -271,7 +308,7 @@ func statusGlyph(status SessionStatus, frame int) string {
 		}
 		return spinnerFrames[idx] + " "
 	case StatusAttention:
-		return attentionStyle.Render("●") + " "
+		return attentionStyle.Render(attentionGlyph) + " "
 	case StatusIdle:
 		return "● "
 	case StatusQuiet:

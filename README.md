@@ -124,9 +124,9 @@ Session status glyphs (M3d). Each sidebar row starts with a two-column cell that
 - `·` (faint) — Quiet: the session is alive but hasn't produced any output yet.
 - `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` (animated braille spinner) — Working: claude is streaming output right now.
 - `●` — Idle: claude finished its response and is waiting for you. Threshold is `monitor_silence` from `config.toml` (default 3s).
-- `●` (red) — Attention: claude rang the terminal bell (permission prompt, error). The glyph stays red until you type into that session's pane, which acknowledges the bell.
+- `!` (red, bold) — Attention: claude rang the terminal bell (permission prompt, error). The glyph stays as a bang until you type into that session's pane, which acknowledges the bell. The shape is deliberately different from the Idle/Quiet dots so the signal carries even on the highlighted row (which paints in reverse video).
 
-The Working spinner is deliberately silenced for ~1.5s after every keystroke you forward to a pane. Claude's TUI redraws its prompt line on every keypress, which shows up as a burst of bytes in the pane stream; without this echo-suppression window the spinner would animate while you type and freeze the moment you stop, which is exactly backwards of what "working" should mean.
+The Working spinner is deliberately silenced for ~400ms after every keystroke you forward to a pane. Claude's TUI redraws its prompt line on every keypress, which shows up as a burst of bytes in the pane stream; without this echo-suppression window the spinner would animate while you type and freeze the moment you stop, which is exactly backwards of what "working" should mean.
 
 The animation only runs while at least one session is Working, so a TUI full of idle sessions is visually still. Status is derived entirely from the byte stream sm4c already consumes; no tmux `monitor-*` options are toggled.
 
