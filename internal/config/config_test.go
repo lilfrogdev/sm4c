@@ -35,6 +35,7 @@ func TestLoadParsesValidTOML(t *testing.T) {
 socket_name   = "sm4c"
 prefix_key    = "C-b"
 monitor_silence = "10s"
+session_poll_interval = "2500ms"
 log_level     = "debug"
 `
 	mustWriteFile(t, path, body, 0o600)
@@ -49,8 +50,23 @@ log_level     = "debug"
 	if cfg.MonitorSilence.AsDuration() != 10*time.Second {
 		t.Errorf("MonitorSilence = %v; want 10s", cfg.MonitorSilence)
 	}
+	if cfg.SessionPollInterval.AsDuration() != 2500*time.Millisecond {
+		t.Errorf("SessionPollInterval = %v; want 2.5s", cfg.SessionPollInterval)
+	}
 	if cfg.LogLevel != "debug" {
 		t.Errorf("LogLevel = %q; want debug", cfg.LogLevel)
+	}
+}
+
+// TestDefaultSessionPollInterval pins that the zero-value shipped
+// cadence is 1s. Operators who do not set session_poll_interval in
+// their TOML get snappy-feeling sidebar updates out of the box;
+// raising this default would feel laggy, lowering it would tax
+// tmux without a user ask.
+func TestDefaultSessionPollInterval(t *testing.T) {
+	t.Parallel()
+	if got := Default().SessionPollInterval.AsDuration(); got != 1*time.Second {
+		t.Fatalf("Default().SessionPollInterval = %v; want 1s", got)
 	}
 }
 

@@ -667,6 +667,139 @@ func TestPaneCaptureErrorStillFlushesPending(t *testing.T) {
 	}
 }
 
+// TestInitialHighlightWindowSkipsFirstCapture pins the freshly-
+// spawned-session fix: when the TUI is opened with an
+// InitialHighlight (which the CLI sets only after an `n`/spawn
+// re-entry), the very first pane resolution for that window
+// must NOT trigger a capture-pane round-trip. Claude is still
+// booting at that moment; a capture would freeze a half-baked
+// frame into the emulator and then sit under the live redraw,
+// producing the "content ghosted at the wrong rows until I
+// resize" symptom.
+//
+// We assert via the capturer stub: zero calls for the initial
+// window's pane. A second paneResolvedMsg for a DIFFERENT window
+// still triggers a capture, proving the skip is scoped to the
+// initial-spawn window and does not disable backfill globally.
+func TestInitialHighlightWindowSkipsFirstCapture(t *testing.T) {
+	t.Parallel()
+	cap := newCapturerStub(map[string][]byte{
+		"%10": []byte("SPAWN-CAPTURE"),
+		"%20": []byte("EXISTING-CAPTURE"),
+	}, "")
+	m := NewModel(Deps{
+		PaneCapturer:     cap.capturer(),
+		InitialHighlight: "@1",
+	})
+	// Resolve the spawn window first: capture must be skipped.
+	next, cmd := m.Update(paneResolvedMsg{windowID: "@1", paneID: "%10"})
+	m = next.(Model)
+	if cmd != nil {
+		t.Fatalf("first resolve for InitialHighlight window emitted cmd %T; want nil (capture suppressed)", cmd)
+	}
+	if m.paneCapturing["%10"] {
+		t.Fatal("paneCapturing[%10] set after suppressed resolve")
+	}
+	if !m.paneCaptured["%10"] {
+		t.Fatal("paneCaptured[%10] not set after suppressed resolve; would let a later resolve re-try capture")
+	}
+	if m.skipCaptureWindow != "" {
+		t.Fatalf("skipCaptureWindow = %q; want cleared after first consume", m.skipCaptureWindow)
+	}
+	if len(cap.called) != 0 {
+		t.Fatalf("capturer called %d times for suppressed window; want 0. called=%+v", len(cap.called), cap.called)
+	}
+	// A different window still gets captured.
+	next2, cmd2 := m.Update(paneResolvedMsg{windowID: "@2", paneID: "%20"})
+	m = next2.(Model)
+	if cmd2 == nil {
+		t.Fatal("second resolve for existing window did not emit capture cmd (skip leaked?)")
+	}
+	// Drive the cmd to observe the capturer call.
+	_ = cmd2()
+	if len(cap.called) != 1 || cap.called[0] != "%20" {
+		t.Fatalf("capturer called = %+v; want exactly one for %%20", cap.called)
+	}
+}
+
+// TestPaneCaptureNormalizesBareLFToCRLF pins the fix for the
+// "captured content renders as a staircase" bug. `tmux capture-pane`
+// emits rows separated by bare LF (`\n`), but vt.Emulator follows
+// strict VT semantics where LF only advances the row — it does NOT
+// reset the column. Without normalization, row N starts at the
+// column where row N-1 ended, so captured content accumulates a
+// diagonal indent that matches the visible distortion users
+// reported ("text wraps far beyond the pane and bleeds into the
+// next row; a tiny terminal resize fixes it").
+//
+// The test writes a capture payload shaped like what tmux actually
+// produces (three short rows, LF-separated) and asserts each
+// emulator row starts at column 0 — i.e. the captured lines are
+// on their own rows, not cumulatively indented. The assertion
+// reads through the plain-text snapshot so it is robust to any
+// SGR encoding the VT renderer chooses.
+func TestPaneCaptureNormalizesBareLFToCRLF(t *testing.T) {
+	t.Parallel()
+	captured := []byte("row one\nrow two\nrow three\n")
+	cap := newCapturerStub(map[string][]byte{"%10": captured}, "")
+	m := NewModel(Deps{PaneCapturer: cap.capturer()})
+	// Force a known viewport so the emulator is wide enough for
+	// each row to fit without its own wrapping; any residual
+	// offset must be from the bug, not from grid overflow.
+	m.paneViewW = 40
+	m.paneViewH = 10
+	next, captureCmd := m.Update(paneResolvedMsg{windowID: "@1", paneID: "%10"})
+	m = next.(Model)
+	next2, _ := m.Update(captureCmd().(paneCaptureMsg))
+	m = next2.(Model)
+	term := m.paneTerminals["%10"]
+	if term == nil {
+		t.Fatal("emulator not created after capture flush")
+	}
+	plain := term.emu.String()
+	lines := strings.Split(plain, "\n")
+	wantPrefixes := []string{"row one", "row two", "row three"}
+	for i, want := range wantPrefixes {
+		if i >= len(lines) {
+			t.Fatalf("emulator only produced %d lines; want at least %d. plain=%q",
+				len(lines), len(wantPrefixes), plain)
+		}
+		got := strings.TrimRight(lines[i], " ")
+		if got != want {
+			t.Fatalf("row %d = %q; want %q (staircase bug returned?)", i, got, want)
+		}
+	}
+}
+
+// TestNormalizeCaptureEOLPreservesExistingCRLF pins that the
+// normalizer does not double up carriage returns when tmux (or any
+// future source) hands us already-CRLF-terminated rows. The guard
+// is important because emulating `\r\r\n` would push the cursor to
+// column 0 twice — no visible harm, but wasted emulator work and a
+// behavioral oddity worth locking down.
+func TestNormalizeCaptureEOLPreservesExistingCRLF(t *testing.T) {
+	t.Parallel()
+	in := []byte("a\r\nb\r\nc\n")
+	out := normalizeCaptureEOL(in)
+	// "a\r\n" stays, "b\r\n" stays, "c\n" -> "c\r\n".
+	want := []byte("a\r\nb\r\nc\r\n")
+	if string(out) != string(want) {
+		t.Fatalf("normalizeCaptureEOL = %q; want %q", out, want)
+	}
+}
+
+// TestNormalizeCaptureEOLNoopWhenAlreadyCRLF returns the original
+// backing slice unchanged when no bare LFs need rewriting. This is
+// purely an allocation-savings contract but cheap to pin.
+func TestNormalizeCaptureEOLNoopWhenAlreadyCRLF(t *testing.T) {
+	t.Parallel()
+	in := []byte("a\r\nb\r\n")
+	out := normalizeCaptureEOL(in)
+	if &in[0] != &out[0] {
+		t.Fatal("normalizeCaptureEOL allocated a new slice when input was already CRLF")
+	}
+}
+
 func TestPanePendingBufferIsBounded(t *testing.T) {
 	t.Parallel()
 	// A hostile claude emitting bytes faster than capture-pane

@@ -225,23 +225,38 @@ func TestNarrowTerminalFallsBackToStackedLayout(t *testing.T) {
 	mustContain(t, out, "no sessions yet")
 }
 
-func TestCtrlBIsNoOpUntilM3c(t *testing.T) {
+func TestCtrlBTogglesFocusWhenSessionHighlighted(t *testing.T) {
 	t.Parallel()
-	// Ctrl+B is reserved for the focus toggle in M3c (VSCode-style
-	// move of focus from sidebar to right pane). Until then pressing
-	// it must be a no-op so a user who has already trained the
-	// binding doesn't see an unexpected action. If this test fails,
-	// check that the help-bar suffix for the binding has been
-	// updated in the same commit that enables the toggle.
+	// Ctrl+B is the single sm4c-reserved shortcut that works in
+	// both focus states: from sidebar it moves focus to the pane;
+	// from pane it moves focus back. A highlighted session is
+	// required for the sidebar->pane direction so we never leave
+	// the user "typing into nothing". The pane->sidebar direction
+	// is always available.
 	m := withSessions([]Session{{WindowID: "@1", Name: "a"}})
-	m.highlight = 0
-	before := m
-	after, cmd := applyKey(t, m, "ctrl+b")
-	if cmd != nil {
-		t.Fatalf("ctrl+b produced cmd %T, expected nil (placeholder)", cmd)
+	if m.focus != FocusSidebar {
+		t.Fatalf("precondition: focus = %v, want FocusSidebar", m.focus)
 	}
-	if !modelsEqual(before, after) {
-		t.Fatalf("ctrl+b mutated Model: before=%+v after=%+v", before, after)
+	m, _ = applyKey(t, m, "ctrl+b")
+	if m.focus != FocusPane {
+		t.Fatalf("after ctrl+b on sidebar w/ highlight, focus = %v, want FocusPane", m.focus)
+	}
+	m, _ = applyKey(t, m, "ctrl+b")
+	if m.focus != FocusSidebar {
+		t.Fatalf("after ctrl+b on pane, focus = %v, want FocusSidebar", m.focus)
+	}
+}
+
+func TestCtrlBOnEmptySidebarStaysOnSidebar(t *testing.T) {
+	t.Parallel()
+	// With no highlight there is no pane to drop keystrokes into,
+	// so ctrl+b must be a no-op. Otherwise the user would enter a
+	// focus state with no target and their next keystroke would
+	// silently vanish.
+	m := emptyModel()
+	m, _ = applyKey(t, m, "ctrl+b")
+	if m.focus != FocusSidebar {
+		t.Fatalf("ctrl+b on empty sidebar flipped focus to %v; want FocusSidebar", m.focus)
 	}
 }
 
@@ -328,28 +343,23 @@ func TestJKNavigatesWithinBounds(t *testing.T) {
 	}
 }
 
-func TestEnterIsDeliberateNoOp(t *testing.T) {
+func TestEnterOnHighlightedRowMovesFocusToPane(t *testing.T) {
 	t.Parallel()
-	// sm4c has no exec-into-tmux path by design. Enter on a
-	// highlighted row MUST NOT produce an action or a cmd — it is
-	// reserved for a future in-TUI focus shortcut. If this test
-	// starts failing, check whether a regression is rewiring Enter
-	// to an attach-style exit (which would undermine the single-
-	// surface design).
+	// Enter is the discoverable shortcut for "highlight a row, then
+	// drop into it". It must NEVER emit ActionNewSession or tea.Quit
+	// (which would undermine sm4c's "single surface" promise) — it
+	// only flips focus to the pane so subsequent keystrokes forward
+	// to claude.
 	m := withSessions([]Session{
 		{WindowID: "@1", Name: "one"},
 		{WindowID: "@2", Name: "two"},
 	})
-	before := m
-	after, cmd := applyKey(t, m, "enter")
+	after, _ := applyKey(t, m, "enter")
+	if after.focus != FocusPane {
+		t.Fatalf("Enter did not move focus: %v", after.focus)
+	}
 	if after.Action() != ActionNone {
 		t.Fatalf("Enter: Action = %v, want ActionNone", after.Action())
-	}
-	if cmd != nil {
-		t.Fatalf("Enter produced cmd %T, expected nil", cmd)
-	}
-	if !modelsEqual(before, after) {
-		t.Fatalf("Enter mutated Model: before=%+v after=%+v", before, after)
 	}
 }
 
@@ -475,7 +485,7 @@ func TestViewEmptyStateRendersSidebarChromeAndBindings(t *testing.T) {
 	mustContain(t, out, "sm4c")
 	mustContain(t, out, "no sessions yet")
 	mustContain(t, out, "press n")
-	for _, b := range bindings {
+	for _, b := range sidebarBindings {
 		mustContain(t, out, b.key)
 		mustContain(t, out, b.desc)
 	}
@@ -608,4 +618,31 @@ func modelsEqual(a, b Model) bool {
 		}
 	}
 	return true
+}
+
+// TestRightPaneBodyDims pins the layout math used by the CLI to
+// pre-size tmux windows before the TUI opens. The Model itself
+// relies on the same function (via rightPaneBodyDims), so any drift
+// here would immediately surface as distortion on first paint.
+func TestRightPaneBodyDims(t *testing.T) {
+	cases := []struct {
+		name         string
+		termW, termH int
+		wantW, wantH int
+	}{
+		{"too narrow returns zero", minSplitWidth - 1, 30, 0, 0},
+		{"zero height returns zero", 120, 0, 0, 0},
+		{"min split scales sidebar to min", minSplitWidth, 24, minSplitWidth - sidebarMin - 1 - 2, 22},
+		{"mid width scales to one-third", 120, 40, 120 - 40 - 1 - 2, 38},
+		{"ultrawide clamps to sidebar max", 300, 60, 300 - sidebarMax - 1 - 2, 58},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, h := RightPaneBodyDims(tc.termW, tc.termH)
+			if w != tc.wantW || h != tc.wantH {
+				t.Fatalf("RightPaneBodyDims(%d, %d) = (%d, %d); want (%d, %d)",
+					tc.termW, tc.termH, w, h, tc.wantW, tc.wantH)
+			}
+		})
+	}
 }

@@ -222,8 +222,14 @@ func TestIntegration_OneShot_CapturePane(t *testing.T) {
 
 // TestIntegration_OneShot_ResizeWindow covers the M3b.3 viewport-sync
 // write path: ResizeWindow must change the window's cell grid and
-// survive a round-trip without tmux bouncing it back — this is the
-// whole reason spawn.go pins `window-size manual`.
+// survive a round-trip without tmux bouncing it back.
+//
+// We deliberately do NOT set `window-size manual` here. sm4c's
+// production path runs against tmux's default `window-size latest`
+// (see ResizeWindow's docstring for the rationale), and this test
+// pins that the default is sufficient — a regression that only
+// manifests when `window-size manual` is set would not catch a
+// real user's bug.
 func TestIntegration_OneShot_ResizeWindow(t *testing.T) {
 	t.Parallel()
 
@@ -238,17 +244,10 @@ func TestIntegration_OneShot_ResizeWindow(t *testing.T) {
 		_ = exec.Command(tmux, "-L", socket, "kill-server").Run()
 	})
 
-	// We create the window via NewClaudeWindow-ish machinery (a
-	// plain new-session plus a set-option for window-size manual
-	// so the session behaves the way sm4c's production path does).
 	if err := exec.Command(tmux, "-L", socket,
 		"new-session", "-d", "-s", session, "-n", "w1",
 		"sh", "-c", "sleep 3600").Run(); err != nil {
 		t.Fatalf("new-session: %v", err)
-	}
-	if err := exec.Command(tmux, "-L", socket,
-		"set-option", "-g", "window-size", "manual").Run(); err != nil {
-		t.Fatalf("set-option window-size manual: %v", err)
 	}
 
 	o := OneShot{TmuxBin: tmux, SocketName: socket, SessionName: session}
@@ -289,5 +288,191 @@ func TestIntegration_OneShot_ResizeWindow(t *testing.T) {
 	// Non-positive dims are rejected before tmux sees them.
 	if err := o.ResizeWindow(ctx, windowID, 0, 10); err == nil {
 		t.Fatal("ResizeWindow accepted zero width; want rejection")
+	}
+}
+
+// TestIntegration_OneShot_SendKeys covers the M3c input-routing write
+// path: SendKeys must push the given bytes through `send-keys -H` so
+// that the target pane's running program sees them as keystrokes.
+// We use `cat` (reads stdin, echoes to stdout) as a benign stand-in
+// for claude, and verify the echoed sentinel lands in the pane's
+// capture — a full loop from argv into tmux, into the pane's tty,
+// into the program, and back onto the screen buffer.
+func TestIntegration_OneShot_SendKeys(t *testing.T) {
+	t.Parallel()
+
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skipf("tmux not on PATH: %v", err)
+	}
+
+	socket := "sm4c-test-" + randSuffix(t)
+	session := "sm4ctest-" + randSuffix(t)
+	t.Cleanup(func() {
+		_ = exec.Command(tmux, "-L", socket, "kill-server").Run()
+	})
+
+	// `cat` will block waiting for stdin; every byte we send-keys
+	// into the pane becomes a character cat reads and echoes back
+	// to its stdout, which tmux captures into the pane buffer.
+	if err := exec.Command(tmux, "-L", socket,
+		"new-session", "-d", "-s", session, "-n", "w1",
+		"sh", "-c", "cat").Run(); err != nil {
+		t.Fatalf("new-session: %v", err)
+	}
+
+	o := OneShot{TmuxBin: tmux, SocketName: socket, SessionName: session}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wins, err := o.ListWindows(ctx)
+	if err != nil || len(wins) != 1 {
+		t.Fatalf("ListWindows: wins=%v err=%v", wins, err)
+	}
+	paneID, err := o.ActivePane(ctx, wins[0].ID)
+	if err != nil {
+		t.Fatalf("ActivePane: %v", err)
+	}
+
+	// Send a sentinel plus Enter (0x0a — `cat` finishes its line
+	// buffer on LF so the echo lands on screen). We use 0x0a
+	// rather than 0x0d here because the pane's tty is in cooked
+	// mode: terminal line discipline translates CR to LF on
+	// input, but writing LF directly skips the translation and
+	// still produces a newline on output.
+	payload := []byte("SM4C_KEYS_SENTINEL\n")
+	if err := o.SendKeys(ctx, paneID, payload); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+
+	// Poll capture-pane until the echoed sentinel appears.
+	var captured []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		captured, err = o.CapturePane(ctx, paneID)
+		if err != nil {
+			t.Fatalf("CapturePane: %v", err)
+		}
+		if strings.Contains(string(captured), "SM4C_KEYS_SENTINEL") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(string(captured), "SM4C_KEYS_SENTINEL") {
+		t.Fatalf("SendKeys echo missing; pane capture: %q", captured)
+	}
+
+	// Missing pane → ErrNoSuchPane (not a generic error). The TUI
+	// treats this as "session closed between keypress and
+	// forward" and reverts focus.
+	if err := o.SendKeys(ctx, "%9999", []byte{0x61}); !errors.Is(err, ErrNoSuchPane) {
+		t.Fatalf("SendKeys on missing pane err = %v; want ErrNoSuchPane", err)
+	}
+
+	// Malformed pane ID is rejected before reaching tmux.
+	if err := o.SendKeys(ctx, "not-a-pane", []byte{0x61}); err == nil {
+		t.Fatal("SendKeys accepted malformed pane id; want rejection")
+	}
+
+	// Empty payload is a no-op (and must NOT error).
+	if err := o.SendKeys(ctx, paneID, nil); err != nil {
+		t.Errorf("SendKeys(nil) = %v; want nil", err)
+	}
+	if err := o.SendKeys(ctx, paneID, []byte{}); err != nil {
+		t.Errorf("SendKeys([]byte{}) = %v; want nil", err)
+	}
+
+	// Oversized payload is rejected before it reaches argv, so a
+	// runaway caller can't blow past execve's limit.
+	big := make([]byte, maxSendKeysBytes+1)
+	if err := o.SendKeys(ctx, paneID, big); err == nil {
+		t.Fatal("SendKeys accepted oversized payload; want rejection")
+	}
+}
+
+// TestIntegration_OneShot_KillWindow exercises the close-session seam
+// the TUI wires into the `x` binding: kill a live window, confirm it
+// vanishes from ListWindows, and confirm the "already gone" and
+// server-absent paths fold into the ErrNoSuchWindow sentinel (which
+// the CLI translates to a clean TUI refresh rather than a surfaced
+// error).
+func TestIntegration_OneShot_KillWindow(t *testing.T) {
+	t.Parallel()
+
+	tmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Skipf("tmux not on PATH: %v", err)
+	}
+
+	socket := "sm4c-test-" + randSuffix(t)
+	session := "sm4ctest-" + randSuffix(t)
+	t.Cleanup(func() {
+		_ = exec.Command(tmux, "-L", socket, "kill-server").Run()
+	})
+
+	// Start session with two windows so killing one leaves the
+	// server alive — the realistic shape when a user closes one
+	// of several sm4c sessions from the sidebar.
+	if err := exec.Command(tmux, "-L", socket,
+		"new-session", "-d", "-s", session, "-n", "w1",
+		"sh", "-c", "sleep 3600").Run(); err != nil {
+		t.Fatalf("new-session: %v", err)
+	}
+	if err := exec.Command(tmux, "-L", socket,
+		"new-window", "-t", session+":", "-n", "w2",
+		"sh", "-c", "sleep 3600").Run(); err != nil {
+		t.Fatalf("new-window: %v", err)
+	}
+
+	o := OneShot{TmuxBin: tmux, SocketName: socket, SessionName: session}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	wins, err := o.ListWindows(ctx)
+	if err != nil {
+		t.Fatalf("ListWindows: %v", err)
+	}
+	if len(wins) != 2 {
+		t.Fatalf("ListWindows before kill = %d; want 2", len(wins))
+	}
+
+	target := wins[0].ID
+	if err := o.KillWindow(ctx, target); err != nil {
+		t.Fatalf("KillWindow(%s): %v", target, err)
+	}
+
+	wins, err = o.ListWindows(ctx)
+	if err != nil {
+		t.Fatalf("ListWindows after kill: %v", err)
+	}
+	if len(wins) != 1 {
+		t.Fatalf("ListWindows after kill = %d; want 1", len(wins))
+	}
+	if wins[0].ID == target {
+		t.Errorf("killed window %s still present: %+v", target, wins[0])
+	}
+
+	// Second kill of the same ID: tmux reports "can't find window",
+	// OneShot folds that into ErrNoSuchWindow so the TUI treats it
+	// as a no-op success.
+	if err := o.KillWindow(ctx, target); !errors.Is(err, ErrNoSuchWindow) {
+		t.Errorf("KillWindow(gone) err = %v; want ErrNoSuchWindow", err)
+	}
+
+	// Malformed ID is rejected before tmux sees it.
+	if err := o.KillWindow(ctx, "not-a-window"); err == nil {
+		t.Error("KillWindow accepted malformed id; want rejection")
+	}
+
+	// Kill the remaining window to drop the server, then confirm
+	// the server-absent path also surfaces as ErrNoSuchWindow —
+	// the close-session UX depends on this conflation so a user
+	// closing their last sm4c session doesn't see a spurious
+	// error line.
+	if err := o.KillWindow(ctx, wins[0].ID); err != nil {
+		t.Fatalf("KillWindow(last): %v", err)
+	}
+	if err := o.KillWindow(ctx, "@999"); !errors.Is(err, ErrNoSuchWindow) {
+		t.Errorf("KillWindow(no server) err = %v; want ErrNoSuchWindow", err)
 	}
 }

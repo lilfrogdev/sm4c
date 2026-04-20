@@ -231,3 +231,53 @@ func TestIntToDecimal(t *testing.T) {
 		}
 	}
 }
+
+func TestHexByte(t *testing.T) {
+	t.Parallel()
+
+	// Every byte that SendKeys might forward (the entire 0x00..0xff
+	// range, in practice) must round-trip through hexByte as the
+	// lowercase two-digit form tmux's `send-keys -H` expects. A bug
+	// here — off-by-one nibble, uppercase digit, missing leading
+	// zero — would silently corrupt input routing: tmux accepts
+	// many malformed tokens but re-interprets them, and the user
+	// would see phantom keystrokes arrive in the pane.
+	cases := []struct {
+		in   byte
+		want string
+	}{
+		{0x00, "00"},
+		{0x01, "01"},
+		{0x03, "03"}, // Ctrl+C
+		{0x09, "09"}, // Tab
+		{0x0a, "0a"},
+		{0x0d, "0d"}, // Enter
+		{0x1b, "1b"}, // Escape
+		{0x20, "20"}, // Space
+		{0x61, "61"}, // 'a'
+		{0x7f, "7f"}, // Backspace/DEL
+		{0x80, "80"},
+		{0xff, "ff"},
+	}
+	for _, c := range cases {
+		if got := hexByte(c.in); got != c.want {
+			t.Errorf("hexByte(%#02x) = %q; want %q", c.in, got, c.want)
+		}
+	}
+
+	// Exhaustive pin: every byte in 0..255 must produce exactly two
+	// hex characters drawn from [0-9a-f]. This guards against any
+	// future edit introducing a branch for "printable ASCII pass
+	// through as-is" or similar clever-but-wrong optimization.
+	for i := 0; i < 256; i++ {
+		got := hexByte(byte(i))
+		if len(got) != 2 {
+			t.Fatalf("hexByte(%#02x) = %q; want 2 chars", i, got)
+		}
+		for _, r := range got {
+			if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+				t.Fatalf("hexByte(%#02x) = %q; non-hex char %q", i, got, r)
+			}
+		}
+	}
+}

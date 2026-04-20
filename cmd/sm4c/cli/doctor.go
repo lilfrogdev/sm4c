@@ -35,6 +35,7 @@ outside of transient os.Stat calls and a `+"`tmux -V`"+` probe.`,
 			cmd.Printf("  socket_name    : %s\n", cfg.SocketName)
 			cmd.Printf("  prefix_key     : %s\n", cfg.PrefixKey)
 			cmd.Printf("  monitor_silence: %s\n", cfg.MonitorSilence)
+			cmd.Printf("  session_poll   : %s\n", cfg.SessionPollInterval)
 			cmd.Printf("  log_level      : %s\n", cfg.LogLevel)
 			cmd.Printf("  tmux_bin       : %s\n", orDefault(cfg.TmuxBin, "<resolve via PATH>"))
 			cmd.Printf("  claude_bin     : %s\n", orDefault(cfg.ClaudeBin, "<resolve via PATH>"))

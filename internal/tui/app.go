@@ -1,11 +1,42 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+)
+
+// Focus describes which column of the TUI owns keystrokes. M3c
+// introduced the two-state model: by default the sidebar is
+// focused and every keystroke is interpreted as a sm4c navigation
+// shortcut; once the user presses ctrl+b (or Enter on a highlighted
+// row) the pane takes focus and keystrokes are forwarded to the
+// tmux pane of the highlighted session via send-keys. Ctrl+b
+// toggles back.
+//
+// Kept as an int (not a string enum) so zero is a valid value
+// (FocusSidebar), which is what every unit-test fixture relies
+// on for its zero-Deps Model to boot into the expected state.
+type Focus int
+
+const (
+	// FocusSidebar routes every keystroke through sm4c's own
+	// binding table (j/k navigation, n for new session, q/ctrl+c
+	// to quit, etc.). This is the default on bare `sm4c` so the
+	// user can browse sessions before committing to one.
+	FocusSidebar Focus = iota
+
+	// FocusPane forwards every keystroke (except ctrl+b, which
+	// toggles focus back) to the highlighted session's active
+	// tmux pane via the KeySender seam. In this mode ctrl+c is
+	// forwarded to claude (interrupting whatever it is doing)
+	// rather than quitting sm4c, matching every other terminal
+	// multiplexer's convention: to quit the outer shell, first
+	// leave the inner program.
+	FocusPane
 )
 
 // Action is the intent the TUI reports back to its caller after the
@@ -49,28 +80,39 @@ const (
 // rely on to stay minimal.
 //
 //   - Lister            SessionLister that drives the sidebar.
-//                       Nil keeps the empty-state view and skips
-//                       all polling.
+//     Nil keeps the empty-state view and skips
+//     all polling.
 //   - PollInterval      cadence for Lister. Zero / negative means
-//                       "fetch once at Init and never again".
-//                       Ignored when Lister is nil.
+//     "fetch once at Init and never again".
+//     Ignored when Lister is nil.
 //   - PaneStream        factory returning a PaneEvent channel. Nil
-//                       disables live %output; the right pane shows
-//                       a static "preview unavailable" line.
+//     disables live %output; the right pane shows
+//     a static "preview unavailable" line.
 //   - PaneResolver      async mapper windowID -> paneID. Nil
-//                       disables pane resolution; without a pane
-//                       ID, the stream's events are never tied to
-//                       a highlighted session.
+//     disables pane resolution; without a pane
+//     ID, the stream's events are never tied to
+//     a highlighted session.
 //   - PaneCapturer      async mapper paneID -> initial screen.
-//                       Nil disables M3b.3 backfill; the emulator
-//                       still boots on the first live chunk.
+//     Nil disables M3b.3 backfill; the emulator
+//     still boots on the first live chunk.
 //   - WindowResizer     async tmux `resize-window` seam. Nil
-//                       disables M3b.3 viewport sync; wrapping will
-//                       drift after a terminal resize until the
-//                       user switches sessions.
+//     disables M3b.3 viewport sync; wrapping will
+//     drift after a terminal resize until the
+//     user switches sessions.
 //   - InitialHighlight  tmux window ID to snap to on the first
-//                       sessionsMsg containing it. Empty defaults
-//                       to row 0 behavior.
+//     sessionsMsg containing it. Empty defaults
+//     to row 0 behavior.
+//   - KeySender         async tmux `send-keys -H` seam. Nil
+//     disables input routing (pane focus becomes
+//     a read-only spectator view); the TUI keeps
+//     the focus toggle so the UX is testable
+//     without a live tmux.
+//   - InitialFocus      focus state on entry. Zero value is
+//     FocusSidebar so existing tests remain
+//     unchanged; the launch path (sm4c [args])
+//     and the "n" re-entry loop set FocusPane
+//     so the newly-spawned session is
+//     immediately typable.
 type Deps struct {
 	Lister           SessionLister
 	PollInterval     time.Duration
@@ -78,7 +120,10 @@ type Deps struct {
 	PaneResolver     ActivePaneResolver
 	PaneCapturer     PaneCapturer
 	WindowResizer    WindowResizer
+	WindowCloser     WindowCloser
+	KeySender        KeySender
 	InitialHighlight string
+	InitialFocus     Focus
 }
 
 // Model is the Bubble Tea model backing the sidebar view. Its
@@ -90,46 +135,46 @@ type Deps struct {
 //
 //   - help              toggled by `?`; shows the full keybind list.
 //   - quitting          set when the user pressed a quit key; causes
-//                       Update to return tea.Quit on the NEXT step.
-//                       Separating "set intent" from "tell bubbletea
-//                       to quit" in two Update returns is what makes
-//                       the unit tests able to observe ActionNone
-//                       even without running the runtime.
+//     Update to return tea.Quit on the NEXT step.
+//     Separating "set intent" from "tell bubbletea
+//     to quit" in two Update returns is what makes
+//     the unit tests able to observe ActionNone
+//     even without running the runtime.
 //   - action            the intent the caller should realize once
-//                       tea.Quit flushes the runtime. Exposed via
-//                       Model.Action().
+//     tea.Quit flushes the runtime. Exposed via
+//     Model.Action().
 //   - lister            injected SessionLister. Nil means "no live
-//                       data": the Model renders the empty state,
-//                       Init returns no startup cmd, and the poll
-//                       loop is inert. This is how unit tests that
-//                       care only about key handling keep their
-//                       fixtures minimal.
+//     data": the Model renders the empty state,
+//     Init returns no startup cmd, and the poll
+//     loop is inert. This is how unit tests that
+//     care only about key handling keep their
+//     fixtures minimal.
 //   - pollInterval      how often to re-fetch via lister. Honored
-//                       only when lister is non-nil and the value
-//                       is positive.
+//     only when lister is non-nil and the value
+//     is positive.
 //   - sessions          last snapshot returned by lister. Treated as
-//                       authoritative for rendering; Model does not
-//                       mutate it between fetches.
+//     authoritative for rendering; Model does not
+//     mutate it between fetches.
 //   - highlight         zero-based index into sessions that the user
-//                       is currently cursoring over. Clamped by the
-//                       sessionsMsg handler so it always references
-//                       a valid row (or is -1 when sessions is empty).
+//     is currently cursoring over. Clamped by the
+//     sessionsMsg handler so it always references
+//     a valid row (or is -1 when sessions is empty).
 //   - ready             true once the first sessionsMsg has been
-//                       processed. Before that, the view short-
-//                       circuits to the empty state so a slow first
-//                       fetch doesn't paint a stale "N sessions"
-//                       line.
+//     processed. Before that, the view short-
+//     circuits to the empty state so a slow first
+//     fetch doesn't paint a stale "N sessions"
+//     line.
 //   - listErr           last fetch error, if any. Surfaced as a
-//                       faint single-line notice in the sidebar.
-//                       Does not block rendering of stale sessions.
+//     faint single-line notice in the sidebar.
+//     Does not block rendering of stale sessions.
 //   - initialHighlight  optional tmux window ID the Model should
-//                       snap the highlight to as soon as the first
-//                       sessionsMsg contains a matching row. Used
-//                       by the launch path so `sm4c [claude-args]`
-//                       opens the TUI with the freshly-spawned
-//                       session pre-selected. Cleared once applied
-//                       so later navigation isn't overridden on the
-//                       next poll.
+//     snap the highlight to as soon as the first
+//     sessionsMsg contains a matching row. Used
+//     by the launch path so `sm4c [claude-args]`
+//     opens the TUI with the freshly-spawned
+//     session pre-selected. Cleared once applied
+//     so later navigation isn't overridden on the
+//     next poll.
 type Model struct {
 	help     bool
 	quitting bool
@@ -174,6 +219,26 @@ type Model struct {
 	// Nil disables the sync (wrapping may drift, but the TUI
 	// still renders correctly).
 	windowResizer WindowResizer
+
+	// windowCloser is the close-session seam. When non-nil, the
+	// `x` binding in sidebar focus asks for confirmation and, on
+	// `y`, calls through to terminate the highlighted session's
+	// tmux window. Nil disables the binding (tests and degraded
+	// environments where we cannot mutate the socket). See the
+	// pendingCloseWindow field for the confirmation state.
+	windowCloser WindowCloser
+
+	// pendingCloseWindow is the tmux window ID the user has armed
+	// for close via `x` but not yet confirmed. While non-empty:
+	//   - the sidebar renders a "close test-sesh? y/n" hint
+	//     instead of the normal key bar, so the intent is visible;
+	//   - the next sidebar-focus keystroke disambiguates:
+	//       * `y` / `Y`    -> dispatch closeManagedWindow
+	//       * anything else -> cancel (clear the field; no close)
+	// Cleared when the corresponding windowClosedMsg comes back,
+	// when the user cancels, or when a sessionsMsg reveals the
+	// target window is already gone (stale confirmation).
+	pendingCloseWindow string
 
 	// paneStreamClosed records that the upstream channel has been
 	// closed (the tmuxctl.Client terminated). Once set, the right
@@ -243,6 +308,56 @@ type Model struct {
 	// stream of tea.WindowSizeMsg events does not spam tmux with
 	// duplicate resize-window commands.
 	sizedFor map[string][2]int
+
+	// focus is the M3c focus state. FocusSidebar (zero value)
+	// means keystrokes hit sm4c's own binding table; FocusPane
+	// means they are forwarded to the highlighted session's
+	// active pane via keySender. See the Focus docstring for
+	// the full semantics.
+	focus Focus
+
+	// pendingFocus records a FocusPane request that could not be
+	// honored yet because no session was available at startup
+	// (e.g. `sm4c [args]` dropped us into the TUI before the
+	// first sessionsMsg arrived). The next sessionsMsg that
+	// produces a valid highlight consumes the request.
+	pendingFocus bool
+
+	// keySender is the M3c input-routing seam. When non-nil and
+	// focus == FocusPane, each tea.KeyMsg (except ctrl+b) is
+	// translated by keyMsgToBytes and forwarded via this sender
+	// to the active pane of the highlighted session. Nil makes
+	// pane focus a spectator mode (the toggle still works so the
+	// UX is testable without a live tmux server).
+	keySender KeySender
+
+	// skipCaptureWindow is the tmux window ID for which the first
+	// pane resolution should skip the capture-pane backfill round-
+	// trip. It is set from Deps.InitialHighlight and consumed
+	// (cleared) the first time handlePaneResolved sees a matching
+	// windowID.
+	//
+	// Why this exists: the `n`/spawn re-entry loop in cmd/sm4c/cli
+	// re-opens the TUI pointed at a freshly-created claude window.
+	// Claude is still booting at that moment — its initial draw is
+	// not yet complete, and tmux's grid holds a transient mix of
+	// "default 80x24 content" and "post-SIGWINCH half-redraw". A
+	// capture-pane call in that window lands a half-baked snapshot
+	// into the VT emulator; claude's subsequent live %output bytes
+	// paint over some cells but not others (most TUI frameworks
+	// emit cursor-positioned writes, not CSI 2J clears, on a
+	// steady-state redraw), so the captured ghosts linger until
+	// the user nudges the terminal (which triggers a clean full
+	// redraw).
+	//
+	// Existing sessions the user navigates to mid-TUI-session are
+	// unaffected: they are not marked here, so capture runs as a
+	// normal backfill. Only the spawn-entry window opts out, and
+	// only for its very first pane resolution. The live stream
+	// fills the emulator from a clean slate within ~1 claude
+	// frame, which is indistinguishable from the captured path
+	// for a settled session but correct for a still-booting one.
+	skipCaptureWindow string
 }
 
 // paneBackfillBuffer bounds panePending per pane. 64 KiB is
@@ -271,22 +386,27 @@ func NewModel(deps Deps) Model {
 		pollInterval = 0
 	}
 	m := Model{
-		lister:           deps.Lister,
-		pollInterval:     pollInterval,
-		highlight:        -1,
-		initialHighlight: deps.InitialHighlight,
-		paneResolver:     deps.PaneResolver,
-		paneCapturer:     deps.PaneCapturer,
-		windowResizer:    deps.WindowResizer,
-		paneByWindow:     make(map[string]string),
-		paneErrByWindow:  make(map[string]error),
-		paneTerminals:    make(map[string]*paneTerminal),
-		paneCapturing:    make(map[string]bool),
-		paneCaptured:     make(map[string]bool),
-		panePending:      make(map[string][]byte),
-		sizedFor:         make(map[string][2]int),
-		paneViewW:        defaultPaneWidth,
-		paneViewH:        defaultPaneHeight,
+		lister:            deps.Lister,
+		pollInterval:      pollInterval,
+		highlight:         -1,
+		initialHighlight:  deps.InitialHighlight,
+		skipCaptureWindow: deps.InitialHighlight,
+		paneResolver:      deps.PaneResolver,
+		paneCapturer:      deps.PaneCapturer,
+		windowResizer:     deps.WindowResizer,
+		windowCloser:      deps.WindowCloser,
+		keySender:         deps.KeySender,
+		paneByWindow:      make(map[string]string),
+		paneErrByWindow:   make(map[string]error),
+		paneTerminals:     make(map[string]*paneTerminal),
+		paneCapturing:     make(map[string]bool),
+		paneCaptured:      make(map[string]bool),
+		panePending:       make(map[string][]byte),
+		sizedFor:          make(map[string][2]int),
+		paneViewW:         defaultPaneWidth,
+		paneViewH:         defaultPaneHeight,
+		focus:             FocusSidebar,
+		pendingFocus:      deps.InitialFocus == FocusPane,
 	}
 	if deps.PaneStream != nil {
 		m.paneEvents = deps.PaneStream()
@@ -337,6 +457,7 @@ func (m Model) Init() tea.Cmd {
 // switch — each should remain side-effect free and return its work
 // as a tea.Cmd.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	debugf("Update msg=%T", msg)
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		// Stash the terminal dimensions so the view can size the
@@ -400,6 +521,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// flaky tmux state to be useful.
 		_ = msg
 		return m, nil
+	case keysSentMsg:
+		return m.handleKeysSent(msg), nil
+	case windowClosedMsg:
+		return m.handleWindowClosed(msg)
 	}
 	return m, nil
 }
@@ -418,6 +543,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // within this tick, and the next stream event would simply re-
 // populate them.
 func (m Model) handleSessions(msg sessionsMsg) Model {
+	debugf("sessions count=%d err=%v", len(msg.sessions), msg.err)
 	m.ready = true
 	m.listErr = msg.err
 	m.sessions = msg.sessions
@@ -444,6 +570,20 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 	case m.highlight >= len(m.sessions):
 		m.highlight = len(m.sessions) - 1
 	}
+	// Focus invariants: FocusPane only makes sense while a session
+	// is highlighted. If polling dropped every session (the user
+	// closed the last one externally), revert to the sidebar so
+	// the user can press `n` or `q` without a confusing "typing
+	// into nothing" state. If startup requested FocusPane via
+	// InitialFocus, consume the request once a valid highlight
+	// is available.
+	if m.focus == FocusPane && (m.highlight < 0 || m.highlight >= len(m.sessions)) {
+		m.focus = FocusSidebar
+	}
+	if m.pendingFocus && m.highlight >= 0 && m.highlight < len(m.sessions) {
+		m.focus = FocusPane
+		m.pendingFocus = false
+	}
 	// Prune per-window caches. We build a small set of still-live
 	// window IDs rather than iterating sessions inside the loop,
 	// because sessions can grow into the low hundreds once users
@@ -451,6 +591,14 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 	alive := make(map[string]struct{}, len(m.sessions))
 	for _, s := range m.sessions {
 		alive[s.WindowID] = struct{}{}
+	}
+	// A stale pending close (target window vanished externally
+	// between `x` and the next poll) is cleared so the y/n
+	// prompt cannot land on a session that no longer exists.
+	if m.pendingCloseWindow != "" {
+		if _, ok := alive[m.pendingCloseWindow]; !ok {
+			m.pendingCloseWindow = ""
+		}
 	}
 	for wid := range m.paneByWindow {
 		if _, ok := alive[wid]; !ok {
@@ -485,6 +633,7 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 // The handlePaneCapture handler flushes the buffer once the
 // capture arrives.
 func (m Model) handlePaneData(msg paneDataMsg) Model {
+	debugf("paneData pane=%s bytes=%d", msg.paneID, len(msg.data))
 	if msg.paneID == "" {
 		return m
 	}
@@ -541,6 +690,7 @@ func (m *Model) appendPending(paneID string, data []byte) {
 // because a capture failure on one pane should not blank out
 // the preview for other panes.
 func (m Model) handlePaneCapture(msg paneCaptureMsg) Model {
+	debugf("paneCapture pane=%s bytes=%d err=%v", msg.paneID, len(msg.data), msg.err)
 	paneID := msg.paneID
 	if paneID == "" {
 		return m
@@ -554,7 +704,7 @@ func (m Model) handlePaneCapture(msg paneCaptureMsg) Model {
 			term = newPaneTerminal(m.paneViewW, m.paneViewH)
 			m.paneTerminals[paneID] = term
 		}
-		term.write(msg.data)
+		term.write(normalizeCaptureEOL(msg.data))
 	}
 	if pending, ok := m.panePending[paneID]; ok && len(pending) > 0 {
 		term, ok2 := m.paneTerminals[paneID]
@@ -597,25 +747,7 @@ func (m *Model) syncPaneViewport() {
 // padding lipgloss applies inside rightPaneStyle and for the header
 // + blank separator line renderRightPane prepends.
 func (m Model) rightPaneBodyDims() (int, int) {
-	if m.width < minSplitWidth || m.height < 1 {
-		return 0, 0
-	}
-	sidebarW := m.sidebarWidth()
-	rightW := m.width - sidebarW - 1
-	if rightW < 1 {
-		return 0, 0
-	}
-	// rightPaneStyle has Padding(0, 1) — 1 col on each side.
-	bodyW := rightW - 2
-	if bodyW < 1 {
-		return 0, 0
-	}
-	// Header + blank separator = 2 lines consumed before body.
-	bodyH := m.height - 2
-	if bodyH < 1 {
-		return 0, 0
-	}
-	return bodyW, bodyH
+	return RightPaneBodyDims(m.width, m.height)
 }
 
 // handlePaneResolved records the (windowID, paneID) mapping the
@@ -631,6 +763,7 @@ func (m Model) rightPaneBodyDims() (int, int) {
 // live chunk. This is the M3b.3 "switching to a session shows its
 // current state immediately" user-facing promise.
 func (m Model) handlePaneResolved(msg paneResolvedMsg) (Model, tea.Cmd) {
+	debugf("paneResolved window=%s pane=%s err=%v", msg.windowID, msg.paneID, msg.err)
 	if msg.windowID == "" {
 		return m, nil
 	}
@@ -648,6 +781,18 @@ func (m Model) handlePaneResolved(msg paneResolvedMsg) (Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.paneCaptured[msg.paneID] || m.paneCapturing[msg.paneID] {
+		return m, nil
+	}
+	// Freshly-spawned-session opt-out: the CLI passed the new
+	// window's ID through Deps.InitialHighlight. Suppress the
+	// capture-pane for that window on its very first resolve so
+	// the emulator stays empty until claude's live %output
+	// paints it from scratch. See skipCaptureWindow's docstring
+	// for the full rationale (tl;dr: captured bytes from a
+	// still-booting claude ghost-layer under the live redraw).
+	if m.skipCaptureWindow != "" && msg.windowID == m.skipCaptureWindow {
+		m.skipCaptureWindow = ""
+		m.paneCaptured[msg.paneID] = true
 		return m, nil
 	}
 	m.paneCapturing[msg.paneID] = true
@@ -711,15 +856,57 @@ func (m *Model) resolveHighlightedPaneIfNeeded() tea.Cmd {
 	return m.resolveActivePane(wid)
 }
 
-// handleKey is factored out of Update so the unit tests can exercise
-// it with a plain tea.KeyMsg and without constructing message-
-// switch scaffolding around it. Every branch either transitions
-// state, records an Action, or schedules tea.Quit — nothing else.
+// handleKey dispatches a key press based on the current focus.
+// Sidebar focus runs sm4c's own binding table (navigation, new
+// session, help, quit); pane focus forwards every keystroke to
+// the highlighted session's active pane via the KeySender seam,
+// except for ctrl+b which is the single sm4c-reserved shortcut
+// in pane focus (toggles focus back to the sidebar). Factored
+// out of Update so the unit tests can exercise it with a plain
+// tea.KeyMsg and no message-switch scaffolding.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.focus == FocusPane {
+		return m.handleKeyInPaneFocus(msg)
+	}
+	return m.handleKeyInSidebarFocus(msg)
+}
+
+// handleKeyInSidebarFocus implements the sm4c binding table: j/k
+// navigation, n for new session, ? for help, q / ctrl+c to quit,
+// ctrl+b (and enter on a highlighted row) to move focus to the
+// pane. This is the only path that can emit ActionNewSession or
+// tea.Quit — pane focus never triggers a TUI-level lifecycle
+// event because every keystroke there belongs to claude.
+func (m Model) handleKeyInSidebarFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Close-session confirmation state takes precedence over every
+	// other binding: once `x` has armed a close, the user's next
+	// keystroke is either the y/Y confirmation or an implicit
+	// cancel. This is deliberately NOT a modal sub-view — it is a
+	// single-keystroke handoff that keeps the rest of the sidebar
+	// visible, so the user never loses context on what they are
+	// about to close.
+	if m.pendingCloseWindow != "" {
+		target := m.pendingCloseWindow
+		m.pendingCloseWindow = ""
+		switch msg.String() {
+		case "y", "Y":
+			return m, m.closeManagedWindow(target)
+		}
+		// Any other key cancels. We intentionally swallow the key
+		// rather than re-process it (e.g. `n` after a cancel does
+		// NOT create a new session) to avoid a chain where a
+		// mis-type produces an unrelated side effect.
+		return m, nil
+	}
 	switch msg.String() {
 	case "ctrl+c", "q":
 		// Quit with no follow-up action. The caller will see
-		// ActionNone and simply return.
+		// ActionNone and simply return. Note: live claude
+		// sessions are deliberately LEFT RUNNING on the sm4c
+		// tmux socket — quit is non-destructive, a re-launched
+		// `sm4c` rejoins the same server and finds the sessions
+		// intact. Users who want to close a session do so from
+		// within claude (/exit).
 		m.action = ActionNone
 		m.quitting = true
 		return m, tea.Quit
@@ -729,8 +916,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// runtime so the CLI layer can do the tmux round-trip
 		// without holding the raw-mode terminal. The CLI then re-
 		// enters the TUI with the new window ID as initial
-		// highlight — from the user's perspective the sidebar
-		// briefly blinks and redraws with the new row pre-selected.
+		// highlight and FocusPane so the user can type
+		// immediately into the freshly-spawned session.
 		//
 		// TODO (M3e): replace this one-shot exit with an in-TUI
 		// compose sub-view (cwd picker + optional session name +
@@ -742,16 +929,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quitting = true
 		return m, tea.Quit
 
-	case "enter":
-		// Reserved for M3c input routing (focus the right pane so
-		// keystrokes flow into claude). Today it is a deliberate
-		// no-op — there is no exec-into-tmux shortcut in sm4c by
-		// design: the whole TUI's premise is that you never leave
-		// it to reach a session. Consuming the key here means
-		// Bubble Tea's default Enter handling (which just submits
-		// the current input line) never fires either, keeping the
-		// sidebar completely quiet while you navigate.
-		return m, nil
+	case "enter", "ctrl+b":
+		// Both keys move focus to the pane. Enter is a discoverable
+		// shortcut ("highlight then press Enter to drop in"); ctrl+b
+		// is the VSCode-style toggle that pairs with its same-name
+		// binding in the pane focus branch. We gate on "there is a
+		// highlightable session": pressing either on an empty
+		// sidebar is a no-op so we never leave the user typing
+		// into nothing.
+		if m.highlight < 0 || m.highlight >= len(m.sessions) {
+			return m, nil
+		}
+		m.focus = FocusPane
+		return m, tea.Batch(
+			m.resolveHighlightedPaneIfNeeded(),
+			m.resizeHighlightedWindow(),
+		)
 
 	case "j", "down":
 		// Move highlight down, no wrap. A no-wrap bottom is the
@@ -774,13 +967,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.resizeHighlightedWindow(),
 		)
 
-	case "ctrl+b":
-		// Placeholder for M3c's focus toggle (VSCode-style: move
-		// focus between sidebar and the right pane so keystrokes
-		// flow into claude). The binding is reserved now so the
-		// muscle memory carries over once input routing lands.
-		// Until then this is a deliberate no-op; when M3c enables
-		// it, drop the "(coming in M3c)" suffix from bindings[].
+	case "x":
+		// Arm a close on the currently-highlighted session. We
+		// gate on "closer wired AND a real highlightable row";
+		// either missing piece makes this a no-op. The actual
+		// kill-window call does not fire yet — it runs after the
+		// next keystroke confirms via `y`.
+		if m.windowCloser == nil {
+			return m, nil
+		}
+		if m.highlight < 0 || m.highlight >= len(m.sessions) {
+			return m, nil
+		}
+		wid := m.sessions[m.highlight].WindowID
+		if wid == "" {
+			return m, nil
+		}
+		m.pendingCloseWindow = wid
 		return m, nil
 
 	case "?":
@@ -791,6 +994,115 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
+
+// handleKeyInPaneFocus forwards the keystroke to the highlighted
+// session's active pane. ctrl+b is the single sm4c-reserved
+// shortcut here; everything else — including ctrl+c — is routed
+// to claude via send-keys. That matches the convention of every
+// terminal multiplexer and gives the user the intuitive escape
+// sequence: "press ctrl+b to leave claude's input, then q to
+// quit sm4c".
+//
+// The keystroke is dropped without error in a handful of
+// recoverable cases: no session highlighted, no pane resolved
+// yet, no sender wired, or keyMsgToBytes could not translate the
+// keypress (e.g. a bubbletea-specific meta key we have not
+// mapped). A dropped keystroke is always preferable to sending
+// the wrong bytes to claude.
+func (m Model) handleKeyInPaneFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "ctrl+b" {
+		m.focus = FocusSidebar
+		return m, nil
+	}
+	if m.highlight < 0 || m.highlight >= len(m.sessions) {
+		return m, nil
+	}
+	paneID, ok := m.paneByWindow[m.sessions[m.highlight].WindowID]
+	if !ok || paneID == "" {
+		return m, nil
+	}
+	data := keyMsgToBytes(msg)
+	if len(data) == 0 {
+		return m, nil
+	}
+	return m, m.sendKeysToPane(paneID, data)
+}
+
+// handleKeysSent reacts to the KeySender round-trip finishing.
+// The only error we care about is "pane gone" — that means the
+// session closed between our forward and tmux's receive, and
+// staying in pane focus would confuse the user. Every other
+// error is absorbed silently; one dropped keystroke on a
+// transient tmux hiccup is preferable to flashing an error line
+// on every Enter.
+func (m Model) handleKeysSent(msg keysSentMsg) Model {
+	if msg.err == nil {
+		return m
+	}
+	if errors.Is(msg.err, errPaneGone) {
+		m.focus = FocusSidebar
+		return m
+	}
+	return m
+}
+
+// handleWindowClosed folds the result of a WindowCloser round-trip
+// back into the Model. On success (or on an already-gone window,
+// which we treat as success-shaped) we drop any cached per-pane
+// state for the departed window so the right pane snaps away
+// cleanly, and we immediately re-fetch the session list so the
+// sidebar row disappears without waiting for the next poll tick.
+//
+// A genuine failure (tmux reachable but kill-window failed for an
+// unexpected reason — e.g. permissions on a shared socket) is
+// surfaced as the listErr hint; the user can try again. We do
+// NOT re-arm pendingCloseWindow: one `x` press is one close
+// attempt, to keep the UX predictable across flaky sockets.
+func (m Model) handleWindowClosed(msg windowClosedMsg) (tea.Model, tea.Cmd) {
+	if msg.windowID == "" {
+		return m, nil
+	}
+	if msg.err != nil && !errors.Is(msg.err, errPaneGone) {
+		// We don't have a direct tmuxctl.ErrNoSuchWindow import,
+		// but the adapter in cmd/sm4c/cli/tui.go folds that case
+		// into a nil error before returning here — so any non-nil
+		// err on this path is a real problem worth surfacing.
+		m.listErr = msg.err
+		return m, nil
+	}
+	// Drop cached per-pane state so the right pane stops trying
+	// to render a ghost of the closed session while we wait for
+	// the sessionsMsg refresh to land.
+	if paneID, ok := m.paneByWindow[msg.windowID]; ok {
+		delete(m.paneTerminals, paneID)
+		delete(m.paneCapturing, paneID)
+		delete(m.paneCaptured, paneID)
+		delete(m.panePending, paneID)
+	}
+	delete(m.paneByWindow, msg.windowID)
+	delete(m.paneErrByWindow, msg.windowID)
+	delete(m.sizedFor, msg.windowID)
+	if m.skipCaptureWindow == msg.windowID {
+		m.skipCaptureWindow = ""
+	}
+	return m, m.fetchSessions()
+}
+
+// errPaneGone is the sentinel KeySender implementations should
+// wrap (via fmt.Errorf with %w, or by returning directly) when
+// the target pane has disappeared between keystroke and forward.
+// We declare it at the TUI level — not in tmuxctl — because the
+// TUI must not import tmuxctl, and bubbling a concrete error
+// type would violate that boundary. The CLI layer's KeySender
+// adapter maps tmuxctl.ErrNoSuchPane to this sentinel.
+var errPaneGone = errors.New("tui: pane gone")
+
+// ErrPaneGone exposes errPaneGone to the CLI layer so the
+// KeySender adapter it wires into Deps can translate
+// tmuxctl.ErrNoSuchPane without the TUI package importing
+// tmuxctl. Tests use the same symbol to synthesize pane-gone
+// responses from stub senders.
+func ErrPaneGone() error { return errPaneGone }
 
 // View renders the current screen. It is called on every re-render;
 // returning the same bytes twice is cheap and by design.
@@ -829,18 +1141,40 @@ type keybind struct {
 	desc string
 }
 
-// bindings is the authoritative list of keys the sidebar view
-// advertises. Both renderKeys and renderHelp iterate this slice, so
-// any key added here appears in the compact bar AND the expanded
-// help without further changes. Per-milestone keys carry a suffix
-// like "(M3b)" until their behavior lands; dropping the suffix is
-// the explicit checkpoint for enabling the binding.
-var bindings = []keybind{
+// sidebarBindings is the authoritative list of keys the sidebar
+// view advertises when focus is on the sidebar. Both renderKeys
+// and renderHelp iterate this slice for that focus, so any key
+// added here appears in the compact bar AND the expanded help
+// without further changes.
+var sidebarBindings = []keybind{
 	{"j/k", "move highlight"},
+	{"enter", "focus session"},
+	{"ctrl+b", "focus session"},
 	{"n", "new session"},
-	{"ctrl+b", "focus right pane (coming in M3c)"},
+	{"x", "close session"},
 	{"?", "toggle help"},
 	{"q", "quit"},
+}
+
+// paneBindings is the list shown when focus is on the pane. In
+// this mode every keystroke goes to claude; the only sm4c-
+// reserved shortcut is ctrl+b (back to the sidebar). The help
+// block spells out that q / ctrl+c now forward to claude so the
+// user is not surprised.
+var paneBindings = []keybind{
+	{"ctrl+b", "back to sidebar"},
+	{"(any)", "typed into claude"},
+}
+
+// bindingsForFocus returns the binding table that matches the
+// current focus. Kept as a single choke-point so renderKeys,
+// renderHelp, and any future view that wants to advertise the
+// active bindings stay consistent.
+func (m Model) bindingsForFocus() []keybind {
+	if m.focus == FocusPane {
+		return paneBindings
+	}
+	return sidebarBindings
 }
 
 // renderKeys emits the compact "key  description" list shown under
@@ -850,11 +1184,36 @@ var bindings = []keybind{
 // when key names have different widths.
 func (m Model) renderKeys() string {
 	var rows []string
-	for _, b := range bindings {
+	for _, b := range m.bindingsForFocus() {
 		row := keyStyle.Render(b.key) + "  " + keyDescStyle.Render(b.desc)
 		rows = append(rows, row)
 	}
 	return strings.Join(rows, "\n")
+}
+
+// renderCloseConfirm returns the one-line confirmation prompt
+// shown while pendingCloseWindow is armed. Returns "" when no
+// close is pending so the caller can fall back to the standard
+// key bar. The name is looked up from the current sessions slice
+// rather than cached on the Model so the prompt always reflects
+// the latest rename state (claude's /rename writes through via
+// list-windows polling).
+func (m Model) renderCloseConfirm() string {
+	if m.pendingCloseWindow == "" {
+		return ""
+	}
+	name := m.pendingCloseWindow
+	for _, s := range m.sessions {
+		if s.WindowID == m.pendingCloseWindow {
+			if s.Name != "" {
+				name = s.Name
+			}
+			break
+		}
+	}
+	prompt := "close " + name + "?"
+	return keyStyle.Render(" y ") + "  " +
+		keyDescStyle.Render(prompt+" (any other key cancels)")
 }
 
 // renderHelp is the expanded help block shown when the user presses
@@ -864,7 +1223,7 @@ func (m Model) renderKeys() string {
 // now so that growth doesn't require rewriting the compact view.
 func (m Model) renderHelp() string {
 	lines := []string{titleStyle.Render("keys")}
-	for _, b := range bindings {
+	for _, b := range m.bindingsForFocus() {
 		lines = append(lines, "  "+keyStyle.Render(b.key)+"  "+keyDescStyle.Render(b.desc))
 	}
 	return strings.Join(lines, "\n")
@@ -881,6 +1240,49 @@ const (
 	sidebarMin    = 24
 	sidebarMax    = 40
 )
+
+// RightPaneBodyDims returns the interior dimensions of the right
+// pane for a given terminal size, using the same layout math the
+// Model applies internally on each tea.WindowSizeMsg. It is exposed
+// so the CLI can pre-size a freshly-spawned tmux window to the
+// same viewport the TUI is about to claim, eliminating the race
+// between claude drawing at tmux's default 80x24 grid and the
+// TUI's async resize-window round-trip. Without pre-sizing, the
+// emulator briefly captures and re-lays-out content at the old
+// size, which shows up as visible distortion until the user
+// forces a terminal resize.
+//
+// Returns (0, 0) if the terminal is too narrow to split (same
+// stacked-fallback threshold the renderer uses) or the computed
+// body region is non-positive. Callers should treat (0, 0) as
+// "no pre-sizing hint" and skip the resize round-trip.
+func RightPaneBodyDims(termW, termH int) (int, int) {
+	if termW < minSplitWidth || termH < 1 {
+		return 0, 0
+	}
+	sidebarW := termW / 3
+	if sidebarW < sidebarMin {
+		sidebarW = sidebarMin
+	}
+	if sidebarW > sidebarMax {
+		sidebarW = sidebarMax
+	}
+	rightW := termW - sidebarW - 1
+	if rightW < 1 {
+		return 0, 0
+	}
+	// rightPaneStyle has Padding(0, 1) — 1 col on each side.
+	bodyW := rightW - 2
+	if bodyW < 1 {
+		return 0, 0
+	}
+	// Header + blank separator = 2 lines consumed before body.
+	bodyH := termH - 2
+	if bodyH < 1 {
+		return 0, 0
+	}
+	return bodyW, bodyH
+}
 
 // renderSidebarView paints the unified layout. On a terminal wide
 // enough to split (>= minSplitWidth), it renders a visible left
@@ -938,7 +1340,17 @@ func (m Model) renderSidebarColumn() string {
 	sections = append(sections, "")
 	sections = append(sections, m.renderSessionList())
 	sections = append(sections, "")
-	sections = append(sections, m.renderKeys())
+	if prompt := m.renderCloseConfirm(); prompt != "" {
+		// Swap the key bar for the confirmation hint while a
+		// close is armed: the only meaningful keys here are y/n,
+		// and showing the normal bindings would dilute that
+		// signal. When the user answers (y → close, any other
+		// key → cancel), pendingCloseWindow is cleared and the
+		// next render falls back to the standard key bar.
+		sections = append(sections, prompt)
+	} else {
+		sections = append(sections, m.renderKeys())
+	}
 
 	if m.listErr != nil {
 		// A fetch error is usually a preflight issue (e.g. tmux
@@ -981,9 +1393,7 @@ func (m Model) renderSidebarColumn() string {
 // with the right-pane body geometry on every tea.WindowSizeMsg),
 // so what comes out of Render already fits the column.
 func (m Model) renderRightPane() string {
-	header := m.renderRightPaneHeader()
-	body := m.renderRightPaneBody()
-	return header + "\n\n" + body
+	return m.renderRightPaneHeader() + "\n\n" + m.renderRightPaneBody()
 }
 
 // renderRightPaneHeader is the first line of the right pane. It
@@ -1004,6 +1414,16 @@ func (m Model) renderRightPaneHeader() string {
 		name = "(unnamed)"
 	}
 	line := titleStyle.Render(name) + hintStyle.Render("  "+s.WindowID)
+	// Focus indicator: a bracketed tag lets the user tell at a
+	// glance which surface owns keystrokes. We avoid relying on
+	// border color (sm4c's no-hex-colors rule) and keep the
+	// signal purely in the text channel so every terminal
+	// renders it identically.
+	if m.focus == FocusPane {
+		line += "  " + keyStyle.Render("[focus]")
+	} else {
+		line += "  " + hintStyle.Render("[ctrl+b to focus]")
+	}
 	return line
 }
 
@@ -1023,8 +1443,7 @@ func (m Model) renderRightPaneBody() string {
 		return hintStyle.Render("preview disconnected — tmux control channel closed")
 	}
 	if m.paneResolver == nil && m.paneEvents == nil {
-		return hintStyle.Render("pane preview unavailable") + "\n" +
-			hintStyle.Render("(input routing lands in M3c)")
+		return hintStyle.Render("pane preview unavailable")
 	}
 	if err, ok := m.paneErrByWindow[wid]; ok && err != nil {
 		return hintStyle.Render("pane lookup failed: " + err.Error())

@@ -264,6 +264,47 @@ func TestAttachArgv_Shape(t *testing.T) {
 	}
 }
 
+// TestNameFromClaudeArgs pins the sidebar-naming behavior: when the
+// user passes `-n` / `--name` to claude, sm4c pre-seeds the tmux
+// window name so the sidebar reflects the requested name on the
+// first frame rather than waiting for claude to emit a rename
+// escape (which claude does not do reliably for the `-n` flag).
+func TestNameFromClaudeArgs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "nil args", args: nil, want: ""},
+		{name: "empty args", args: []string{}, want: ""},
+		{name: "no name flag", args: []string{"/help"}, want: ""},
+		{name: "-n space-separated", args: []string{"-n", "my-session"}, want: "my-session"},
+		{name: "--name space-separated", args: []string{"--name", "my-session"}, want: "my-session"},
+		{name: "-n equals form", args: []string{"-n=my-session"}, want: "my-session"},
+		{name: "--name equals form", args: []string{"--name=my-session"}, want: "my-session"},
+		{name: "-n trailing dangling", args: []string{"-n"}, want: ""},
+		{name: "--name trailing dangling", args: []string{"--name"}, want: ""},
+		{name: "-n after other flags", args: []string{"-c", "-n", "picked"}, want: "picked"},
+		{name: "first -n wins", args: []string{"-n", "first", "-n", "second"}, want: "first"},
+		{name: "-- stops scanning", args: []string{"--", "-n", "not-a-name"}, want: ""},
+		{name: "name trimmed of whitespace", args: []string{"-n", "  spaced  "}, want: "spaced"},
+		{name: "name stripped of escapes", args: []string{"-n", "pre\x1b[31mpost"}, want: "prepost"},
+		{name: "empty name value", args: []string{"-n", ""}, want: ""},
+		{name: "name equals empty", args: []string{"-n="}, want: ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := nameFromClaudeArgs(tc.args)
+			if got != tc.want {
+				t.Fatalf("nameFromClaudeArgs(%v) = %q; want %q", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
 // short trims a string for use as a test subtest name.
 func short(s string) string {
 	if len(s) > 24 {

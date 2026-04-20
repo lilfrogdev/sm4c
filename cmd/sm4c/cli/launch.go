@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/lilfrogdev/sm4c/internal/tmuxctl"
+	"github.com/lilfrogdev/sm4c/internal/tui"
 	"github.com/spf13/cobra"
 )
 
@@ -58,7 +59,7 @@ const launchTimeout = 10 * time.Second
 // new window ID as the initial highlight, so the TUI opens focused
 // on the session the user just asked for.
 func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
-	o, report, _, err := setupOneShot(pf)
+	o, report, cfg, err := setupOneShot(pf)
 	if err != nil {
 		return err
 	}
@@ -78,7 +79,7 @@ func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 		return err
 	}
 
-	return openTUI(cmd, o, report.ClaudePath, windowID)
+	return openTUI(cmd, o, report.ClaudePath, windowID, tui.FocusPane, cfg.SessionPollInterval.AsDuration())
 }
 
 // spawnClaudeWindow is the thin wrapper around NewClaudeWindow that

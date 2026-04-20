@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/lilfrogdev/sm4c/internal/safe"
 )
@@ -52,6 +53,22 @@ type ClientConfig struct {
 	// the parent's env. Empty slice means "inherit only". Entries must be
 	// of the form KEY=VALUE.
 	ExtraEnv []string
+
+	// InitialWidth / InitialHeight, when both positive, are passed to
+	// the control-mode `new-session -x -y` handshake so tmux knows the
+	// size of this client. Control mode streams over pipes (no TTY),
+	// which means tmux cannot query our size via TIOCGWINSZ and falls
+	// back to 80x24 by default. With `window-size latest` — tmux's 3.0+
+	// default — every attaching control-mode client collapses the
+	// session to 80x24, which loses the pre-sized grid the CLI set up
+	// seconds earlier and forces claude to redraw mid-attach. Declaring
+	// our size here means claude renders at the correct dims on the
+	// very first paint the TUI captures.
+	//
+	// Zero values preserve the legacy "let tmux pick" behavior for
+	// tests and callers that don't have reliable terminal dimensions.
+	InitialWidth  int
+	InitialHeight int
 }
 
 func (c ClientConfig) validate() error {
@@ -178,10 +195,32 @@ func Start(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		"-C",
 		"new-session", "-A", "-s", cfg.SessionName,
 	}
+	// Pass -x/-y when we have plausible dims. tmux 3.0+ accepts both
+	// on new-session and stores them as the client's declared size,
+	// which `window-size latest` then propagates to the session. See
+	// ClientConfig.InitialWidth for the rationale and failure mode we
+	// avoid by setting this.
+	if cfg.InitialWidth > 0 && cfg.InitialHeight > 0 {
+		args = append(args,
+			"-x", fmt.Sprintf("%d", cfg.InitialWidth),
+			"-y", fmt.Sprintf("%d", cfg.InitialHeight),
+		)
+	}
+	// The passed ctx bounds the startup handshake only. The tmux
+	// control-mode subprocess must live for the full lifetime of
+	// the Client (until Close() closes stdin, at which point tmux
+	// exits cleanly on its own), so we deliberately do NOT tie the
+	// subprocess to ctx via exec.CommandContext. If we did,
+	// `defer cancel()` in a caller that bounds Start with a
+	// timeout would SIGKILL tmux right after Start returned,
+	// instantly closing the events channel and making the pane
+	// preview flash "preview disconnected" on every launch. On
+	// startup timeout the select below calls c.Close(), which
+	// tears the subprocess down cleanly via stdin close + Wait.
 	// #nosec G204 -- cfg.TmuxBin is validated as an absolute path by
 	// cfg.validate() above; every other arg is either a compile-time
 	// literal or safe.Arg-checked in validate.
-	cmd := exec.CommandContext(ctx, cfg.TmuxBin, args...)
+	cmd := exec.Command(cfg.TmuxBin, args...)
 	cmd.Env = append(cmd.Environ(), cfg.ExtraEnv...)
 
 	stdin, err := cmd.StdinPipe()
@@ -213,6 +252,32 @@ func Start(ctx context.Context, cfg ClientConfig) (*Client, error) {
 
 	select {
 	case <-c.ready:
+		// Declare this client's size to tmux. `new-session -x/-y`
+		// is only honored when `-d` creates a fresh session, and
+		// `-A` almost always attaches to an existing one (sm4c
+		// creates the session up front via one-shot spawn
+		// commands). Without a declared size, tmux sees our
+		// pipe-backed stdin/stdout, cannot query a TTY, and
+		// defaults the client to 80x24. With `window-size
+		// latest` — tmux's default — the whole session then
+		// collapses to 80x24 the instant we attach, silently
+		// undoing any pre-size the CLI performed and forcing
+		// claude to redraw mid-capture.
+		//
+		// `refresh-client -C WIDTHxHEIGHT` is the control-mode-
+		// native primitive for telling tmux the real dims. We
+		// send it synchronously, before returning: callers treat
+		// a ready Client as one that is fully sized, so any race
+		// with the next resize-window round-trip is impossible.
+		// Failures are logged via stderr ring but do not fail
+		// Start — a missized client is still a usable one, and
+		// the TUI's WindowSizeMsg handler will converge things.
+		if cfg.InitialWidth > 0 && cfg.InitialHeight > 0 {
+			sizeCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			_, _ = c.Send(sizeCtx, fmt.Sprintf("refresh-client -C %dx%d",
+				cfg.InitialWidth, cfg.InitialHeight))
+			cancel()
+		}
 		return c, nil
 	case <-c.readerDone:
 		_ = cmd.Wait()

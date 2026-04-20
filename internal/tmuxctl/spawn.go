@@ -79,12 +79,25 @@ func (o OneShot) NewClaudeWindow(ctx context.Context, claudeBin string, args []s
 
 	cmdline := buildShellCommand(claudeBin, args)
 
-	// Common case (session exists) is one tmux call; fall back to a
-	// slightly longer chain only if the server reports the session is
-	// missing.
-	windowID, err := o.newWindowOnExistingSession(ctx, cmdline)
+	// Pre-seed the tmux window name from claude's own -n / --name
+	// flag when present. Claude owns session naming conceptually
+	// (via `claude -n …` or `/rename` inside a session), but the
+	// `-n` flag only controls claude's internal session id — it
+	// does NOT automatically emit a terminal escape that tmux
+	// would observe and rename the window from. Without this hint
+	// the sidebar would show the literal placeholder ("claude") on
+	// every new `-n`-launched session until the user issued a
+	// `/rename` inside claude, which is a jarring UX papercut. By
+	// pre-naming the tmux window to match the flag, the sidebar
+	// reflects the requested name immediately; `allow-rename on`
+	// means a later in-pane `/rename` still overrides cleanly.
+	// If claude's arg parser is not in play (no -n / --name), we
+	// fall back to the literal "claude" placeholder.
+	initialName := nameFromClaudeArgs(args)
+
+	windowID, err := o.newWindowOnExistingSession(ctx, cmdline, initialName)
 	if err != nil && errors.Is(err, errNoSuchSession) {
-		windowID, err = o.newSessionWithCommand(ctx, cmdline)
+		windowID, err = o.newSessionWithCommand(ctx, cmdline, initialName)
 	}
 	if err != nil {
 		return "", err
@@ -103,6 +116,56 @@ func (o OneShot) NewClaudeWindow(ctx context.Context, claudeBin string, args []s
 		return "", fmt.Errorf("tag window %s: %w", windowID, err)
 	}
 	return windowID, nil
+}
+
+// nameFromClaudeArgs scans args for claude's session-name flag
+// (`-n VALUE`, `--name VALUE`, `-n=VALUE`, or `--name=VALUE`) and
+// returns the VALUE that should seed the tmux window name. The
+// returned string is pre-sanitized via safe.Label so it is safe to
+// pass to tmux as a `-n` argument: control bytes are stripped, and
+// length is capped to match sidebar-display constraints. If no
+// name flag is present, no value is visible, or the extracted
+// value is empty after sanitization, an empty string is returned
+// and the caller falls back to the literal "claude" placeholder.
+//
+// We intentionally stop scanning at "--" (the POSIX end-of-options
+// marker) so a user running `claude -- -n not-a-name` does not
+// accidentally seed their window with the word "not-a-name" —
+// everything after "--" is positional input to claude itself.
+//
+// We do NOT attempt to fully parse claude's flag grammar here:
+// that would require tracking which other flags take values, and
+// claude's CLI is out of sm4c's control. A false positive on an
+// unrelated `-n <x>` just produces a wrong initial window name
+// that the user can fix with `/rename` inside claude — strictly
+// better than the current "every session is named 'claude'" UX.
+func nameFromClaudeArgs(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			return ""
+		}
+		switch {
+		case a == "-n" || a == "--name":
+			if i+1 >= len(args) {
+				return ""
+			}
+			return sanitizedLabel(args[i+1])
+		case strings.HasPrefix(a, "-n="):
+			return sanitizedLabel(a[len("-n="):])
+		case strings.HasPrefix(a, "--name="):
+			return sanitizedLabel(a[len("--name="):])
+		}
+	}
+	return ""
+}
+
+// sanitizedLabel runs s through safe.Label and trims surrounding
+// whitespace. safe.Label strips C0 controls and ANSI escape
+// sequences and caps length, so whatever tmux receives here is
+// guaranteed safe for the window-name field.
+func sanitizedLabel(s string) string {
+	return strings.TrimSpace(safe.Label(s))
 }
 
 // validateSpawnArgs rejects claudeBin or any argument that contains a
@@ -140,17 +203,21 @@ var errNoSuchSession = errors.New("tmuxctl: sm4c session does not exist")
 //   - The server is not running at all → errNoSuchSession (the chain
 //     cannot even start).
 //   - The server is running but the session is missing → errNoSuchSession.
-func (o OneShot) newWindowOnExistingSession(ctx context.Context, cmdline string) (string, error) {
-	out, err := o.run(ctx,
+func (o OneShot) newWindowOnExistingSession(ctx context.Context, cmdline, initialName string) (string, error) {
+	args := []string{
 		"set-option", "-g", "default-shell", posixShell,
 		";",
 		"new-window",
-		"-t", o.SessionName+":",
+		"-t", o.SessionName + ":",
 		"-d",
 		"-P",
 		"-F", "#{window_id}",
-		cmdline,
-	)
+	}
+	if initialName != "" {
+		args = append(args, "-n", initialName)
+	}
+	args = append(args, cmdline)
+	out, err := o.run(ctx, args...)
 	if err != nil {
 		if errors.Is(err, ErrServerNotRunning) {
 			return "", errNoSuchSession
@@ -181,7 +248,10 @@ func (o OneShot) newWindowOnExistingSession(ctx context.Context, cmdline string)
 // user input. The window-name starts as "claude" and is expected to
 // be updated by claude's own title-writing (OSC 0/2) shortly after
 // startup; sm4c does not rename windows itself at any point.
-func (o OneShot) newSessionWithCommand(ctx context.Context, cmdline string) (string, error) {
+func (o OneShot) newSessionWithCommand(ctx context.Context, cmdline, initialName string) (string, error) {
+	if initialName == "" {
+		initialName = "claude"
+	}
 	out, err := o.run(ctx,
 		"set-option", "-g", "default-shell", posixShell,
 		";",
@@ -192,7 +262,7 @@ func (o OneShot) newSessionWithCommand(ctx context.Context, cmdline string) (str
 		"new-session",
 		"-d",
 		"-s", o.SessionName,
-		"-n", "claude",
+		"-n", initialName,
 		"-P",
 		"-F", "#{window_id}",
 		cmdline,
@@ -259,6 +329,43 @@ func (o OneShot) setWindowOption(ctx context.Context, windowID, key, value strin
 func (o OneShot) killWindow(ctx context.Context, windowID string) error {
 	_, err := o.run(ctx, "kill-window", "-t", windowID)
 	return err
+}
+
+// KillWindow is the public, input-validating counterpart to
+// killWindow. It is the close-session seam the TUI wires into the
+// `x` binding: a user confirming closure of a sidebar row calls
+// through here to terminate the underlying tmux window, which
+// sends SIGHUP to claude and drops the window from the next
+// sessionsMsg poll.
+//
+// windowID must be in the canonical `@<digits>` form tmux assigns
+// (and parseWindowID / ListWindows return); anything else is
+// rejected before tmux sees it, so a malformed input never
+// becomes a shell-like argument to `kill-window`. A missing
+// server is folded into ErrNoSuchWindow so the caller can treat
+// "already gone" and "just went away" identically — both outcomes
+// end the user's intent ("this session should no longer exist")
+// successfully.
+func (o OneShot) KillWindow(ctx context.Context, windowID string) error {
+	if err := safe.Arg(windowID); err != nil {
+		return fmt.Errorf("tmuxctl: KillWindow: windowID: %w", err)
+	}
+	if _, err := parseWindowID([]byte(windowID)); err != nil {
+		return fmt.Errorf("tmuxctl: KillWindow: %w", err)
+	}
+	_, err := o.run(ctx, "kill-window", "-t", windowID)
+	if errors.Is(err, ErrServerNotRunning) {
+		return ErrNoSuchWindow
+	}
+	if err != nil {
+		low := err.Error()
+		if strings.Contains(low, "can't find window") ||
+			strings.Contains(low, "window not found") {
+			return ErrNoSuchWindow
+		}
+		return err
+	}
+	return nil
 }
 
 // buildShellCommand constructs the string passed to tmux

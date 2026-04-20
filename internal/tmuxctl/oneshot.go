@@ -374,10 +374,15 @@ func (o OneShot) CapturePane(ctx context.Context, paneID string) ([]byte, error)
 // soft-failure posture and keeps a single closed session from
 // blowing up the TUI.
 //
-// Setting `window-size manual` on the sm4c session (done in spawn.go)
-// is what makes this call authoritative; without it tmux would
-// bounce the window back to a client-derived size on the next
-// %sizechanged notification.
+// Note on `window-size`: sm4c does NOT pin `window-size manual` on
+// its tmux session. On tmux 3.6a that option tears down a
+// detached-only server (sm4c's steady state — the sm4c process
+// never attaches), with "server exited unexpectedly", in every
+// configuration we tested. Empirically `resize-window` already
+// sticks with the default `window-size latest` for both standalone
+// and control-mode-attached servers, so we leave the option at its
+// default and rely on this call being the authoritative source of
+// pane geometry.
 func (o OneShot) ResizeWindow(ctx context.Context, windowID string, width, height int) error {
 	if err := safe.Arg(windowID); err != nil {
 		return fmt.Errorf("tmuxctl: ResizeWindow: windowID: %w", err)
@@ -407,6 +412,87 @@ func (o OneShot) ResizeWindow(ctx context.Context, windowID string, width, heigh
 		return err
 	}
 	return nil
+}
+
+// SendKeys forwards raw input bytes into a tmux pane via
+// `send-keys -H`. `-H` is tmux's "hex bytes" mode: every argument
+// after the target is a two-digit hex representation of a single
+// byte, which tmux pushes into the pane's input stream exactly as
+// given, WITHOUT re-interpreting named keys like "Enter" or "C-c".
+//
+// This is the right semantics for M3c input routing: sm4c already
+// translated the user's tea.KeyMsg into the exact byte sequence a
+// terminal would emit (UTF-8 runes, 0x0d for Enter, 0x03 for
+// Ctrl+C, CSI escapes for arrow keys, …). Letting tmux's named-key
+// table remap any of that would introduce an extra layer of
+// interpretation and break claude's expectation of raw terminal
+// input.
+//
+// Validation:
+//
+//   - paneID must match `%<digits>` (the same shape ActivePane
+//     returns). We reject anything else before it reaches tmux so
+//     no user-controlled string flows into argv.
+//   - data is bounded to maxSendKeysBytes (4 KiB). A single
+//     keypress is a handful of bytes; 4 KiB is a generous ceiling
+//     that still catches a runaway call. Larger payloads would
+//     also blow past execve's argv length limit (hex-encoded
+//     bytes are 3-arguments-per-byte in the worst case).
+//
+// Missing server / missing pane map to ErrNoSuchPane so callers
+// can treat "session closed between keypress and forward" as a
+// soft outcome — the TUI reverts focus to the sidebar on that
+// signal and the next sessions poll prunes the stale highlight.
+func (o OneShot) SendKeys(ctx context.Context, paneID string, data []byte) error {
+	if err := safe.Arg(paneID); err != nil {
+		return fmt.Errorf("tmuxctl: SendKeys: paneID: %w", err)
+	}
+	if _, err := parsePaneID([]byte(paneID)); err != nil {
+		return fmt.Errorf("tmuxctl: SendKeys: %w", err)
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	if len(data) > maxSendKeysBytes {
+		return fmt.Errorf("tmuxctl: SendKeys: payload too large: %d > %d", len(data), maxSendKeysBytes)
+	}
+
+	args := make([]string, 0, 4+len(data))
+	args = append(args, "send-keys", "-t", paneID, "-H")
+	for _, b := range data {
+		args = append(args, hexByte(b))
+	}
+	_, err := o.run(ctx, args...)
+	if errors.Is(err, ErrServerNotRunning) {
+		return ErrNoSuchPane
+	}
+	if err != nil {
+		low := err.Error()
+		if strings.Contains(low, "can't find pane") ||
+			strings.Contains(low, "can't find window") ||
+			strings.Contains(low, "pane not found") ||
+			strings.Contains(low, "window not found") {
+			return ErrNoSuchPane
+		}
+		return err
+	}
+	return nil
+}
+
+// maxSendKeysBytes bounds a single SendKeys payload. In practice a
+// keypress is 1–4 bytes (UTF-8 rune, short CSI escape); the limit
+// is far above that so we never truncate a real keystroke, but
+// small enough to keep a buggy caller from generating a
+// multi-megabyte argv.
+const maxSendKeysBytes = 4 * 1024
+
+// hexByte formats b as a lowercase two-digit hex string. Used to
+// build the per-byte arguments to `send-keys -H`. Factored out
+// instead of using fmt.Sprintf("%02x", b) to avoid the format-
+// string interpreter for what is a completely fixed shape.
+func hexByte(b byte) string {
+	const hex = "0123456789abcdef"
+	return string([]byte{hex[b>>4], hex[b&0x0f]})
 }
 
 // intToDecimal renders a non-negative int as its base-10 string

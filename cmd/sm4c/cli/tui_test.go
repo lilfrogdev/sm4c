@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lilfrogdev/sm4c/internal/tmuxctl"
 	"github.com/lilfrogdev/sm4c/internal/tui"
@@ -74,7 +75,7 @@ claude_bin = "/sm4c/tests/no/such/claude"
 
 	calls := 0
 	orig := runTUIProgram
-	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot, _ string) (tui.Model, error) {
+	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot, _ string, _ tui.Focus, _ time.Duration) (tui.Model, error) {
 		calls++
 		return tui.Model{}, nil
 	}
@@ -119,10 +120,12 @@ claude_bin = "/bin/sh"
 	t.Cleanup(func() { interactiveStdin = origTTY })
 
 	var seenHighlight string
+	var seenFocus tui.Focus
 	var seenCount int
 	origTUI := runTUIProgram
-	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot, initialHighlight string) (tui.Model, error) {
+	runTUIProgram = func(_ *cobra.Command, _ tmuxctl.OneShot, initialHighlight string, initialFocus tui.Focus, _ time.Duration) (tui.Model, error) {
 		seenHighlight = initialHighlight
+		seenFocus = initialFocus
 		seenCount++
 		// Returning a zero Model defaults Action() to ActionNone,
 		// which ends the openTUI loop on the first iteration.
@@ -141,5 +144,8 @@ claude_bin = "/bin/sh"
 	}
 	if seenHighlight != "" {
 		t.Fatalf("bare sm4c called runTUIProgram with initialHighlight = %q; want empty", seenHighlight)
+	}
+	if seenFocus != tui.FocusSidebar {
+		t.Fatalf("bare sm4c called runTUIProgram with initialFocus = %v; want FocusSidebar", seenFocus)
 	}
 }

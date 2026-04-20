@@ -42,17 +42,19 @@ import (
 
 // runTUI is the entry point for the bare `sm4c` invocation (no
 // positional args). It performs preflight and hands off to openTUI
-// with no initial-highlight hint, so the sidebar picks the first
-// row as the default cursor.
+// with no initial-highlight hint and sidebar focus, so the user
+// can browse sessions before committing to one. This matches the
+// bare-invocation UX: nothing has been launched yet, so typing
+// into a pane would have nowhere to land.
 func runTUI(cmd *cobra.Command, pf *persistentFlags) error {
-	o, report, _, err := setupOneShot(pf)
+	o, report, cfg, err := setupOneShot(pf)
 	if err != nil {
 		return err
 	}
 	if report.ClaudePath == "" {
 		return fmt.Errorf("claude is not available: %s", summarizeFatals(report))
 	}
-	return openTUI(cmd, o, report.ClaudePath, "")
+	return openTUI(cmd, o, report.ClaudePath, "", tui.FocusSidebar, cfg.SessionPollInterval.AsDuration())
 }
 
 // openTUI is the shared entry into the Bubble Tea runtime. Both
@@ -73,7 +75,7 @@ func runTUI(cmd *cobra.Command, pf *persistentFlags) error {
 // or a shell script — we refuse to open the TUI and instead return
 // a short pointer to the shell shortcuts. This prevents sm4c from
 // hanging waiting for a keystroke that will never come.
-func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID string) error {
+func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID string, initialFocus tui.Focus, pollInterval time.Duration) error {
 	if !interactiveStdin() {
 		// Non-interactive stdin: refuse to launch the TUI (it would
 		// hang) and give the user a concrete alternative. We return
@@ -85,8 +87,9 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 	}
 
 	highlight := initialWindowID
+	focus := initialFocus
 	for {
-		final, err := runTUIProgram(cmd, o, highlight)
+		final, err := runTUIProgram(cmd, o, highlight, focus, pollInterval)
 		if err != nil {
 			return fmt.Errorf("tui: %w", err)
 		}
@@ -113,12 +116,12 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 				return spawnErr
 			}
 			// Re-enter the TUI focused on the freshly-spawned
-			// window. From the user's perspective the sidebar
-			// blinks and redraws with the new row pre-selected;
-			// that's the same Bubble Tea alt-screen teardown/
-			// setup a `n` keystroke used to cause in M3a, just
-			// with a different post-state.
+			// window with pane focus so the user can type
+			// immediately into claude — matching the UX promise
+			// of "press n, land in your new session ready to
+			// work".
 			highlight = newID
+			focus = tui.FocusPane
 			continue
 		}
 
@@ -141,7 +144,7 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 // relative to setupOneShot.
 var runTUIProgram = runTUIProgramReal
 
-func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID string) (tui.Model, error) {
+func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID string, initialFocus tui.Focus, pollInterval time.Duration) (tui.Model, error) {
 	// Bubble Tea wants the actual process stdin/stdout to drive
 	// raw-mode input and terminal-level escape sequences. cmd.InOrStdin
 	// and cmd.OutOrStdout return interfaces that are os.Stdin /
@@ -182,6 +185,8 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 	}
 	var capturer tui.PaneCapturer
 	var resizer tui.WindowResizer
+	var closerFn tui.WindowCloser
+	var keys tui.KeySender
 	if o.TmuxBin != "" {
 		capturer = func(ctx context.Context, paneID string) ([]byte, error) {
 			return o.CapturePane(ctx, paneID)
@@ -189,18 +194,51 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 		resizer = func(ctx context.Context, windowID string, width, height int) error {
 			return o.ResizeWindow(ctx, windowID, width, height)
 		}
+		// WindowCloser: fold tmuxctl.ErrNoSuchWindow (server
+		// gone, or window already vanished between `x` and the
+		// kill-window round-trip) into a nil error. The user's
+		// intent is "this session should no longer exist", which
+		// is already true in that case — surfacing it as an
+		// error would produce a spurious "session fetch error"
+		// line on a perfectly fine close.
+		closerFn = func(ctx context.Context, windowID string) error {
+			err := o.KillWindow(ctx, windowID)
+			if err == nil || errors.Is(err, tmuxctl.ErrNoSuchWindow) {
+				return nil
+			}
+			return err
+		}
+		// KeySender: translate tmuxctl.ErrNoSuchPane into the
+		// TUI-facing tui.ErrPaneGone sentinel so the TUI package
+		// can react to "session closed between keystroke and
+		// forward" without importing tmuxctl (the import boundary
+		// is one-way: CLI imports both packages; neither internal
+		// package imports the other).
+		keys = func(ctx context.Context, paneID string, data []byte) error {
+			err := o.SendKeys(ctx, paneID, data)
+			if err == nil {
+				return nil
+			}
+			if errors.Is(err, tmuxctl.ErrNoSuchPane) {
+				return tui.ErrPaneGone()
+			}
+			return err
+		}
 	}
 	return tui.Run(
 		asReader(cmd.InOrStdin()),
 		asWriter(cmd.OutOrStdout()),
 		tui.Deps{
 			Lister:           sessionLister(o),
-			PollInterval:     tui.DefaultPollInterval,
+			PollInterval:     resolvePollInterval(pollInterval),
 			PaneStream:       stream,
 			PaneResolver:     resolver,
 			PaneCapturer:     capturer,
 			WindowResizer:    resizer,
+			WindowCloser:     closerFn,
+			KeySender:        keys,
 			InitialHighlight: initialWindowID,
+			InitialFocus:     initialFocus,
 		},
 	)
 }
@@ -237,15 +275,51 @@ func setupPaneBridge(cmd *cobra.Command, o tmuxctl.OneShot) (tui.PaneEventStream
 		SocketName:  o.SocketName,
 		SessionName: o.SessionName,
 	}
+	// Declare the control-mode client's viewport as the RIGHT-PANE
+	// BODY dimensions, not the full terminal dimensions.
+	//
+	// tmux's default `window-size latest` auto-sizes every window
+	// in the session to match the most-recently-active client's
+	// viewport. If we lie to tmux and say our client is as wide as
+	// the whole terminal, tmux sizes the windows to that, claude
+	// draws its UI to the full terminal width, and our right-pane
+	// column ends up only showing the LEFT SLICE of a much wider
+	// grid — the screenshot symptom "text wraps far beyond the
+	// column and bleeds onto the next row".
+	//
+	// Explicit `resize-window` calls cannot reliably fix this:
+	// `window-size latest` snaps every window back to the client
+	// viewport on the next triggering event (attach, detach,
+	// refresh-client), so the manual size is consistently clobbered.
+	// The robust fix is to stop fighting the auto-sizer: declare
+	// the viewport that MATCHES the visible surface, let
+	// `window-size latest` do its job, and skip the redundant
+	// per-window resize round-trip entirely.
+	//
+	// Falling back to full terminal dims when body dims are not
+	// computable (narrow terminal, missing controlling tty) keeps
+	// the previous behavior in those degenerate cases; anything
+	// is better than tmux defaulting to 80x24.
+	if termW, termH, ok := terminalDims(); ok {
+		if bodyW, bodyH := tui.RightPaneBodyDims(termW, termH); bodyW > 0 && bodyH > 0 {
+			cfg.InitialWidth = bodyW
+			cfg.InitialHeight = bodyH
+		} else {
+			cfg.InitialWidth = termW
+			cfg.InitialHeight = termH
+		}
+	}
 	// Client.Start blocks until tmux finishes its handshake. A short
 	// bound keeps a hung socket from stalling the TUI; if we time
 	// out the user still gets the TUI, just without live preview.
 	client, err := tmuxctl.Start(startCtx, cfg)
 	if err != nil {
+		debugBridgef("Start FAILED err=%v", err)
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 			"sm4c: pane preview disabled: %v\n", err)
 		return nil, nil, nil
 	}
+	debugBridgef("Start OK initW=%d initH=%d", cfg.InitialWidth, cfg.InitialHeight)
 
 	events := make(chan tui.PaneEvent, paneBridgeBufferSize)
 
@@ -258,6 +332,7 @@ func setupPaneBridge(cmd *cobra.Command, o tmuxctl.OneShot) (tui.PaneEventStream
 	closeEvents := func() { once.Do(func() { close(events) }) }
 	go func() {
 		defer closeEvents()
+		defer debugBridgef("bridge-exit reason=client.events-closed")
 		for ev := range client.Events() {
 			out, ok := ev.(tmuxctl.OutputEvent)
 			if !ok {
@@ -269,6 +344,7 @@ func setupPaneBridge(cmd *cobra.Command, o tmuxctl.OneShot) (tui.PaneEventStream
 			select {
 			case events <- tui.PaneEvent{PaneID: out.PaneID, Data: out.Data}:
 			default:
+				debugBridgef("DROP pane=%s bytes=%d (buffer full)", out.PaneID, len(out.Data))
 			}
 		}
 	}()
@@ -351,6 +427,20 @@ func sessionLister(o tmuxctl.OneShot) tui.SessionLister {
 	}
 }
 
+// resolvePollInterval picks the effective session-list poll cadence
+// the TUI will run at. It honors the operator's `session_poll_interval`
+// TOML value when positive, and falls back to tui.DefaultPollInterval
+// for the zero-value case (e.g. a config file that predates this
+// field, or an in-process caller that passed 0). A negative value
+// passed explicitly is preserved — the Model treats that as "fetch
+// once and never poll", which is the snapshot-only contract.
+func resolvePollInterval(cfg time.Duration) time.Duration {
+	if cfg == 0 {
+		return tui.DefaultPollInterval
+	}
+	return cfg
+}
+
 // interactiveStdin reports whether the process's standard input is
 // a terminal. It's a package-level var (not a function) so tests
 // that exercise runTUI end-to-end can flip it to true without
@@ -368,6 +458,28 @@ func isInteractiveStdinReal() bool {
 	// #nosec G115 -- file descriptors on Linux/macOS fit in int
 	// comfortably; this is the same cast we use in cmd/sm4c/cli/stop.go.
 	return xterm.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// terminalDims reports the current controlling terminal's size.
+// It tries stdout first (what Bubble Tea writes to and the size
+// everything downstream cares about) and falls back to stdin so
+// pipelines that redirect stdout still get a sensible hint.
+// Returns ok=false when neither fd is a terminal or xterm.GetSize
+// fails — callers should treat that as "skip pre-sizing".
+func terminalDims() (int, int, bool) {
+	for _, fd := range []uintptr{os.Stdout.Fd(), os.Stdin.Fd()} {
+		// #nosec G115 -- fd ints match the cast used elsewhere in cli.
+		n := int(fd)
+		if !xterm.IsTerminal(n) {
+			continue
+		}
+		w, h, err := xterm.GetSize(n)
+		if err != nil || w < 1 || h < 1 {
+			continue
+		}
+		return w, h, true
+	}
+	return 0, 0, false
 }
 
 // asReader / asWriter coerce Cobra's io.Reader / io.Writer

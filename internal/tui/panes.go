@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"io"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/vt"
@@ -70,6 +71,25 @@ type ActivePaneResolver func(ctx context.Context, windowID string) (paneID strin
 // that wraps tmuxctl.OneShot.CapturePane.
 type PaneCapturer func(ctx context.Context, paneID string) (data []byte, err error)
 
+// KeySender forwards raw input bytes to a tmux pane. The TUI uses
+// it to realize "focus on the pane means keystrokes flow into
+// claude": every tea.KeyMsg that is not a sm4c-reserved shortcut
+// (ctrl+b toggles focus back to the sidebar) is translated by
+// keyMsgToBytes into the byte sequence a tty would emit for that
+// keypress, and handed here.
+//
+// A nil KeySender is supported and disables input routing; the TUI
+// still renders and navigates, but pane focus becomes effectively
+// read-only. Production callers wrap tmuxctl.OneShot.SendKeys.
+//
+// Errors: when the target pane is gone (the window was closed
+// mid-keystroke), implementations should return a sentinel that
+// errors.Is against tmuxctl.ErrNoSuchPane so the TUI can revert
+// focus to the sidebar on the next tick; other errors are
+// absorbed silently (the next %output will paint whatever state
+// tmux reached).
+type KeySender func(ctx context.Context, paneID string, data []byte) error
+
 // WindowResizer tells tmux to resize a window's cell grid to
 // (width, height). The TUI invokes it whenever its right-pane
 // viewport changes (terminal resized) or the highlight lands on a
@@ -83,6 +103,20 @@ type PaneCapturer func(ctx context.Context, paneID string) (data []byte, err err
 // where the user's tmux is pre-3.2. Production callers wrap
 // tmuxctl.OneShot.ResizeWindow.
 type WindowResizer func(ctx context.Context, windowID string, width, height int) error
+
+// WindowCloser terminates a tmux window (the "close session" action)
+// identified by its tmux window ID. The TUI invokes it when the user
+// confirms an `x` close in the sidebar: killing the window sends
+// SIGHUP to claude inside the pane, which is the same lifecycle
+// effect as running `/exit` in claude — the session goes away and
+// the next sessionsMsg poll drops its row.
+//
+// A nil WindowCloser disables the close-session binding: `x` becomes
+// a no-op in sidebar focus. Production callers wrap
+// tmuxctl.OneShot.KillWindow. Implementations should treat an
+// already-gone window as a successful outcome (user's intent is
+// "this session should no longer exist", which is true either way).
+type WindowCloser func(ctx context.Context, windowID string) error
 
 // defaultPaneWidth / defaultPaneHeight are the emulator dimensions
 // used before we have seen a tea.WindowSizeMsg. They roughly match
@@ -110,6 +144,26 @@ type paneTerminal struct {
 // dimensions. Callers are expected to pass positive integers; width
 // and height are clamped to a minimum of 1 on the emulator side, but
 // we clamp defensively too to keep internal invariants obvious.
+//
+// We also start a background goroutine that drains the emulator's
+// response pipe (emu.Read) into io.Discard. Claude emits device-
+// attributes queries on startup (CSI c, CSI >0q, and friends); the
+// charmbracelet/x/vt emulator answers those by queuing response
+// bytes into an internal buffer exposed via Read. If nothing drains
+// that buffer, the internal pipe fills up and any subsequent
+// emu.Write call blocks forever — deadlocking the entire TUI
+// goroutine, since Write is invoked from Bubble Tea's main loop
+// during handlePaneData.
+//
+// We silently discard the responses because they are spurious in
+// our topology: claude's actual PTY is on the tmux side, and tmux
+// has already answered claude's queries on that PTY. Our emulator
+// is a passive observer of the bytes claude has written, not the
+// terminal claude believes it is attached to, so its generated
+// responses have no correct destination.
+//
+// The goroutine exits when emu.Read returns an error, which
+// happens when the emulator is closed via (*paneTerminal).close.
 func newPaneTerminal(width, height int) *paneTerminal {
 	if width < 1 {
 		width = 1
@@ -117,7 +171,11 @@ func newPaneTerminal(width, height int) *paneTerminal {
 	if height < 1 {
 		height = 1
 	}
-	return &paneTerminal{emu: vt.NewEmulator(width, height)}
+	emu := vt.NewEmulator(width, height)
+	go func() {
+		_, _ = io.Copy(io.Discard, emu)
+	}()
+	return &paneTerminal{emu: emu}
 }
 
 // write feeds a chunk of bytes to the emulator and records that we
@@ -191,6 +249,32 @@ type paneCaptureMsg struct {
 	err    error
 }
 
+// keysSentMsg is delivered when KeySender returns. The Model uses
+// err to decide whether the target pane is still live: a
+// "no such pane" error tells us the session was closed between
+// keystroke and forward, so we revert focus to the sidebar and
+// let the next sessionsMsg poll prune the stale highlight.
+// Other errors are absorbed silently; one dropped keystroke on a
+// transient tmux hiccup is preferable to a sidebar full of noisy
+// error lines.
+type keysSentMsg struct {
+	paneID string
+	err    error
+}
+
+// windowClosedMsg is delivered when WindowCloser returns. The
+// Model's handler reacts by dropping any cached per-pane state
+// for the closed window and requesting an immediate sessionsMsg
+// so the sidebar row disappears without waiting for the next
+// poll tick. err is recorded on the Model's listErr surface only
+// when non-nil AND not ErrPaneGone-equivalent (an already-gone
+// window is the desired post-condition, not an error to shout
+// about).
+type windowClosedMsg struct {
+	windowID string
+	err      error
+}
+
 // windowResizedMsg is delivered when WindowResizer returns. The
 // Model absorbs it silently: resize failures (window closed, tmux
 // flaked) manifest as visual drift the user can recover from by
@@ -200,6 +284,57 @@ type paneCaptureMsg struct {
 type windowResizedMsg struct {
 	windowID string
 	err      error
+}
+
+// normalizeCaptureEOL converts bare LF (`\n`) row terminators into
+// CRLF (`\r\n`) so a VT emulator interprets them as "move cursor to
+// column 0 of the next row" rather than "cursor down, same column".
+//
+// Why this matters: `tmux capture-pane -p -e` emits one line per
+// row of the visible grid, separated by bare `\n`. The emulator
+// follows strict VT semantics where `\n` (0x0A) is LINE FEED —
+// advance the row, keep the column. Without a leading `\r`
+// (0x0D, CARRIAGE RETURN), every subsequent row starts at whatever
+// column the previous row ended on, producing a visible staircase
+// where each captured row is indented by the cumulative width of
+// all rows above it. The effect in the TUI is exactly the
+// "text wrapped far beyond the pane and bleeds into the next row"
+// distortion the user reported, and it is fixed ONLY by a manual
+// terminal resize because a resize triggers claude to emit a full
+// redraw whose byte stream uses proper CSI cursor positioning (or
+// CRLF) and overwrites the staircase.
+//
+// Live %output bytes from tmux do NOT need this normalization:
+// tmux forwards the pane's PTY output verbatim, which already uses
+// CRLF or cursor-positioning escapes. This helper is therefore
+// scoped to the capture-pane payload only, invoked in
+// handlePaneCapture.
+//
+// We deliberately scan for isolated `\n` rather than unconditionally
+// inserting `\r` before every `\n`: preserving an existing `\r\n`
+// pair (should tmux ever emit it) is correct, and the cost of a
+// one-pass byte scan is trivial next to the cost of the emulator
+// parsing the data itself.
+func normalizeCaptureEOL(src []byte) []byte {
+	needs := 0
+	for i := 0; i < len(src); i++ {
+		if src[i] == '\n' && (i == 0 || src[i-1] != '\r') {
+			needs++
+		}
+	}
+	if needs == 0 {
+		return src
+	}
+	out := make([]byte, 0, len(src)+needs)
+	for i := 0; i < len(src); i++ {
+		b := src[i]
+		if b == '\n' && (i == 0 || src[i-1] != '\r') {
+			out = append(out, '\r', '\n')
+			continue
+		}
+		out = append(out, b)
+	}
+	return out
 }
 
 // waitForPaneEvent returns a tea.Cmd that reads one PaneEvent from
@@ -252,6 +387,46 @@ func (m Model) captureActivePane(paneID string) tea.Cmd {
 		defer cancel()
 		data, err := capturer(ctx, paneID)
 		return paneCaptureMsg{paneID: paneID, data: data, err: err}
+	}
+}
+
+// sendKeysToPane returns a tea.Cmd that asks KeySender to forward
+// data to paneID. Returns nil when no sender is wired, the pane
+// ID is empty, or data is empty — all of which are "nothing to
+// route" and should never produce a spurious tea.Msg in the
+// runtime loop.
+func (m Model) sendKeysToPane(paneID string, data []byte) tea.Cmd {
+	if m.keySender == nil || paneID == "" || len(data) == 0 {
+		return nil
+	}
+	sender := m.keySender
+	// Copy so a later write to the Model's internal buffers cannot
+	// race with the async subprocess; the tea.Cmd runs on a
+	// separate goroutine and receives its own owned slice.
+	buf := make([]byte, len(data))
+	copy(buf, data)
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+		defer cancel()
+		err := sender(ctx, paneID, buf)
+		return keysSentMsg{paneID: paneID, err: err}
+	}
+}
+
+// closeManagedWindow returns a tea.Cmd that asks WindowCloser to
+// terminate windowID. Returns nil when no closer is wired or
+// windowID is empty. The result is wrapped in a windowClosedMsg
+// the Update loop consumes to refresh the sidebar snapshot.
+func (m Model) closeManagedWindow(windowID string) tea.Cmd {
+	if m.windowCloser == nil || windowID == "" {
+		return nil
+	}
+	closer := m.windowCloser
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+		defer cancel()
+		err := closer(ctx, windowID)
+		return windowClosedMsg{windowID: windowID, err: err}
 	}
 }
 

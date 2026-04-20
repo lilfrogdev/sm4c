@@ -46,6 +46,18 @@ type Config struct {
 	// On disk this is a Go duration string: "5s", "250ms", "1m30s".
 	MonitorSilence Duration `toml:"monitor_silence"`
 
+	// SessionPollInterval is how often the TUI re-runs `tmux
+	// list-windows` to refresh the sidebar. The default ("1s") is
+	// effectively "live" on any healthy socket; operators running
+	// on constrained hardware or over slow sockets can raise it to
+	// reduce subprocess load at the cost of rename/close-lag. On
+	// disk this is a Go duration string: "1s", "500ms", "2s".
+	//
+	// Zero or negative means "fetch once at startup and do not
+	// poll" — useful for snapshot-only environments (CI, smoke
+	// tests) where polling would waste a ticker goroutine.
+	SessionPollInterval Duration `toml:"session_poll_interval"`
+
 	// LogLevel controls slog output. Valid: "debug", "info", "warn",
 	// "error".
 	LogLevel string `toml:"log_level"`
@@ -54,10 +66,11 @@ type Config struct {
 // Default returns the built-in defaults. Safe for concurrent read.
 func Default() Config {
 	return Config{
-		SocketName:     "sm4c",
-		PrefixKey:      "C-a",
-		MonitorSilence: Duration(5 * time.Second),
-		LogLevel:       "info",
+		SocketName:          "sm4c",
+		PrefixKey:           "C-a",
+		MonitorSilence:      Duration(5 * time.Second),
+		SessionPollInterval: Duration(1 * time.Second),
+		LogLevel:            "info",
 	}
 }
 
@@ -112,6 +125,11 @@ func (c Config) Validate() error {
 	if c.MonitorSilence.AsDuration() < 0 {
 		return errors.New("config: monitor_silence must be non-negative")
 	}
+	// session_poll_interval of zero or negative means "no polling"
+	// and is allowed; only a positive value is meaningful as a
+	// cadence. We do not upper-bound it: an operator asking for
+	// "10m" has made a deliberate tradeoff.
+	_ = c.SessionPollInterval
 	if c.TmuxBin != "" && !filepath.IsAbs(c.TmuxBin) {
 		return fmt.Errorf("config: tmux_bin must be absolute, got %q", c.TmuxBin)
 	}
