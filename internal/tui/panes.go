@@ -4,11 +4,12 @@ import (
 	"context"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/vt"
 )
 
-// panes.go carries the M3b.1 data path: a PaneEvent value type, the
+// panes.go carries the pane-preview data path: a PaneEvent value type, the
 // two dependency-injection seams (PaneEventStream, ActivePaneResolver)
-// the Model calls into, a per-pane ring buffer, and the message
+// the Model calls into, a per-pane VT emulator, and the message
 // types the Bubble Tea runtime delivers.
 //
 // Design mirrors sessions.go on purpose: everything here is side-
@@ -23,9 +24,10 @@ import (
 // sm4c socket, and the TUI filters by pane ID.
 //
 // Data is the already-unescaped raw bytes the pane produced, exactly
-// as they appeared on the pane's local terminal. The TUI treats them
-// as opaque until VT emulation lands in M3b.2; for M3b.1 we strip
-// them down to printable ASCII before rendering.
+// as they appeared on the pane's local terminal. Starting in M3b.2
+// the TUI feeds these bytes into a charmbracelet/x/vt emulator
+// so ANSI styling, cursor positioning, and line wrapping render
+// identically to a native tmux attach.
 type PaneEvent struct {
 	PaneID string
 	Data   []byte
@@ -55,85 +57,82 @@ type PaneEventStream func() <-chan PaneEvent
 // treats resolution as disabled.
 type ActivePaneResolver func(ctx context.Context, windowID string) (paneID string, err error)
 
-// paneBufferBytes caps the per-pane ring buffer. A few kilobytes is
-// plenty for a raw-bytes preview (enough to cover one screen of
-// output on any realistic terminal); M3b.2's VT emulator will have
-// its own bounded grid and this raw buffer will go away.
-const paneBufferBytes = 8 * 1024
+// defaultPaneWidth / defaultPaneHeight are the emulator dimensions
+// used before we have seen a tea.WindowSizeMsg. They roughly match
+// an 80x24 terminal so a fresh model with no resize still produces
+// sensible output in unit tests. Once the runtime delivers a real
+// size, resizePaneTerminals replaces these on every existing pane
+// emulator.
+const (
+	defaultPaneWidth  = 80
+	defaultPaneHeight = 24
+)
 
-// paneBuffer is a fixed-size ring that keeps the most recent N
-// bytes produced by a pane. We deliberately discard older bytes
-// silently — the right pane is a live preview, not a scrollback
-// viewer.
-type paneBuffer struct {
-	data []byte
-	size int
-	head int
+// paneTerminal pairs a VT emulator with a "has received any bytes
+// yet" flag. The flag lets renderRightPaneBody distinguish "emulator
+// exists but is still the post-boot blank screen" from "emulator has
+// drawn something", so we can keep showing a "waiting for output"
+// hint until claude actually emits bytes instead of flashing an
+// empty grid.
+type paneTerminal struct {
+	emu     *vt.Emulator
+	written bool
 }
 
-// newPaneBuffer allocates a fresh ring of the configured capacity.
-// Kept internal so the Model can mint one per newly-seen pane ID on
-// demand without exposing the ring type to callers.
-func newPaneBuffer() *paneBuffer {
-	return &paneBuffer{data: make([]byte, paneBufferBytes)}
+// newPaneTerminal constructs a fresh emulator at the given
+// dimensions. Callers are expected to pass positive integers; width
+// and height are clamped to a minimum of 1 on the emulator side, but
+// we clamp defensively too to keep internal invariants obvious.
+func newPaneTerminal(width, height int) *paneTerminal {
+	if width < 1 {
+		width = 1
+	}
+	if height < 1 {
+		height = 1
+	}
+	return &paneTerminal{emu: vt.NewEmulator(width, height)}
 }
 
-// append appends p to the ring, discarding the oldest bytes when
-// capacity is exceeded. Safe to call with an empty slice.
-func (b *paneBuffer) append(p []byte) {
-	if len(p) == 0 {
+// write feeds a chunk of bytes to the emulator and records that we
+// have drawn something. The VT parser accepts partial escape
+// sequences across Write calls, so chunk boundaries from tmux
+// `%output` notifications are safe.
+func (p *paneTerminal) write(data []byte) {
+	if p == nil || p.emu == nil || len(data) == 0 {
 		return
 	}
-	cap := len(b.data)
-	// If this chunk alone is larger than the ring, keep just the
-	// tail: everything before it would be overwritten anyway.
-	if len(p) >= cap {
-		copy(b.data, p[len(p)-cap:])
-		b.head = 0
-		b.size = cap
-		return
-	}
-	// Two-phase write: from head to end of the ring, then wrap.
-	n := copy(b.data[b.head:], p)
-	if n < len(p) {
-		copy(b.data, p[n:])
-	}
-	b.head = (b.head + len(p)) % cap
-	if b.size < cap {
-		if b.size+len(p) > cap {
-			b.size = cap
-		} else {
-			b.size += len(p)
-		}
-	}
+	_, _ = p.emu.Write(data)
+	p.written = true
 }
 
-// snapshot returns a fresh linear copy of the ring's current
-// contents in oldest-to-newest order. We copy on every read rather
-// than handing back an internal slice because the Model's render
-// path retains the value across frames, and the ring keeps being
-// written to by incoming paneDataMsg handlers.
-func (b *paneBuffer) snapshot() []byte {
-	if b.size == 0 {
-		return nil
+// resize updates the emulator's grid dimensions. No-op when either
+// dimension is non-positive or the terminal is nil.
+func (p *paneTerminal) resize(width, height int) {
+	if p == nil || p.emu == nil {
+		return
 	}
-	out := make([]byte, b.size)
-	cap := len(b.data)
-	// The oldest byte starts at (head - size + cap) % cap.
-	start := (b.head - b.size + cap) % cap
-	if start+b.size <= cap {
-		copy(out, b.data[start:start+b.size])
-		return out
+	if width < 1 || height < 1 {
+		return
 	}
-	first := cap - start
-	copy(out, b.data[start:])
-	copy(out[first:], b.data[:b.size-first])
-	return out
+	p.emu.Resize(width, height)
+}
+
+// render returns the emulator's current screen as an ANSI-encoded
+// string: one line per row, each clipped to the emulator width,
+// with SGR escapes embedded so colors and attributes survive the
+// handoff to the outer terminal. The caller is responsible for
+// trimming trailing empty lines if the surrounding layout prefers
+// tight content.
+func (p *paneTerminal) render() string {
+	if p == nil || p.emu == nil {
+		return ""
+	}
+	return p.emu.Render()
 }
 
 // paneDataMsg is delivered when the pane event stream yielded a
 // chunk. The Update handler forwards Data into the matching pane's
-// ring buffer and re-arms the read.
+// VT emulator and re-arms the read.
 type paneDataMsg struct {
 	paneID string
 	data   []byte

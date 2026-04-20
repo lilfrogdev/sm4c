@@ -20,11 +20,15 @@ func TestPreviewRenderedView(t *testing.T) {
 	t.Parallel()
 
 	// Build a model with live pane data so the preview case shows
-	// the M3b.1 right-pane render path. We pin the resolver output
+	// the M3b.2 VT-rendered right-pane. We pin the resolver output
 	// via paneResolvedMsg rather than driving a fake ctx round-trip.
 	// The renderer suppresses pane content when both paneEvents and
 	// paneResolver are nil, so wire a stub resolver to flip that
 	// branch — we never call it here, paneResolvedMsg bypasses it.
+	// The window size MUST be delivered before the pane data so the
+	// emulator is created at the right-pane body dimensions rather
+	// than the default 80x24 (which on a 140-wide preview would
+	// crop the right-hand edge of the emulator).
 	previewSessions := []Session{
 		{WindowID: "@1", Name: "refactor-auth", Active: true},
 		{WindowID: "@4", Name: "spike-queue"},
@@ -34,16 +38,21 @@ func TestPreviewRenderedView(t *testing.T) {
 	})
 	withPreview := NewModel(stubLister(previewSessions, nil), 0, nil, stubResolver, "")
 	withPreview = withPreview.handleSessions(sessionsMsg{sessions: previewSessions})
+	sz, _ := withPreview.Update(tea.WindowSizeMsg{Width: 140, Height: 32})
+	withPreview = sz.(Model)
 	n1, _ := withPreview.Update(paneResolvedMsg{windowID: "@1", paneID: "%11"})
 	withPreview = n1.(Model)
+	// Terminals send \r\n between lines (LF alone advances the row
+	// but leaves the column where it was, producing a staircase).
+	// That's what tmux forwards verbatim on its %output channel.
 	n2, _ := withPreview.Update(paneDataMsg{paneID: "%11", data: []byte(
-		"$ claude --help\n" +
-			"Usage: claude [options] [prompt]\n" +
-			"\n" +
-			"Options:\n" +
-			"  -n, --name <string>   session name\n" +
-			"  -h, --help            show help\n" +
-			"$ _\n")})
+		"$ claude --help\r\n" +
+			"Usage: claude [options] [prompt]\r\n" +
+			"\r\n" +
+			"Options:\r\n" +
+			"  -n, --name <string>   session name\r\n" +
+			"  -h, --help            show help\r\n" +
+			"$ _\r\n")})
 	withPreview = n2.(Model)
 
 	cases := []struct {

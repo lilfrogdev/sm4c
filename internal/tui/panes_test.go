@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -10,88 +9,111 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// panes_test.go covers the M3b.1 pane-preview state machine as a
+// panes_test.go covers the M3b.2 pane-preview state machine as a
 // set of pure (Model, Msg) -> (Model, Cmd) transitions. As with
 // app_test.go, we drive Update with synthetic messages and never
 // spin up a real Bubble Tea runtime, a real tmux server, or a
 // real pane.
+//
+// The preview now runs through a charmbracelet/x/vt emulator
+// instead of a raw-bytes ring, so the assertions here look through
+// the VT's String() (plain) output rather than comparing byte
+// slices: ANSI escapes are interpreted, wrapping is row-based, and
+// the screen has a fixed grid.
 
-// TestPaneBufferAppendAndSnapshot pins the contract for the ring:
-// it returns only what was written, in order, with a hard cap at
-// paneBufferBytes. The implementation is compact but uses pointer
-// arithmetic (head, size), so the cases below target the boundary
-// conditions that would fail a naive linear buffer.
-func TestPaneBufferAppendAndSnapshot(t *testing.T) {
+// TestPaneTerminalWriteAndRenderRoundTrip pins the shape of the
+// new pane backing: raw bytes go in, the interpreted screen comes
+// back out. We read the plain String() snapshot for assertions so
+// this test does not couple to the exact SGR encoding Render emits.
+func TestPaneTerminalWriteAndRenderRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	t.Run("empty snapshot is nil", func(t *testing.T) {
+	t.Run("empty terminal renders blank", func(t *testing.T) {
 		t.Parallel()
-		b := newPaneBuffer()
-		if got := b.snapshot(); got != nil {
-			t.Fatalf("empty snapshot = %q; want nil", got)
+		p := newPaneTerminal(20, 4)
+		if p.written {
+			t.Fatalf("fresh paneTerminal reports written=true")
+		}
+		// The VT emulator renders a grid; its plain-text snapshot
+		// for an untouched screen is a sequence of blank rows.
+		// Whitespace-only is the contract we rely on for the
+		// "waiting for output" hint to stay visible.
+		if got := strings.TrimSpace(p.emu.String()); got != "" {
+			t.Fatalf("fresh terminal plain = %q; want blank", got)
 		}
 	})
 
-	t.Run("small write round-trips", func(t *testing.T) {
+	t.Run("plain bytes land on the grid verbatim", func(t *testing.T) {
 		t.Parallel()
-		b := newPaneBuffer()
-		b.append([]byte("hello"))
-		if got := b.snapshot(); !bytes.Equal(got, []byte("hello")) {
-			t.Fatalf("snapshot = %q; want hello", got)
+		p := newPaneTerminal(20, 4)
+		p.write([]byte("hello world"))
+		if !p.written {
+			t.Fatalf("write did not flip written flag")
+		}
+		if got := p.emu.String(); !strings.Contains(got, "hello world") {
+			t.Fatalf("terminal plain = %q; want to contain 'hello world'", got)
 		}
 	})
 
-	t.Run("multiple appends preserve order", func(t *testing.T) {
+	t.Run("ansi sequences are consumed not echoed", func(t *testing.T) {
 		t.Parallel()
-		b := newPaneBuffer()
-		b.append([]byte("one "))
-		b.append([]byte("two "))
-		b.append([]byte("three"))
-		if got := b.snapshot(); !bytes.Equal(got, []byte("one two three")) {
-			t.Fatalf("snapshot = %q; want 'one two three'", got)
+		// A raw CSI SGR (\x1b[1;31m) and a reset (\x1b[0m) must be
+		// absorbed by the parser: the plain-text snapshot should
+		// contain only the visible payload, never the raw ESC byte.
+		// This is the defensive posture we relied on stripToPrintable
+		// for in M3b.1 — now the emulator provides it.
+		p := newPaneTerminal(40, 4)
+		p.write([]byte("\x1b[1;31mred\x1b[0m then plain"))
+		plain := p.emu.String()
+		if strings.ContainsRune(plain, 0x1b) {
+			t.Fatalf("raw ESC byte leaked into plain snapshot: %q", plain)
+		}
+		if !strings.Contains(plain, "red") || !strings.Contains(plain, "plain") {
+			t.Fatalf("visible payload missing from snapshot: %q", plain)
 		}
 	})
 
-	t.Run("overflow keeps most recent bytes", func(t *testing.T) {
+	t.Run("split writes re-assemble across chunk boundaries", func(t *testing.T) {
 		t.Parallel()
-		b := newPaneBuffer()
-		// Fill to cap + 100, then verify only the last cap bytes
-		// survive. This exercises the wrap-around branch.
-		first := bytes.Repeat([]byte{'a'}, paneBufferBytes-100)
-		b.append(first)
-		extra := bytes.Repeat([]byte{'b'}, 200)
-		b.append(extra)
-		got := b.snapshot()
-		if len(got) != paneBufferBytes {
-			t.Fatalf("snapshot len = %d; want %d", len(got), paneBufferBytes)
+		// tmux %output chunks are not guaranteed to align with
+		// escape sequences. The VT parser's internal state must
+		// carry over between Write calls; if it didn't, a chunk
+		// boundary mid-escape would corrupt the screen.
+		p := newPaneTerminal(40, 4)
+		p.write([]byte("\x1b[1"))
+		p.write([]byte(";31mred\x1b[0m done"))
+		plain := p.emu.String()
+		if strings.ContainsRune(plain, 0x1b) {
+			t.Fatalf("ESC leaked from split-escape write: %q", plain)
 		}
-		// The tail is the most recently appended bytes.
-		if !bytes.HasSuffix(got, bytes.Repeat([]byte{'b'}, 200)) {
-			t.Fatalf("snapshot tail missing latest 200 'b' bytes")
-		}
-		// The head must contain 'a' (some of it; exactly paneBufferBytes-200 of them).
-		if got[0] != 'a' {
-			t.Fatalf("snapshot[0] = %q; want 'a'", got[0])
+		if !strings.Contains(plain, "red") || !strings.Contains(plain, "done") {
+			t.Fatalf("split-escape content missing: %q", plain)
 		}
 	})
 
-	t.Run("single write larger than capacity keeps tail", func(t *testing.T) {
+	t.Run("resize changes emulator grid", func(t *testing.T) {
 		t.Parallel()
-		b := newPaneBuffer()
-		big := make([]byte, paneBufferBytes+500)
-		for i := range big {
-			big[i] = byte(i % 256)
+		p := newPaneTerminal(20, 4)
+		p.resize(40, 10)
+		if got := p.emu.Width(); got != 40 {
+			t.Fatalf("after resize, width = %d; want 40", got)
 		}
-		b.append(big)
-		got := b.snapshot()
-		if len(got) != paneBufferBytes {
-			t.Fatalf("snapshot len = %d; want %d", len(got), paneBufferBytes)
+		if got := p.emu.Height(); got != 10 {
+			t.Fatalf("after resize, height = %d; want 10", got)
 		}
-		// The kept region should be the last paneBufferBytes bytes
-		// of big, verbatim.
-		want := big[len(big)-paneBufferBytes:]
-		if !bytes.Equal(got, want) {
-			t.Fatalf("snapshot mismatch on oversize write")
+	})
+
+	t.Run("render preserves ansi styling", func(t *testing.T) {
+		t.Parallel()
+		// The styled snapshot MUST re-emit SGR escapes so colors
+		// survive the handoff to the outer terminal. We don't pin
+		// the exact byte sequence (lipgloss / vt may normalize),
+		// only that some ESC-prefixed SGR payload is present.
+		p := newPaneTerminal(40, 4)
+		p.write([]byte("\x1b[31mred\x1b[0m"))
+		styled := p.render()
+		if !strings.ContainsRune(styled, 0x1b) {
+			t.Fatalf("styled render stripped all ANSI; got %q", styled)
 		}
 	})
 }
@@ -104,14 +126,13 @@ func stubStream(ch <-chan PaneEvent) PaneEventStream {
 	return func() <-chan PaneEvent { return ch }
 }
 
-// stubResolver returns an ActivePaneResolver that records every
-// windowID it's asked about and returns a deterministic pane ID
-// per window. If a window matches wantErrFor, the stub returns the
-// canned error instead.
+// resolverStub records every windowID it has been asked about and
+// returns a deterministic pane ID per window. If a window matches
+// wantErrFor, the stub returns the canned error instead.
 type resolverStub struct {
-	panes     map[string]string
+	panes      map[string]string
 	wantErrFor string
-	called    []string
+	called     []string
 }
 
 func newResolverStub(panes map[string]string, errWin string) *resolverStub {
@@ -128,20 +149,31 @@ func (r *resolverStub) resolver() ActivePaneResolver {
 	}
 }
 
-func TestPaneDataBuffersByPaneID(t *testing.T) {
+func TestPaneDataFeedsPerPaneEmulator(t *testing.T) {
 	t.Parallel()
-	// Deliver two chunks for two different panes; snapshots must
-	// be independent, so bytes from pane A never leak into pane B.
+	// Deliver two chunks for two different panes; each pane's
+	// emulator must see only its own bytes, so pane-A content
+	// never leaks into pane-B.
 	m := NewModel(nil, 0, nil, nil, "")
 	m = m.handlePaneData(paneDataMsg{paneID: "%1", data: []byte("alpha")})
 	m = m.handlePaneData(paneDataMsg{paneID: "%2", data: []byte("beta")})
 	m = m.handlePaneData(paneDataMsg{paneID: "%1", data: []byte(" more")})
 
-	if got := string(m.paneBuffers["%1"].snapshot()); got != "alpha more" {
-		t.Fatalf("pane %%1 snapshot = %q; want 'alpha more'", got)
+	t1 := m.paneTerminals["%1"]
+	t2 := m.paneTerminals["%2"]
+	if t1 == nil || t2 == nil {
+		t.Fatalf("expected terminals for both panes: %%1=%v %%2=%v", t1, t2)
 	}
-	if got := string(m.paneBuffers["%2"].snapshot()); got != "beta" {
-		t.Fatalf("pane %%2 snapshot = %q; want 'beta'", got)
+	p1 := t1.emu.String()
+	p2 := t2.emu.String()
+	if !strings.Contains(p1, "alpha more") {
+		t.Fatalf("pane %%1 plain = %q; want to contain 'alpha more'", p1)
+	}
+	if strings.Contains(p1, "beta") {
+		t.Fatalf("pane %%1 plain leaked pane %%2 bytes: %q", p1)
+	}
+	if !strings.Contains(p2, "beta") {
+		t.Fatalf("pane %%2 plain = %q; want to contain 'beta'", p2)
 	}
 }
 
@@ -149,10 +181,10 @@ func TestPaneDataWithEmptyIDIsIgnored(t *testing.T) {
 	t.Parallel()
 	// A paneDataMsg with an empty pane ID is defensive nonsense
 	// (the CLI bridge filters on OutputEvent, which always has a
-	// pane ID). The Model must not allocate a buffer for it.
+	// pane ID). The Model must not allocate an emulator for it.
 	m := NewModel(nil, 0, nil, nil, "")
 	m = m.handlePaneData(paneDataMsg{paneID: "", data: []byte("x")})
-	if _, ok := m.paneBuffers[""]; ok {
+	if _, ok := m.paneTerminals[""]; ok {
 		t.Fatalf("empty-paneID data was buffered under key %q", "")
 	}
 }
@@ -321,11 +353,11 @@ func TestSessionsMsgPrunesStaleWindowEntries(t *testing.T) {
 	}
 }
 
-func TestRightPaneShowsBufferForHighlightedSession(t *testing.T) {
+func TestRightPaneShowsEmulatorForHighlightedSession(t *testing.T) {
 	t.Parallel()
 	// End-to-end: a session is highlighted, its pane is resolved,
 	// and the stream has delivered bytes. The rendered right pane
-	// must include the latest portion of those bytes.
+	// must include the most recent visible payload.
 	m := withSessions([]Session{{WindowID: "@1", Name: "refactor"}})
 	m.paneResolver = newResolverStub(map[string]string{"@1": "%10"}, "").resolver()
 
@@ -333,61 +365,91 @@ func TestRightPaneShowsBufferForHighlightedSession(t *testing.T) {
 	next, _ := m.Update(paneResolvedMsg{windowID: "@1", paneID: "%10"})
 	m = next.(Model)
 
-	// Feed bytes.
-	next2, _ := m.Update(paneDataMsg{paneID: "%10", data: []byte("hello world\n")})
-	m = next2.(Model)
-
 	// Give the model a realistic terminal size so the split layout
-	// kicks in; width/height are stashed by WindowSizeMsg.
+	// kicks in; width/height are stashed by WindowSizeMsg and the
+	// pane emulator is resized to the body dims.
 	next3, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = next3.(Model)
 
+	// Feed bytes.
+	next2, _ := m.Update(paneDataMsg{paneID: "%10", data: []byte("hello world\r\n")})
+	m = next2.(Model)
+
 	out := m.View()
 	if !strings.Contains(out, "hello world") {
-		t.Fatalf("right pane missing buffered bytes:\n%s", out)
+		t.Fatalf("right pane missing emulator payload:\n%s", out)
 	}
 	if !strings.Contains(out, "refactor") {
 		t.Fatalf("right pane missing session name:\n%s", out)
 	}
 }
 
-func TestRightPaneStripsNonPrintableBytes(t *testing.T) {
+func TestRightPaneEmulatorAbsorbsRawControlSequences(t *testing.T) {
 	t.Parallel()
-	// Raw tmux output contains ANSI escapes, UTF-8, and control
-	// bytes. M3b.1 is read-only raw-preview, so stripToPrintable
-	// must drop everything non-ASCII-printable so nothing a
-	// malicious claude could emit corrupts the outer terminal.
-	// This pins the policy at the rendering boundary.
-	raw := []byte("safe\x1b[2Jhidden\x07bell\xffnon-ascii")
-	got := stripToPrintable(raw, 200, 10)
-	for _, bad := range []byte{0x1b, 0x07, 0xff} {
-		if bytes.IndexByte([]byte(got), bad) >= 0 {
-			t.Fatalf("stripToPrintable left byte 0x%02x in output: %q", bad, got)
+	// Raw tmux output contains ANSI escapes and control bytes.
+	// The VT emulator parses them — nothing a pane emits should
+	// appear in the rendered view as a literal ESC byte. This is
+	// the defensive posture stripToPrintable provided in M3b.1
+	// and the emulator provides natively in M3b.2.
+	m := withSessions([]Session{{WindowID: "@1", Name: "tty"}})
+	m.paneResolver = newResolverStub(map[string]string{"@1": "%10"}, "").resolver()
+	next, _ := m.Update(paneResolvedMsg{windowID: "@1", paneID: "%10"})
+	m = next.(Model)
+	next2, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = next2.(Model)
+
+	// \x1b[2J clears the screen; \x07 is BEL (interpreted, not
+	// rendered); \x1b[31m sets red; \x1b[0m resets.
+	next3, _ := m.Update(paneDataMsg{
+		paneID: "%10",
+		data:   []byte("before\x1b[2Jafter\x07\x1b[31mred\x1b[0m tail"),
+	})
+	m = next3.(Model)
+
+	// The VT emulator consumes escape sequences; the plain-text
+	// snapshot should never contain a raw ESC byte. The styled
+	// render (which is what the View emits) may re-emit SGR
+	// escapes for color, so we check the plain snapshot of the
+	// emulator directly.
+	term := m.paneTerminals["%10"]
+	if term == nil {
+		t.Fatalf("expected emulator for %%10")
+	}
+	plain := term.emu.String()
+	for _, bad := range []byte{0x1b, 0x07} {
+		if strings.IndexByte(plain, bad) >= 0 {
+			t.Fatalf("emulator plain snapshot leaked byte 0x%02x: %q", bad, plain)
 		}
 	}
-	// Printable content must survive verbatim.
-	if !strings.Contains(got, "safe") || !strings.Contains(got, "bell") || !strings.Contains(got, "non-ascii") {
-		t.Fatalf("stripToPrintable lost printable text: %q", got)
+	// "before" was cleared by \x1b[2J so it must not survive.
+	if strings.Contains(plain, "before") {
+		t.Fatalf("\\x1b[2J did not clear: %q", plain)
+	}
+	// "after" and "tail" must be visible.
+	if !strings.Contains(plain, "after") || !strings.Contains(plain, "tail") {
+		t.Fatalf("visible payload missing from snapshot: %q", plain)
 	}
 }
 
-func TestRightPaneClipsToRecentLines(t *testing.T) {
+func TestWindowResizePropagatesToExistingEmulators(t *testing.T) {
 	t.Parallel()
-	// When the buffer contains many lines, only the most recent
-	// maxLines should be rendered. This is the "live tail" shape
-	// expected of a pane preview.
-	var lines []string
-	for i := 0; i < 100; i++ {
-		lines = append(lines, "line-"+intToString(i))
+	// A terminal resize while a pane emulator exists must resize
+	// that emulator too; otherwise claude keeps drawing into a
+	// stale grid and wrapping no longer matches what the outer
+	// terminal shows. This pins the geometry sync.
+	m := NewModel(nil, 0, nil, nil, "")
+	// Boot an emulator at defaults by feeding any bytes.
+	m = m.handlePaneData(paneDataMsg{paneID: "%10", data: []byte("x")})
+	if w, h := m.paneTerminals["%10"].emu.Width(), m.paneTerminals["%10"].emu.Height(); w != defaultPaneWidth || h != defaultPaneHeight {
+		t.Fatalf("fresh emulator dims = %dx%d; want %dx%d", w, h, defaultPaneWidth, defaultPaneHeight)
 	}
-	raw := []byte(strings.Join(lines, "\n"))
-	got := stripToPrintable(raw, 200, 5)
-	// line-95..line-99 must be present; line-50 must not.
-	if !strings.Contains(got, "line-99") || !strings.Contains(got, "line-95") {
-		t.Fatalf("recent lines missing from clipped output:\n%s", got)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 50})
+	m = next.(Model)
+	if w := m.paneTerminals["%10"].emu.Width(); w != m.paneViewW {
+		t.Fatalf("emulator width = %d; want paneViewW = %d", w, m.paneViewW)
 	}
-	if strings.Contains(got, "line-50") {
-		t.Fatalf("older line leaked into clipped output:\n%s", got)
+	if h := m.paneTerminals["%10"].emu.Height(); h != m.paneViewH {
+		t.Fatalf("emulator height = %d; want paneViewH = %d", h, m.paneViewH)
 	}
 }
 

@@ -138,13 +138,22 @@ type Model struct {
 	// sessions.
 	paneErrByWindow map[string]error
 
-	// paneBuffers holds the ring buffer for every pane the stream
+	// paneTerminals holds a VT emulator for every pane the stream
 	// has delivered bytes for. Keyed by pane ID (as produced by
-	// ActivePaneResolver / %output). Buffers are created lazily on
-	// first write; there is no eviction in M3b.1 because the byte
-	// cap is small and the number of live panes is bounded by the
-	// number of sm4c-managed windows.
-	paneBuffers map[string]*paneBuffer
+	// ActivePaneResolver / %output). Emulators are created lazily on
+	// first write at the current right-pane body dimensions; there
+	// is no eviction because the number of live panes is bounded by
+	// the number of sm4c-managed windows (typically tens).
+	paneTerminals map[string]*paneTerminal
+
+	// paneViewW / paneViewH track the dimensions every pane
+	// emulator has been sized to. They are derived from the
+	// right-pane body geometry on each tea.WindowSizeMsg, and any
+	// newly-minted paneTerminal is constructed at these dims so a
+	// pane that first appears after a resize is not stuck at the
+	// default 80x24.
+	paneViewW int
+	paneViewH int
 
 	// resolvedWindowID is the last window ID we issued a resolver
 	// call for. Used to debounce: if j/k navigates to a row whose
@@ -192,7 +201,9 @@ func NewModel(
 		paneResolver:     paneResolver,
 		paneByWindow:     make(map[string]string),
 		paneErrByWindow:  make(map[string]error),
-		paneBuffers:      make(map[string]*paneBuffer),
+		paneTerminals:    make(map[string]*paneTerminal),
+		paneViewW:        defaultPaneWidth,
+		paneViewH:        defaultPaneHeight,
 	}
 	if paneStream != nil {
 		m.paneEvents = paneStream()
@@ -246,12 +257,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		// Stash the terminal dimensions so the view can size the
-		// sidebar column and the right-pane placeholder correctly.
-		// We do NOT emit a cmd: Bubble Tea's default behavior is to
-		// re-render on the next tick, which is exactly what we
-		// want.
+		// sidebar column and the right-pane correctly. We also
+		// recompute the right-pane body geometry and resize every
+		// active VT emulator to match — claude draws for whatever
+		// grid tmux tells it about, and keeping the emulator sized
+		// to the visible area is what keeps wrapping / cursor
+		// positioning honest. We do NOT emit a cmd: Bubble Tea's
+		// default behavior is to re-render on the next tick, which
+		// is exactly what we want.
 		m.width = msg.Width
 		m.height = msg.Height
+		m.syncPaneViewport()
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -289,10 +305,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // makes the "no sessions" branch in View a single len-check.
 //
 // We also prune paneByWindow / paneErrByWindow entries for windows
-// that are no longer in the snapshot. The corresponding paneBuffers
-// are retained: a window closing does not necessarily mean its pane
-// is gone from tmux's point of view within this tick, and the next
-// stream event would simply re-populate them.
+// that are no longer in the snapshot. The corresponding VT
+// emulators in paneTerminals are retained: a window closing does
+// not necessarily mean its pane is gone from tmux's point of view
+// within this tick, and the next stream event would simply re-
+// populate them.
 func (m Model) handleSessions(msg sessionsMsg) Model {
 	m.ready = true
 	m.listErr = msg.err
@@ -341,22 +358,74 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 	return m
 }
 
-// handlePaneData appends a chunk of bytes into the ring buffer for
+// handlePaneData feeds a chunk of bytes into the VT emulator for
 // its pane. Unknown pane IDs are accepted: the stream carries data
 // for every pane on the sm4c socket, not just the one we are
-// previewing, so we happily buffer them and let the render path
-// decide what to show.
+// previewing, so we happily feed them and let the render path
+// decide what to show. Emulators are minted lazily at the current
+// paneViewW / paneViewH so a pane that first appears after a
+// terminal resize is not stuck at the default 80x24.
 func (m Model) handlePaneData(msg paneDataMsg) Model {
 	if msg.paneID == "" {
 		return m
 	}
-	buf, ok := m.paneBuffers[msg.paneID]
+	term, ok := m.paneTerminals[msg.paneID]
 	if !ok {
-		buf = newPaneBuffer()
-		m.paneBuffers[msg.paneID] = buf
+		term = newPaneTerminal(m.paneViewW, m.paneViewH)
+		m.paneTerminals[msg.paneID] = term
 	}
-	buf.append(msg.data)
+	term.write(msg.data)
 	return m
+}
+
+// syncPaneViewport recomputes the right-pane body dimensions from
+// the current window size and resizes every existing emulator to
+// match. Called from the WindowSizeMsg handler. When the window is
+// too narrow for a split layout or we have not yet seen a size, we
+// leave the defaults in place; the fallback dims are still a sane
+// 80x24 so rendering works under tests that never emit a size.
+func (m *Model) syncPaneViewport() {
+	w, h := m.rightPaneBodyDims()
+	if w < 1 || h < 1 {
+		return
+	}
+	if w == m.paneViewW && h == m.paneViewH {
+		return
+	}
+	m.paneViewW = w
+	m.paneViewH = h
+	for _, t := range m.paneTerminals {
+		t.resize(w, h)
+	}
+}
+
+// rightPaneBodyDims returns the interior dimensions of the right
+// pane body — width and height of the region where the VT emulator
+// should draw. Derived from the current WindowSizeMsg: a narrow
+// terminal (or one we have not sized yet) returns zeros and the
+// caller keeps the defaults. The numbers account for the one-col
+// padding lipgloss applies inside rightPaneStyle and for the header
+// + blank separator line renderRightPane prepends.
+func (m Model) rightPaneBodyDims() (int, int) {
+	if m.width < minSplitWidth || m.height < 1 {
+		return 0, 0
+	}
+	sidebarW := m.sidebarWidth()
+	rightW := m.width - sidebarW - 1
+	if rightW < 1 {
+		return 0, 0
+	}
+	// rightPaneStyle has Padding(0, 1) — 1 col on each side.
+	bodyW := rightW - 2
+	if bodyW < 1 {
+		return 0, 0
+	}
+	// Header + blank separator = 2 lines consumed before body.
+	bodyH := m.height - 2
+	if bodyH < 1 {
+		return 0, 0
+	}
+	return bodyW, bodyH
 }
 
 // handlePaneResolved records the (windowID, paneID) mapping the
@@ -608,7 +677,7 @@ func (m Model) renderSidebarView() string {
 	right := rightPaneStyle.
 		Width(rightW).
 		Height(m.height).
-		Render(m.renderRightPane(rightW, m.height))
+		Render(m.renderRightPane())
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, right)
 }
@@ -650,23 +719,25 @@ func (m Model) renderSidebarColumn() string {
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
-// renderRightPane paints the M3b.1 right-hand column: a live raw-
-// bytes preview of the highlighted session's tmux pane, with a
-// fallback for every state that has no preview to show (no lister,
-// no sessions, stream down, pane not yet resolved).
+// renderRightPane paints the right-hand column: a live VT-emulated
+// preview of the highlighted session's tmux pane, with a fallback
+// for every state that has no preview to show (no lister, no
+// sessions, stream down, pane not yet resolved).
 //
-// M3b.2 will replace the raw-byte path with a VT-rendered screen
-// grid; until then, we strip non-printables so a stray ANSI escape
-// or control byte cannot corrupt the outer terminal. This matches
-// the defensive posture we take for safe.Label on window titles.
+// Starting in M3b.2, the body is the output of a charmbracelet/x/vt
+// emulator fed with the pane's raw bytes, so ANSI styling, cursor
+// motion, and line wrapping all survive the handoff — the preview
+// looks identical to a native tmux attach within the emulator's
+// grid. The VT parser absorbs every control sequence before we
+// render, so a stray OSC / APC / DCS escape from the pane cannot
+// corrupt the outer terminal.
 //
-// The width/height args are the interior dimensions of the right
-// column (i.e. after lipgloss padding and border accounting). They
-// bound the preview so the last N visible lines are all that remain
-// visible — older bytes scroll off the top just like a real pane.
-func (m Model) renderRightPane(width, height int) string {
+// The emulator is sized from paneViewW / paneViewH (kept in sync
+// with the right-pane body geometry on every tea.WindowSizeMsg),
+// so what comes out of Render already fits the column.
+func (m Model) renderRightPane() string {
 	header := m.renderRightPaneHeader()
-	body := m.renderRightPaneBody(width, height)
+	body := m.renderRightPaneBody()
 	return header + "\n\n" + body
 }
 
@@ -692,11 +763,11 @@ func (m Model) renderRightPaneHeader() string {
 }
 
 // renderRightPaneBody is the body beneath the header. It returns
-// either the last N lines of the selected pane's ring buffer or a
+// either the VT-emulated screen of the selected pane or a
 // state-appropriate hint line. Keeping every branch in one place
 // makes it easy to reason about what the user will see in each
 // configuration.
-func (m Model) renderRightPaneBody(width, height int) string {
+func (m Model) renderRightPaneBody() string {
 	if len(m.sessions) == 0 || m.highlight < 0 || m.highlight >= len(m.sessions) {
 		return hintStyle.Render("press n to start a new session")
 	}
@@ -717,85 +788,11 @@ func (m Model) renderRightPaneBody(width, height int) string {
 	if !ok {
 		return hintStyle.Render("resolving pane…")
 	}
-	buf, ok := m.paneBuffers[paneID]
-	if !ok || buf == nil {
+	term, ok := m.paneTerminals[paneID]
+	if !ok || term == nil || !term.written {
 		return hintStyle.Render("waiting for output  " + paneID)
 	}
-	raw := buf.snapshot()
-	if len(raw) == 0 {
-		return hintStyle.Render("waiting for output  " + paneID)
-	}
-	// Reserve two lines for the header + blank separator emitted by
-	// renderRightPane. Subtract a little more for lipgloss padding.
-	maxLines := height - 2
-	if maxLines < 3 {
-		maxLines = 3
-	}
-	return stripToPrintable(raw, width, maxLines)
-}
-
-// stripToPrintable reduces a raw byte slice to something safe to
-// render in the right pane: only printable ASCII + newlines, clipped
-// to the last maxLines rows and the rightmost maxWidth columns per
-// row. This is a deliberately conservative transformation; M3b.2
-// replaces it with a full VT emulator.
-func stripToPrintable(raw []byte, maxWidth, maxLines int) string {
-	if maxWidth < 1 {
-		maxWidth = 1
-	}
-	if maxLines < 1 {
-		maxLines = 1
-	}
-	// Split into lines first; each line is then independently
-	// sanitized + clipped. We use \n as the only delimiter — \r is
-	// treated as a non-printable and dropped, which matches what a
-	// VT emulator would do for a CR at column 0.
-	lines := make([]string, 0, 16)
-	var cur []byte
-	for _, b := range raw {
-		switch {
-		case b == '\n':
-			lines = append(lines, clipLine(cur, maxWidth))
-			cur = cur[:0]
-		case b == '\t':
-			cur = append(cur, ' ', ' ', ' ', ' ')
-		case b >= 0x20 && b < 0x7f:
-			cur = append(cur, b)
-		default:
-			// Non-ASCII byte: render as '?' so the outer terminal
-			// never sees a partial UTF-8 sequence or a control
-			// byte. M3b.2 handles UTF-8 + ANSI properly.
-			cur = append(cur, '?')
-		}
-	}
-	if len(cur) > 0 {
-		lines = append(lines, clipLine(cur, maxWidth))
-	}
-	if len(lines) > maxLines {
-		lines = lines[len(lines)-maxLines:]
-	}
-	// Join without lipgloss — we want plain lines; the right pane
-	// style already handles padding and border.
-	out := ""
-	for i, l := range lines {
-		if i > 0 {
-			out += "\n"
-		}
-		out += l
-	}
-	return out
-}
-
-// clipLine keeps the last maxWidth bytes of line (which at this
-// point is already filtered to printable ASCII, so len == column
-// count). Clipping from the left preserves the rightmost — i.e.
-// most recent — columns of tmux output, which is what a user
-// glancing at a pane actually wants.
-func clipLine(line []byte, maxWidth int) string {
-	if len(line) <= maxWidth {
-		return string(line)
-	}
-	return string(line[len(line)-maxWidth:])
+	return term.render()
 }
 
 // sidebarWidth picks the sidebar column's content width for the

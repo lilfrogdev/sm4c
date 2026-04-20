@@ -1,6 +1,6 @@
 // Package tui is sm4c's Bubble Tea front end.
 //
-// Scope in this milestone (M3b.1 — read-only raw-bytes pane preview):
+// Scope in this milestone (M3b.2 — read-only VT-emulated pane preview):
 //
 //   - One unified sidebar layout, shown at all times:
 //
@@ -35,9 +35,12 @@
 //
 //   - Pane preview (right column). When cmd/sm4c/cli has set up the
 //     tmux control-mode bridge, the right column streams %output
-//     events from the highlighted session's active pane into a ring
-//     buffer and paints the latest N lines as raw, printable-ASCII-
-//     only text. Every state the preview can be in has an explicit
+//     events from the highlighted session's active pane into a
+//     per-pane charmbracelet/x/vt emulator and renders the emulator's
+//     ANSI-styled screen on every frame. The emulator is sized to
+//     match the right-pane body on every tea.WindowSizeMsg, so
+//     wrapping and cursor placement stay consistent with the visible
+//     column. Every state the preview can be in has an explicit
 //     rendering:
 //
 //       * no sessions     — "press n to start a new session"
@@ -47,15 +50,15 @@
 //       * resolving       — "resolving pane…"
 //       * resolver error  — "pane lookup failed: <reason>"
 //       * no bytes yet    — "waiting for output  <pane-id>"
-//       * bytes present   — the last few lines of stripToPrintable
-//                           output, clipped to the right column's
-//                           width and height
+//       * bytes present   — the emulator's Render() output, which
+//                           re-emits SGR escapes so the user's
+//                           native terminal palette carries through
 //
-//     The preview is intentionally read-only in M3b.1. M3b.2 swaps
-//     stripToPrintable for a charmbracelet/x/vt emulator; M3b.3
-//     preserves cell attributes; M3b.4 backfills initial screen
-//     state via tmux capture-pane. Input routing and focus toggle
-//     land in M3c. None of those milestones change the sidebar.
+//     The preview is intentionally read-only. M3b.3 will request
+//     tmux to resize the upstream pane to match the emulator's grid
+//     and backfill initial screen state via tmux capture-pane.
+//     Input routing and focus toggle land in M3c. None of those
+//     milestones change the sidebar.
 //
 //   - Key bindings:
 //

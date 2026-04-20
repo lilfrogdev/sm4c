@@ -76,12 +76,12 @@ make build
 
 ## Quickstart
 
-_(M3b.1 ships a read-only raw-bytes pane preview alongside the sidebar. VT-accurate rendering, input routing, status badges, and the compose flow land in M3b.2–M3e.)_
+_(M3b.2 ships a read-only VT-emulated pane preview alongside the sidebar. Input routing, status badges, and the compose flow land in M3c–M3e.)_
 
 ```bash
 # Open the TUI. The sidebar is always visible:
 #   - no sessions yet   → right pane shows "press n to start a new session"
-#   - one or more       → highlighted row streams a raw-bytes preview on the right
+#   - one or more       → highlighted row streams a live VT-emulated preview on the right
 # Bindings:
 #   j / k / ↑ / ↓   move highlight
 #   n               new claude session (bare; compose flow comes in M3e)
@@ -110,11 +110,9 @@ Anything after `--` is forwarded verbatim to `claude`. If a claude arg does not 
 
 To rename a session, type `/rename <newname>` directly inside the claude pane — sm4c does not mediate rename. sm4c does not expose a tmux detach shortcut; every interaction with a session happens inside the TUI. Once M3c lands input routing, `Ctrl+B` will move focus between sidebar and the active pane so you can type into claude without leaving sm4c.
 
-Planned for M3b.2–M3e (not yet shipped):
+Planned for M3b.3–M3e (not yet shipped):
 
-- M3b.2: VT-accurate pane rendering. The current raw-bytes preview is replaced by a `charmbracelet/x/vt` emulator so colors, cursor positioning, and redraws look identical to a native tmux attach.
-- M3b.3: cell-attribute preservation through lipgloss, so bold / faint / reverse / named ANSI colors survive the emulator → lipgloss handoff.
-- M3b.4: scrollback backfill via `tmux capture-pane` so switching to a session shows its current screen immediately instead of blank-until-next-keystroke.
+- M3b.3: pane-size sync + scrollback backfill. sm4c will tell tmux to resize the upstream pane to match the emulator's grid so wrapping stays stable across terminal resizes, and will backfill initial screen state via `tmux capture-pane` so switching to a session shows its current screen immediately instead of blank-until-next-keystroke.
 - M3c: input routing. `Ctrl+B` toggles focus between sidebar and active session; keystrokes flow to claude when the pane has focus; terminal resizes propagate to tmux.
 - M3d: status badges. Live per-session status (idle / running / needs input / done) derived from tmux's `monitor-bell` / `monitor-activity` / `monitor-silence` flags.
 - M3e: compose flow for `n`. Pick the target working directory and set a session name before spawning, replacing today's bare-`claude` stopgap.
