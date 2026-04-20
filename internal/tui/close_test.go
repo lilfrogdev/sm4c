@@ -262,6 +262,51 @@ func TestWindowClosedMsgDropsCachedPaneState(t *testing.T) {
 	}
 }
 
+func TestWindowClosedMsgInvalidatesSurvivorPanes(t *testing.T) {
+	t.Parallel()
+	// When tmux kills the active window, the control client is
+	// switched to a surviving window; that switch can dribble a
+	// partial redraw into the %output stream that mixes with the
+	// existing emulator contents and leaves the preview looking
+	// "mostly right but with stale rows". handleWindowClosed
+	// forces a re-capture of every surviving pane (by pruning
+	// paneByWindow, paneTerminals, and the capture flags) so the
+	// next resolveHighlightedPaneIfNeeded tick redraws them from
+	// tmux's authoritative grid. This test pins that contract at
+	// the Model level — the resolveHighlightedPaneIfNeeded call
+	// chain is covered elsewhere.
+	m := NewModel(Deps{})
+	// Closed window + pane.
+	m.paneByWindow["@1"] = "%10"
+	m.paneTerminals["%10"] = newPaneTerminal(40, 10)
+	m.paneCaptured["%10"] = true
+	// Surviving window + pane with pre-close emulator content.
+	m.paneByWindow["@2"] = "%20"
+	m.paneTerminals["%20"] = newPaneTerminal(40, 10)
+	m.paneCaptured["%20"] = true
+	m.panePending["%20"] = []byte("mid-flight")
+	m.resolvedWindowID = "@1"
+
+	next, _ := m.Update(windowClosedMsg{windowID: "@1"})
+	m = next.(Model)
+
+	if _, ok := m.paneByWindow["@2"]; ok {
+		t.Fatalf("survivor paneByWindow[@2] not invalidated; map=%v", m.paneByWindow)
+	}
+	if _, ok := m.paneTerminals["%20"]; ok {
+		t.Fatalf("survivor paneTerminals[%%20] not cleared")
+	}
+	if m.paneCaptured["%20"] {
+		t.Fatalf("survivor paneCaptured[%%20] still true; want reset for re-capture")
+	}
+	if _, ok := m.panePending["%20"]; ok {
+		t.Fatalf("survivor panePending[%%20] not cleared")
+	}
+	if m.resolvedWindowID != "" {
+		t.Fatalf("resolvedWindowID = %q; want cleared so the next sessionsMsg re-resolves", m.resolvedWindowID)
+	}
+}
+
 func TestSessionsMsgClearsStalePendingClose(t *testing.T) {
 	t.Parallel()
 	// If the target session disappears between `x` (arm) and

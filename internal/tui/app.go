@@ -1053,6 +1053,23 @@ func (m Model) handleKeysSent(msg keysSentMsg) Model {
 // cleanly, and we immediately re-fetch the session list so the
 // sidebar row disappears without waiting for the next poll tick.
 //
+// We also invalidate the capture state of every SURVIVING pane.
+// When tmux kills the active window of the attached session, it
+// switches the control client to a different window — and that
+// window-switch can dribble a partial redraw into the %output
+// stream (cursor repositioning + row-targeted rewrites without
+// a CSI 2J clear), which gets layered on top of the pre-close
+// emulator contents and produces the "mostly-right but with
+// stale rows peeking through" symptom. Forcing a re-capture on
+// each survivor's next resolve pulls a fresh, authoritative
+// snapshot from tmux's grid, which paints over the mixed state
+// in one shot. We do NOT preemptively re-resolve here: the
+// fetchSessions round-trip we are about to kick off will
+// naturally call resolveHighlightedPaneIfNeeded for the
+// newly-promoted highlight, and the non-highlighted survivors
+// will pick up their re-capture the next time the user
+// navigates to them.
+//
 // A genuine failure (tmux reachable but kill-window failed for an
 // unexpected reason — e.g. permissions on a shared socket) is
 // surfaced as the listErr hint; the user can try again. We do
@@ -1073,7 +1090,9 @@ func (m Model) handleWindowClosed(msg windowClosedMsg) (tea.Model, tea.Cmd) {
 	// Drop cached per-pane state so the right pane stops trying
 	// to render a ghost of the closed session while we wait for
 	// the sessionsMsg refresh to land.
+	closedPaneID := ""
 	if paneID, ok := m.paneByWindow[msg.windowID]; ok {
+		closedPaneID = paneID
 		delete(m.paneTerminals, paneID)
 		delete(m.paneCapturing, paneID)
 		delete(m.paneCaptured, paneID)
@@ -1085,6 +1104,29 @@ func (m Model) handleWindowClosed(msg windowClosedMsg) (tea.Model, tea.Cmd) {
 	if m.skipCaptureWindow == msg.windowID {
 		m.skipCaptureWindow = ""
 	}
+	// Invalidate survivors. Clearing paneByWindow forces
+	// resolveHighlightedPaneIfNeeded to re-issue an ActivePane
+	// round-trip, which feeds back into handlePaneResolved and
+	// re-arms captureActivePane for the surviving window that
+	// the user is about to see highlighted.
+	for wid, paneID := range m.paneByWindow {
+		if paneID == closedPaneID {
+			// Defensive: a resurrected stale entry for the
+			// closed pane would spoil the invalidation loop.
+			delete(m.paneByWindow, wid)
+			continue
+		}
+		delete(m.paneTerminals, paneID)
+		delete(m.paneCapturing, paneID)
+		delete(m.paneCaptured, paneID)
+		delete(m.panePending, paneID)
+		delete(m.paneByWindow, wid)
+	}
+	// Reset the resolve latch too, otherwise
+	// resolveHighlightedPaneIfNeeded will short-circuit on the
+	// next sessionsMsg because it thinks the highlight window is
+	// already resolved.
+	m.resolvedWindowID = ""
 	return m, m.fetchSessions()
 }
 
