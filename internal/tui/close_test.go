@@ -307,6 +307,94 @@ func TestWindowClosedMsgInvalidatesSurvivorPanes(t *testing.T) {
 	}
 }
 
+// TestWindowClosedMsgClearsSurvivorSizedFor pins the first half
+// of the "typing lands at the bottom of the survivor" fix:
+// sizedFor is fully cleared on close so the next
+// resizeHighlightedWindow pass cannot debounce itself into a
+// no-op. The second half — forcing the resize to be a wiggle
+// shape rather than a single same-size call — is pinned by
+// TestWindowClosedMsgArmsForceResize below.
+//
+// Symptom the full fix guards against: after closing a
+// session, the surviving session's preview looked correct,
+// but typed characters landed at the very bottom of the pane
+// instead of in claude's input box. Root cause: the emulator
+// inherited a stale cursor (end-of-capture row) from the
+// pre-close capture-pane backfill, AND the post-close resize
+// was a tmux no-op because the surviving pane's current dims
+// already matched our paneViewW/paneViewH. No SIGWINCH
+// reached claude, so claude never redrew, so no cursor-
+// addressed writes re-positioned the emulator's cursor, so
+// echoes landed wherever the stale cursor was parked.
+func TestWindowClosedMsgClearsSurvivorSizedFor(t *testing.T) {
+	t.Parallel()
+	m := NewModel(Deps{})
+	m.paneByWindow["@1"] = "%10"
+	m.paneByWindow["@2"] = "%20"
+	m.sizedFor["@1"] = [2]int{120, 30}
+	m.sizedFor["@2"] = [2]int{120, 30}
+
+	next, _ := m.Update(windowClosedMsg{windowID: "@1"})
+	m = next.(Model)
+
+	if len(m.sizedFor) != 0 {
+		t.Fatalf("sizedFor not fully cleared after close; got %v", m.sizedFor)
+	}
+}
+
+// TestWindowClosedMsgArmsForceResize pins the second half of
+// the "typing lands at the bottom" fix: handleWindowClosed
+// arms forceResizePending so the next resizeHighlightedWindow
+// call fires a wiggle (W, H+1)→(W, H) through
+// forceResizeManagedWindow rather than a single same-size
+// resize-window that tmux would no-op. See the
+// forceResizeManagedWindow docstring for why the wiggle is
+// the only shape that guarantees SIGWINCH on a pane whose
+// current dims already match the target.
+func TestWindowClosedMsgArmsForceResize(t *testing.T) {
+	t.Parallel()
+	m := NewModel(Deps{})
+	m.paneByWindow["@1"] = "%10"
+	m.paneByWindow["@2"] = "%20"
+	if m.forceResizePending {
+		t.Fatal("forceResizePending set before any close; baseline broken")
+	}
+	next, _ := m.Update(windowClosedMsg{windowID: "@1"})
+	m = next.(Model)
+	if !m.forceResizePending {
+		t.Fatal("handleWindowClosed did not arm forceResizePending")
+	}
+}
+
+// TestResizeHighlightedWindowConsumesForceResizeFlag pins the
+// "consume the flag on first use" invariant. Without this,
+// a subsequent j/k navigation would also pay the wiggle cost
+// on top of its own resize, which is wasteful (extra tmux
+// traffic) and would produce a visible flicker on every nav
+// after a close. We cannot easily differentiate wiggle vs
+// single-resize shape from tea.Cmd opacity, so we pin the
+// observable proxy instead: the flag must flip to false the
+// moment a resize is emitted.
+func TestResizeHighlightedWindowConsumesForceResizeFlag(t *testing.T) {
+	t.Parallel()
+	rz := &resizerStub{}
+	m := NewModel(Deps{WindowResizer: rz.resizer()})
+	m = m.handleSessions(sessionsMsg{sessions: []Session{
+		{WindowID: "@1", Name: "a"},
+	}})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = next.(Model)
+	// Arm the flag directly — the handleWindowClosed path is
+	// already covered by TestWindowClosedMsgArmsForceResize.
+	m.forceResizePending = true
+	if cmd := m.resizeHighlightedWindow(); cmd == nil {
+		t.Fatal("resizeHighlightedWindow returned nil while flag was armed")
+	}
+	if m.forceResizePending {
+		t.Fatal("forceResizePending not cleared after one-shot consumption")
+	}
+}
+
 func TestSessionsMsgClearsStalePendingClose(t *testing.T) {
 	t.Parallel()
 	// If the target session disappears between `x` (arm) and

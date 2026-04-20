@@ -13,16 +13,23 @@
 //         highlighted row is painted in reverse video. The
 //         status glyph (M3d) reflects that session's live
 //         state: faint `·` (Quiet), solid `●` (Idle), animated
-//         braille spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ — Working), red `!`
-//         (Attention — claude rang the bell, user hasn't
-//         acknowledged yet). The Attention glyph is a bang
-//         (not a dot) so the "this needs you" signal carries
-//         through the reverse-video attribute that paints the
-//         highlighted row, since reverse swaps foreground and
-//         background and can hide a foreground-only color
-//         change. The spinner only runs while at least one
-//         session is Working, so an all-idle TUI is visually
-//         still. The Working state is suppressed for
+//         braille spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ — Working), `✓`
+//         (Attention — claude finished AND rang the bell at
+//         some point during the run; the user hasn't
+//         acknowledged it yet). The Attention glyph is a
+//         checkmark (not a dot) so the "this one's done, your
+//         turn" signal carries through the reverse-video
+//         attribute that paints the highlighted row, since
+//         reverse swaps foreground and background and can
+//         hide a foreground-only color change. The checkmark
+//         is rendered in the sidebar's native weight — not
+//         bold, not colored — so Attention reads as a calm
+//         "done, your turn" rather than an alarm. Earlier
+//         iterations used bold and/or red; both over-weighted
+//         the signal relative to Idle and Working. The shape
+//         is the signal. The spinner only runs while at least
+//         one session is Working, so an all-idle TUI is
+//         visually still. The Working state is suppressed for
 //         keystrokeEchoWindow (400ms) after every forwarded
 //         keystroke, so claude's per-keypress redraw bytes do
 //         not masquerade as "claude is thinking" — only bytes
@@ -33,9 +40,22 @@
 //         press n to start one") so the sidebar never collapses
 //         to a bare header.
 //
-//       * Key bar — the full binding list, always visible so the
-//         user can see what's available regardless of session
-//         count.
+//       * Help hint — a single "? help" row anchored at the
+//         bottom of the sidebar. Pressing `?` toggles an
+//         expanded block of every binding for the current
+//         focus, still at the bottom of the column, and
+//         pressing `?` again collapses it back to the hint.
+//         Earlier iterations kept the full binding list
+//         visible at all times under the session list; live
+//         usage found that the permanent key bar stole
+//         vertical space from sessions and that users who
+//         wanted the keys reached for `?` anyway. Hiding the
+//         list behind `?` preserves discovery ("press this
+//         one visible key to see everything") without the
+//         permanent vertical cost. The close-confirmation
+//         prompt ("close <name>? y …") replaces the hint
+//         while a kill is armed so the user sees exactly one
+//         question at a time.
 //
 //       * Disclaimer footer — "sm4c is not affiliated with
 //         Anthropic…" — rendered ONLY in the empty state, where a
@@ -164,27 +184,48 @@
 //     Those flags are sticky in tmux (cleared only when a client
 //     "sees" the window) and fit a "notify me about a window
 //     I'm not looking at" use case, not sm4c's reactive sidebar.
-//     Transitions (per pane): Quiet → Working on first byte;
-//     Working → Idle after Deps.SilenceThreshold of no bytes
-//     (plumbed from Config.MonitorSilence, default 3s); Idle →
-//     Working on any byte; any state → Attention on a BEL
-//     (0x07) byte; Attention → derived-from-activity on the
-//     next keystroke the user forwards to that pane (which
-//     acknowledges the bell). Bytes arriving within
-//     keystrokeEchoWindow (400ms) of the most recent
-//     keystroke are treated as claude's prompt redraw rather
-//     than claude working — they leave the glyph on Idle
-//     instead of flipping it to Working. Without this arc, every keypress
-//     the user sent would spin the glyph for 3s while nothing
-//     was actually happening (claude was not thinking, the
-//     bytes were just echo). The animation ticker
-//     (statusFrameInterval = 100ms, for a 1s rotation across
-//     the 10 braille frames) only runs while at least one
-//     pane is Working, so a TUI full of idle sessions does
-//     not burn a background re-render budget. Status is keyed
-//     by tmux window ID in paneStatuses (not pane ID) so the
-//     close-session churn that invalidates paneByWindow for
-//     survivors does not flicker the sidebar glyphs.
+//     The central model is that "claude is working" (bytes
+//     flowing vs. silent) and "claude wants you" (bell rang)
+//     are LAYERED signals, not competing ones. Working is
+//     answered by the byte stream directly; Attention is
+//     answered only AFTER the stream has quieted down.
+//     Transitions per pane:
+//       * Quiet → Working on first byte.
+//       * Working → Idle after Deps.SilenceThreshold of no
+//         bytes (plumbed from Config.MonitorSilence,
+//         default 1.5s) and no bell was rung during the run.
+//       * Working → Attention after the same silence, when a
+//         bell WAS rung during the run. The bell is
+//         remembered in paneStatus.bell from the moment the
+//         BEL byte (0x07) arrives, but it is not surfaced
+//         as Attention while bytes are still flowing — doing
+//         that would yank the spinner mid-stream and tell the
+//         user "done" when claude is still generating (the
+//         "the bang appears too soon" failure mode).
+//       * Idle/Attention → Working on any new byte (assuming
+//         the bytes are not inside the echo window below).
+//       * Attention → derived-from-activity once the user
+//         types into that pane (the keystroke clears bell
+//         and opens the echo window in one step).
+//     Bytes arriving within keystrokeEchoWindow (400ms) of
+//     the most recent keystroke are treated as claude's
+//     prompt redraw rather than claude working — they leave
+//     the glyph on Idle instead of flipping it to Working.
+//     A pending bell inside the echo window is also treated
+//     as implicitly acknowledged, because the user's hands
+//     are already on the pane and a flashing bang would be
+//     noise. Without the echo-window arc, every keypress
+//     the user sent would spin the glyph for 3s while
+//     nothing was actually happening (claude was not
+//     thinking, the bytes were just echo).
+//     The animation ticker (statusFrameInterval = 100ms,
+//     for a 1s rotation across the 10 braille frames) only
+//     runs while at least one pane is Working, so a TUI full
+//     of idle sessions does not burn a background re-render
+//     budget. Status is keyed by tmux window ID in
+//     paneStatuses (not pane ID) so the close-session churn
+//     that invalidates paneByWindow for survivors does not
+//     flicker the sidebar glyphs.
 //
 // Design rules enforced here:
 //

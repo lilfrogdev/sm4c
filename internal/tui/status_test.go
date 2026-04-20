@@ -16,10 +16,18 @@ import (
 // TestDerivedStatusTransitions walks every arrow in the
 // state-diagram defined in status.go:
 //
-//	Quiet → Working   (first byte)
-//	Working → Idle    (silence elapsed)
-//	Idle → Working    (new byte)
-//	Any → Attention   (bell seen)
+//	Quiet → Working          (first byte)
+//	Working → Idle            (silence elapsed, no bell)
+//	Working → Attention       (silence elapsed, bell set)
+//	Idle → Working            (new byte)
+//	Attention → Working       (new byte)
+//
+// Note specifically that bell does NOT flip Working to
+// Attention while bytes are still flowing — that is the whole
+// point of layering bell on top of silence rather than
+// treating them as competing signals on the same axis. A bell
+// fired during a token stream is remembered and surfaces only
+// once the stream quiets down for silenceThreshold.
 //
 // The threshold is kept small so the tests don't have to sleep,
 // and "now" is threaded explicitly so there is no dependence on
@@ -70,20 +78,20 @@ func TestDerivedStatusTransitions(t *testing.T) {
 			why:   "boundary: >= is the FSM rule",
 		},
 		{
-			name:  "bell wins over Working",
+			name:  "bell during Working stays Working (mid-stream bell is remembered, not surfaced)",
 			ps:    paneStatus{lastOutputAt: start, everHadOutput: true, bell: true},
 			now:   start.Add(50 * time.Millisecond),
 			tThrs: threshold,
-			want:  StatusAttention,
-			why:   "bell is the top-priority state",
+			want:  StatusWorking,
+			why:   "a bell fired while bytes are still flowing must not yank the spinner; the bang surfaces after silence confirms claude is done",
 		},
 		{
-			name:  "bell wins over Idle",
+			name:  "silent + bell is Attention (the your-turn signal)",
 			ps:    paneStatus{lastOutputAt: start, everHadOutput: true, bell: true},
 			now:   start.Add(threshold * 5),
 			tThrs: threshold,
 			want:  StatusAttention,
-			why:   "bell is the top-priority state",
+			why:   "once the stream quiets down, the remembered bell surfaces as Attention",
 		},
 		{
 			name:  "bell wins over Quiet (nothing emitted yet, already ringing)",
@@ -91,15 +99,15 @@ func TestDerivedStatusTransitions(t *testing.T) {
 			now:   start,
 			tThrs: threshold,
 			want:  StatusAttention,
-			why:   "bell priority is independent of history",
+			why:   "bell with no output history is a pathological but handled case",
 		},
 		{
-			name:  "zero threshold means never-Idle",
-			ps:    paneStatus{lastOutputAt: start, everHadOutput: true},
+			name:  "zero threshold means never-Idle (and therefore never-Attention)",
+			ps:    paneStatus{lastOutputAt: start, everHadOutput: true, bell: true},
 			now:   start.Add(1 * time.Hour),
 			tThrs: 0,
 			want:  StatusWorking,
-			why:   "0 threshold = opt-out of the Idle flip",
+			why:   "0 threshold = opt-out of silence transitions entirely; bell cannot surface because silent never becomes true",
 		},
 		{
 			name: "recent keystroke suppresses Working",
@@ -126,7 +134,7 @@ func TestDerivedStatusTransitions(t *testing.T) {
 			why:   "once keystrokeEchoWindow elapses, fresh bytes mean claude, not echo",
 		},
 		{
-			name: "bell still wins over recent keystroke",
+			name: "recent keystroke suppresses pending bell too",
 			ps: paneStatus{
 				lastOutputAt:    start,
 				lastKeystrokeAt: start,
@@ -135,8 +143,8 @@ func TestDerivedStatusTransitions(t *testing.T) {
 			},
 			now:   start.Add(100 * time.Millisecond),
 			tThrs: threshold,
-			want:  StatusAttention,
-			why:   "bell has priority over every other FSM arrow, including echo suppression",
+			want:  StatusIdle,
+			why:   "if the user is typing into this pane, the bell is implicitly acknowledged; no point flashing Attention at someone whose hands are already on the pane",
 		},
 	}
 

@@ -450,3 +450,57 @@ func (m Model) resizeManagedWindow(windowID string, width, height int) tea.Cmd {
 		return windowResizedMsg{windowID: windowID, err: err}
 	}
 }
+
+// forceResizeManagedWindow returns a tea.Cmd that asks WindowResizer
+// to RESIZE twice in quick succession: first to (width, height+1),
+// then back to (width, height). The temporary +1 row is the trigger
+// — tmux no-ops a resize-window whose target dims match the pane's
+// current dims, which means a same-size resize issued after a
+// window close does NOT produce a SIGWINCH on the surviving
+// pane's claude process. No SIGWINCH, no redraw; no redraw, no
+// cursor-repositioning escapes on the wire; no cursor escapes,
+// our emulator's cursor stays at the stale position left by the
+// pre-close capture-pane backfill — and subsequent character
+// echoes from claude (which rely on claude's own drawing code
+// having already positioned the cursor to the input box) land
+// wherever the stale cursor was, typically at the bottom of the
+// grid.
+//
+// The wiggle is transient: the +1 row exists only between the two
+// tmux round-trips (sub-millisecond on a local socket), and our
+// emulator's grid is never resized during this dance — only
+// tmux's view of the pane is. Claude observes a height change,
+// redraws for (H+1), then observes another height change and
+// redraws for H. The second redraw is the one our emulator
+// consumes, with cursor-addressed writes that land where claude
+// intends them.
+//
+// Errors from either call collapse into the returned
+// windowResizedMsg. We do NOT surface the intermediate +1
+// failure separately: if tmux rejects the (H+1) call, the
+// second call (same height we would send anyway) still has a
+// reasonable chance of succeeding, and a two-step error report
+// would just double-count the same problem.
+//
+// Returns nil under the same degenerate conditions as
+// resizeManagedWindow (no resizer, empty windowID, non-positive
+// dims), which keeps the call sites that batch both helpers
+// symmetric.
+func (m Model) forceResizeManagedWindow(windowID string, width, height int) tea.Cmd {
+	if m.windowResizer == nil || windowID == "" {
+		return nil
+	}
+	if width < 1 || height < 1 {
+		return nil
+	}
+	resizer := m.windowResizer
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+		defer cancel()
+		if err := resizer(ctx, windowID, width, height+1); err != nil {
+			return windowResizedMsg{windowID: windowID, err: err}
+		}
+		err := resizer(ctx, windowID, width, height)
+		return windowResizedMsg{windowID: windowID, err: err}
+	}
+}

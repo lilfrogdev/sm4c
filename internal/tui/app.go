@@ -319,6 +319,27 @@ type Model struct {
 	// duplicate resize-window commands.
 	sizedFor map[string][2]int
 
+	// forceResizePending is a one-shot flag that tells the next
+	// resizeHighlightedWindow call to fire a wiggle resize
+	// (see forceResizeManagedWindow) instead of the usual
+	// debounced single resize. It is set by handleWindowClosed
+	// because tmux no-ops a resize-window whose target dims
+	// match the pane's current dims — and after a close the
+	// surviving pane's current dims usually DO match what the
+	// TUI was showing pre-close, so the post-close resize is a
+	// no-op and no SIGWINCH reaches claude. No SIGWINCH means
+	// no redraw, which means the cursor our emulator inherited
+	// from the (now-stale) capture-pane backfill points at
+	// whatever row ended the capture — almost always the bottom.
+	// Subsequent echo bytes from claude therefore land at the
+	// bottom of the preview instead of inside claude's input
+	// box. The wiggle guarantees SIGWINCH, guarantees a full
+	// claude redraw, and guarantees cursor re-positioning
+	// before the next keystroke. Cleared to false the moment a
+	// wiggle is emitted so a subsequent j/k navigation does
+	// NOT double-pay the wiggle cost.
+	forceResizePending bool
+
 	// focus is the M3c focus state. FocusSidebar (zero value)
 	// means keystrokes hit sm4c's own binding table; FocusPane
 	// means they are forwarded to the highlighted session's
@@ -1017,6 +1038,19 @@ func (m *Model) resizeHighlightedWindow() tea.Cmd {
 	if w < 1 || h < 1 {
 		return nil
 	}
+	// Force-redraw one-shot. handleWindowClosed sets this flag
+	// because a plain same-size resize-window post-close is a
+	// tmux no-op that fails to SIGWINCH claude; see the
+	// forceResizePending docstring for the full rationale. We
+	// consume the flag unconditionally (whether or not the
+	// debounce would normally fire) so the wiggle reaches
+	// tmux even when sizedFor already had the right dims
+	// cached from an earlier resize.
+	if m.forceResizePending {
+		m.forceResizePending = false
+		m.sizedFor[wid] = [2]int{w, h}
+		return m.forceResizeManagedWindow(wid, w, h)
+	}
 	if prev, ok := m.sizedFor[wid]; ok && prev[0] == w && prev[1] == h {
 		return nil
 	}
@@ -1303,7 +1337,6 @@ func (m Model) handleWindowClosed(msg windowClosedMsg) (tea.Model, tea.Cmd) {
 	}
 	delete(m.paneByWindow, msg.windowID)
 	delete(m.paneErrByWindow, msg.windowID)
-	delete(m.sizedFor, msg.windowID)
 	delete(m.paneStatuses, msg.windowID)
 	if m.skipCaptureWindow == msg.windowID {
 		m.skipCaptureWindow = ""
@@ -1335,6 +1368,23 @@ func (m Model) handleWindowClosed(msg windowClosedMsg) (tea.Model, tea.Cmd) {
 		// statusForWindow does not depend on paneByWindow.
 		delete(m.paneByWindow, wid)
 	}
+	// Nuke sizedFor entirely so the post-close resize pass
+	// re-emits a resize for every surviving window the user
+	// might land on next (j/k past the new top), and arm the
+	// force-redraw one-shot so the next resize is the wiggle
+	// form (see forceResizeManagedWindow). The wiggle is the
+	// only resize shape that guarantees SIGWINCH on a pane
+	// whose current dims already match our target — which is
+	// the common case on close, because paneViewW/paneViewH
+	// do not change when a window disappears. Without the
+	// wiggle, tmux no-ops the same-size resize, claude never
+	// redraws, and the surviving pane's emulator keeps the
+	// stale cursor left at the bottom of the grid by the
+	// pre-close capture-pane backfill — with the result that
+	// the user's next keystrokes echo into the bottom rows of
+	// the preview instead of inside claude's input box.
+	m.sizedFor = make(map[string][2]int)
+	m.forceResizePending = true
 	// Reset the resolve latch too, otherwise
 	// resolveHighlightedPaneIfNeeded will short-circuit on the
 	// next sessionsMsg because it thinks the highlight window is
@@ -1397,10 +1447,9 @@ type keybind struct {
 }
 
 // sidebarBindings is the authoritative list of keys the sidebar
-// view advertises when focus is on the sidebar. Both renderKeys
-// and renderHelp iterate this slice for that focus, so any key
-// added here appears in the compact bar AND the expanded help
-// without further changes.
+// view advertises when focus is on the sidebar. renderHelp
+// iterates this slice for that focus, so any key added here
+// appears in the expanded help block.
 var sidebarBindings = []keybind{
 	{"j/k", "move highlight"},
 	{"enter", "focus session"},
@@ -1422,28 +1471,14 @@ var paneBindings = []keybind{
 }
 
 // bindingsForFocus returns the binding table that matches the
-// current focus. Kept as a single choke-point so renderKeys,
-// renderHelp, and any future view that wants to advertise the
-// active bindings stay consistent.
+// current focus. Kept as a single choke-point so renderHelp
+// and any future view that wants to advertise the active
+// bindings stay consistent.
 func (m Model) bindingsForFocus() []keybind {
 	if m.focus == FocusPane {
 		return paneBindings
 	}
 	return sidebarBindings
-}
-
-// renderKeys emits the compact "key  description" list shown under
-// the status line. Each row uses keyStyle (reverse-video chip) for
-// the key and plain text for the description; the blank space
-// between them is a single tab-like gap so the columns align even
-// when key names have different widths.
-func (m Model) renderKeys() string {
-	var rows []string
-	for _, b := range m.bindingsForFocus() {
-		row := keyStyle.Render(b.key) + "  " + keyDescStyle.Render(b.desc)
-		rows = append(rows, row)
-	}
-	return strings.Join(rows, "\n")
 }
 
 // renderCloseConfirm returns the one-line confirmation prompt
@@ -1471,11 +1506,23 @@ func (m Model) renderCloseConfirm() string {
 		keyDescStyle.Render(prompt+" (any other key cancels)")
 }
 
-// renderHelp is the expanded help block shown when the user presses
-// `?`. Today it is a near-copy of renderKeys with a leading label —
-// M3 will grow it into a proper multi-section cheatsheet (navigation,
-// session lifecycle, status legend). We keep the two paths separate
-// now so that growth doesn't require rewriting the compact view.
+// renderHelp is the expanded help block shown at the bottom of
+// the sidebar when the user presses `?`. Each binding row uses
+// keyStyle (reverse-video chip) for the key and plain text for
+// the description; a two-space gap aligns keys across rows
+// even when key names have different widths. The leading
+// "keys" title doubles as the "this is the help block" marker
+// for tests.
+//
+// Pre-M3d polish this block was a near-copy of a now-removed
+// renderKeys, which rendered the same list unconditionally in
+// the compact area under the status line. Hiding the list
+// behind `?` removed the permanent vertical cost while
+// preserving every advertised binding for users who ask for
+// them. If the help grows into a multi-section cheatsheet
+// (navigation, session lifecycle, status legend), that growth
+// can land here without reopening the "should this be visible
+// by default?" question.
 func (m Model) renderHelp() string {
 	lines := []string{titleStyle.Render("keys")}
 	for _, b := range m.bindingsForFocus() {
@@ -1584,29 +1631,99 @@ func (m Model) renderSidebarView() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, right)
 }
 
-// renderSidebarColumn builds the stacked content (title, list, key
-// bar, optional diagnostics, optional footer) that lives inside the
-// sidebar column. Extracted so it can be reused verbatim in both
-// the split layout and the narrow-terminal fallback.
+// renderSidebarColumn builds the stacked content that lives inside
+// the sidebar column. Layout:
+//
+//	┌──────────────────────┐
+//	│ header               │  ← sm4c / N sessions
+//	│                      │
+//	│ session list         │  ← status glyph + name rows
+//	│                      │
+//	│ (list err, if any)   │  ← faint one-liner on fetch failures
+//	│                      │
+//	│   (vertical filler)  │  ← stretches to fill the column height
+//	│                      │
+//	│ help block / footer  │  ← anchored at the bottom
+//	└──────────────────────┘
+//
+// The footer is one of three mutually-exclusive states:
+//
+//  1. close prompt        — while pendingCloseWindow is armed
+//  2. full bindings list  — while m.help is true (expanded help)
+//  3. "? help" hint       — default
+//
+// The pre-M3d layout showed every binding at all times in a
+// compact key bar directly under the session list. Live usage
+// surfaced two problems: the bar crowded the session list even
+// when the user was not looking at bindings, and the bindings
+// themselves were too subtle to teach new users. Hiding the
+// full list behind `?` gets the sidebar out of the way for the
+// common case (users already know j/k/n/x) while making the
+// help experience more deliberate and more legible when the
+// user actually wants it. The `?` hint stays visible at the
+// bottom so the discovery path is preserved.
+//
+// Extracted so it can be reused verbatim in both the split
+// layout and the narrow-terminal fallback.
 func (m Model) renderSidebarColumn() string {
-	var sections []string
+	top := m.renderSidebarTop()
+	bottom := m.renderSidebarBottom()
 
-	sections = append(sections, m.renderHeader())
-	sections = append(sections, "")
-	sections = append(sections, m.renderSessionList())
-	sections = append(sections, "")
-	if prompt := m.renderCloseConfirm(); prompt != "" {
-		// Swap the key bar for the confirmation hint while a
-		// close is armed: the only meaningful keys here are y/n,
-		// and showing the normal bindings would dilute that
-		// signal. When the user answers (y → close, any other
-		// key → cancel), pendingCloseWindow is cleared and the
-		// next render falls back to the standard key bar.
-		sections = append(sections, prompt)
-	} else {
-		sections = append(sections, m.renderKeys())
+	// Vertical filler: push the bottom block to the actual
+	// bottom of the sidebar column. We target m.height (the
+	// viewport height, kept current by the WindowSizeMsg
+	// handler). When m.height is 0 — which happens in tests
+	// that never emit a size and on the narrow-terminal
+	// fallback path where lipgloss does not pad for us — we
+	// fall back to a single-blank-line separator so the
+	// content still reads correctly even without a pin at
+	// the bottom of the viewport.
+	if m.height <= 0 {
+		if top == "" {
+			return bottom
+		}
+		if bottom == "" {
+			return top
+		}
+		return top + "\n\n" + bottom
 	}
+	topH := 0
+	if top != "" {
+		topH = lipgloss.Height(top)
+	}
+	bottomH := 0
+	if bottom != "" {
+		bottomH = lipgloss.Height(bottom)
+	}
+	// One blank line separator above the bottom block so the
+	// footer never butts up against the session list or the
+	// fetch-error line even when the sidebar is short enough
+	// that the filler would otherwise collapse to zero rows.
+	filler := m.height - topH - bottomH - 1
+	if filler < 1 {
+		filler = 1
+	}
+	parts := []string{top}
+	if filler > 0 {
+		parts = append(parts, strings.Repeat("\n", filler-1))
+	}
+	if bottom != "" {
+		parts = append(parts, bottom)
+	}
+	return strings.Join(parts, "\n")
+}
 
+// renderSidebarTop builds the always-anchored-to-the-top portion
+// of the sidebar: header, session list, and the fetch-error
+// line (when present). Extracted from renderSidebarColumn so
+// the height math that positions renderSidebarBottom has a
+// clean single-call surface to measure.
+func (m Model) renderSidebarTop() string {
+	sections := []string{
+		m.renderHeader(),
+		"",
+		m.renderSessionList(),
+	}
 	if m.listErr != nil {
 		// A fetch error is usually a preflight issue (e.g. tmux
 		// socket permissions flipped mid-run). We surface it
@@ -1616,10 +1733,41 @@ func (m Model) renderSidebarColumn() string {
 		sections = append(sections, hintStyle.Render(
 			"session fetch error: "+m.listErr.Error()))
 	}
-	if m.help {
-		sections = append(sections, "")
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+// renderSidebarBottom builds the bottom-anchored portion of the
+// sidebar. The three mutually-exclusive layouts are documented
+// on renderSidebarColumn. The empty-state disclaimer ("sm4c is
+// not affiliated with Anthropic…") is folded into this block
+// so first-time users see it at the natural "where am I?"
+// glance point — the bottom of the sidebar — rather than
+// scrolling off the top.
+func (m Model) renderSidebarBottom() string {
+	var sections []string
+
+	// 1. Close prompt trumps everything: while a kill-window
+	//    confirmation is pending, the only meaningful keys
+	//    are y/any, and the normal bindings would dilute that
+	//    signal. The close-prompt layout is its own single line
+	//    so it reads as a focused question.
+	if prompt := m.renderCloseConfirm(); prompt != "" {
+		sections = append(sections, prompt)
+	} else if m.help {
+		// 2. Expanded help: show every binding for the current
+		//    focus, plus the "? help" toggle so the user
+		//    remembers how to close the block. The toggle is
+		//    rendered last (after the bindings) so the visual
+		//    hierarchy matches the action: read the list, press
+		//    `?` again to dismiss.
 		sections = append(sections, m.renderHelp())
+	} else {
+		// 3. Default: a single compact hint. Discovery is
+		//    preserved ("press `?` to see everything"), but the
+		//    sidebar stays uncluttered for the common case.
+		sections = append(sections, m.renderHelpHint())
 	}
+
 	if len(m.sessions) == 0 {
 		sections = append(sections, "")
 		sections = append(sections, footerStyle.Render(
@@ -1627,8 +1775,16 @@ func (m Model) renderSidebarColumn() string {
 				"You must install the official claude CLI separately.",
 		))
 	}
-
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+// renderHelpHint returns the single compact "? help" row that
+// lives at the bottom of the sidebar in the default (help-off)
+// state. Kept as its own helper so tests can target the
+// "there is a discoverable help hint" contract without coupling
+// to the full binding list that the expanded help block uses.
+func (m Model) renderHelpHint() string {
+	return keyStyle.Render("?") + "  " + keyDescStyle.Render("help")
 }
 
 // renderRightPane paints the right-hand column: a live VT-emulated
@@ -1668,7 +1824,14 @@ func (m Model) renderRightPaneHeader() string {
 	if name == "" {
 		name = "(unnamed)"
 	}
-	line := titleStyle.Render(name) + hintStyle.Render("  "+s.WindowID)
+	// Window ID (@N) is intentionally omitted from the header —
+	// it is an opaque tmux identifier users never refer to by
+	// hand, and live usage confirmed nobody was reading it. The
+	// session name is the only user-meaningful label in this
+	// slot; `sm4c ls` still surfaces IDs for debugging. This
+	// matches the same decision the sidebar row format made in
+	// M3d polish (see renderSessionList).
+	line := titleStyle.Render(name)
 	// Focus indicator: a bracketed tag lets the user tell at a
 	// glance which surface owns keystrokes. We avoid relying on
 	// border color (sm4c's no-hex-colors rule) and keep the

@@ -476,18 +476,29 @@ func TestViewBeforeFirstFetchShowsEmptyPlaceholder(t *testing.T) {
 	mustContain(t, out, "no sessions yet")
 }
 
-func TestViewEmptyStateRendersSidebarChromeAndBindings(t *testing.T) {
+func TestViewEmptyStateRendersSidebarChrome(t *testing.T) {
 	t.Parallel()
 	// The sidebar is always visible. With zero sessions we must
-	// still see the title, the key bar for every binding, and
-	// the "press n to start one" empty-state placeholder.
+	// still see the title, the "press n to start one" empty-
+	// state placeholder, and the discoverable `?` help hint at
+	// the bottom. The expanded binding list is gated behind `?`
+	// (see TestViewHelpSectionOnlyWhenToggled) so it must NOT
+	// appear in the default render.
 	out := emptyModel().View()
 	mustContain(t, out, "sm4c")
 	mustContain(t, out, "no sessions yet")
 	mustContain(t, out, "press n")
-	for _, b := range sidebarBindings {
-		mustContain(t, out, b.key)
-		mustContain(t, out, b.desc)
+	mustContain(t, out, "?")
+	mustContain(t, out, "help")
+	// Bindings other than the `?` help toggle must stay hidden
+	// until the user opens the help block. Pinning one of each
+	// "noisy" description (move highlight / new session / close
+	// session) keeps a regression that accidentally resurrects
+	// the old always-visible key bar from sneaking in.
+	for _, desc := range []string{"move highlight", "new session", "close session"} {
+		if strings.Contains(out, desc) {
+			t.Fatalf("default sidebar should hide %q until `?` is pressed:\n%s", desc, out)
+		}
 	}
 }
 
@@ -510,9 +521,11 @@ func TestViewRendersSidebarWhenSessionsPresent(t *testing.T) {
 	if strings.Contains(out, "@1") || strings.Contains(out, "@4") {
 		t.Fatalf("sidebar leaked window ID:\n%s", out)
 	}
-	// Bindings that must stay visible on the populated sidebar.
-	mustContain(t, out, "move highlight")
-	mustContain(t, out, "new session")
+	// Discoverable help hint must stay visible on the populated
+	// sidebar; the full binding list is gated behind `?` (see
+	// TestViewHelpSectionOnlyWhenToggled).
+	mustContain(t, out, "?")
+	mustContain(t, out, "help")
 	// Empty-state placeholder MUST NOT appear when rows exist —
 	// it would be contradictory and steal vertical space.
 	if strings.Contains(out, "no sessions yet") {
@@ -547,13 +560,40 @@ func TestViewPluralizesSingleSession(t *testing.T) {
 
 func TestViewHelpSectionOnlyWhenToggled(t *testing.T) {
 	t.Parallel()
+	// Before `?`: only the compact hint at the bottom. The
+	// "keys" title that leads the expanded block AND every
+	// non-help binding description must be absent.
 	m := emptyModel()
-	if strings.Contains(m.View(), "keys") {
-		t.Fatalf("help header present before `?` was pressed:\n%s", m.View())
+	before := m.View()
+	if strings.Contains(before, "keys") {
+		t.Fatalf("help header present before `?` was pressed:\n%s", before)
 	}
+	for _, desc := range []string{"move highlight", "new session", "close session", "quit"} {
+		if strings.Contains(before, desc) {
+			t.Fatalf("binding %q visible before `?` was pressed:\n%s", desc, before)
+		}
+	}
+	// After `?`: the expanded block is anchored to the bottom
+	// and every sidebar binding is listed. This is the single
+	// place users learn the shortcut table, so every advertised
+	// binding must actually reach the screen.
 	m, _ = applyKey(t, m, "?")
-	if !strings.Contains(m.View(), "keys") {
-		t.Fatalf("help header absent after `?` was pressed:\n%s", m.View())
+	after := m.View()
+	if !strings.Contains(after, "keys") {
+		t.Fatalf("help header absent after `?` was pressed:\n%s", after)
+	}
+	for _, b := range sidebarBindings {
+		if !strings.Contains(after, b.desc) {
+			t.Fatalf("binding %q missing from expanded help:\n%s", b.desc, after)
+		}
+	}
+	// Pressing `?` again closes the block — the toggle must
+	// round-trip so muscle memory ("? to open, ? to close")
+	// works.
+	m, _ = applyKey(t, m, "?")
+	reclosed := m.View()
+	if strings.Contains(reclosed, "keys") {
+		t.Fatalf("help header still present after second `?`:\n%s", reclosed)
 	}
 }
 

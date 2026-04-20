@@ -21,15 +21,28 @@ import (
 // absence, and bells are the BEL byte (0x07) inside those bytes.
 //
 // State machine per pane, given a silence threshold T (configured
-// via Config.MonitorSilence, default 3s) and an echo window E
-// (keystrokeEchoWindow, fixed at 1500ms):
+// via Config.MonitorSilence, default 1.5s) and an echo window E
+// (keystrokeEchoWindow, fixed at 400ms):
 //
 //	Quiet      ──(first byte, no recent keystroke)──> Working
-//	Working    ──(no bytes for T)──> Idle
+//	Working    ──(no bytes for T AND bell unset)──> Idle
+//	Working    ──(no bytes for T AND bell set)──> Attention
 //	Idle       ──(new bytes, no recent keystroke)──> Working
-//	Any        ──(BEL seen)──> Attention
+//	Idle       ──(BEL seen)──> Attention
+//	Attention  ──(new bytes, no recent keystroke)──> Working
 //	Attention  ──(keystroke to pane)──> derived-from-bytes
-//	Any        ──(user typed within E)──> Idle/Quiet (echo suppression)
+//	Any        ──(user typed within E)──> Idle (echo suppression)
+//
+// Note the Working transitions: a bell fired DURING a token
+// stream does not flip the glyph to Attention immediately. It
+// sets paneStatus.bell=true, which is remembered, and the
+// spinner keeps animating until the stream quiets down for T.
+// Only THEN does the remembered bell surface as Attention. This
+// is the fix for "the bang appears too soon" — claude rings the
+// bell at several points inside a single response (tool-call
+// boundaries, partial confirmations, completion), and surfacing
+// each one immediately would rip the spinner away mid-stream
+// and tell the user "done" while claude was still generating.
 //
 // The "echo suppression" arc is why this package tracks
 // lastKeystrokeAt as well as lastOutputAt. When the user types
@@ -160,51 +173,79 @@ const keystrokeEchoWindow = 400 * time.Millisecond
 // parameter rather than read from time.Now() so tests can pin a
 // specific instant without racing the test clock.
 //
+// The central insight this function encodes is that "claude is
+// working" and "claude wants your attention" are NOT competing
+// signals on the same axis — they are layered. Whether claude
+// is working is answered by bytes flowing (vs. silent); whether
+// claude wants you is answered by a bell, which is only
+// meaningful AFTER it has stopped working. A bell fired in the
+// middle of a token stream is a hint for "when this calms
+// down, look here", not a hint for "drop the token stream and
+// look now". Surfacing Attention while bytes are still flowing
+// yanks the spinner away mid-response and makes the user think
+// claude is done when it isn't — which is exactly the "the
+// bang appears too soon" regression this ordering fixes.
+//
 // Priority order (top wins):
 //
-//  1. bell  → Attention. Bell always wins; the user's active
-//     attention is what clears it, so even if they are typing
-//     into this very pane the glyph stays amber until the
-//     clearing keystroke is processed (which happens on the
-//     same Update cycle, so the visible flicker is zero).
-//  2. never had output → Quiet.
-//  3. user typed within keystrokeEchoWindow → Idle (echo
-//     suppression, see package comment). We treat the pane as
-//     Idle rather than Quiet because "user has typed here"
-//     implies the pane is live and ready; Quiet is reserved
-//     for panes that have genuinely never done anything.
-//  4. silent longer than silenceThreshold → Idle.
-//  5. otherwise → Working.
+//  1. user typed within keystrokeEchoWindow → Idle. The user
+//     is actively engaged with this pane; they are not waiting
+//     on a signal from us. We also treat any pending bell as
+//     implicitly acknowledged here (the user's hands are on
+//     the pane), so the bang does not flash while they type
+//     past a permission prompt.
+//  2. never had output → Quiet (or Attention if somehow a
+//     bell landed with no prior output, which would be a
+//     pathological case but we handle it anyway).
+//  3. actively emitting (now.Sub(lastOutputAt) < T) → Working.
+//     This is where bell's priority flips: bell is remembered
+//     in paneStatus but NOT surfaced while bytes are still
+//     flowing. The spinner keeps going through bell events
+//     until the stream actually quiets down.
+//  4. silent AND bell → Attention. The pane has settled AND
+//     claude asked for your attention at some point during
+//     the run. This is the "your turn" signal the user cares
+//     about.
+//  5. silent, no bell → Idle. The pane has output history but
+//     is currently quiet.
 //
-// Note that step 3 is why a pane that has received bytes from
-// user-echo alone (never any work from claude) still leaves
-// everHadOutput = true — the field is "has bytes ever arrived
-// here", not "has claude ever worked here". We cannot
-// distinguish the two without protocol knowledge we do not
-// have, and mis-firing step 3 is preferable to missing step 5
-// when the user genuinely wants to see the spinner.
+// The silence threshold is the same knob in both directions:
+// it determines when Working yields to Idle/Attention. Shorter
+// values make the "done" signal more responsive but risk
+// flipping during a mid-response pause; longer values are more
+// stable but add latency between "claude actually finished"
+// and "user sees the bang / solid dot". Default 3s from
+// Config.MonitorSilence.
+//
+// Edge case: silenceThreshold <= 0 disables silence-based
+// transitions entirely — panes stay Working forever once they
+// have emitted a byte. Bells in this mode are remembered but
+// never surfaced as Attention, because "silent" never becomes
+// true. This is the deliberate opt-out shape for
+// `monitor_silence = "0s"` in TOML and is intentionally a
+// degenerate config: operators who pick it have opted out of
+// status transitions, including Attention.
 func (ps paneStatus) derivedStatus(now time.Time, silenceThreshold time.Duration) SessionStatus {
-	if ps.bell {
-		return StatusAttention
-	}
-	if !ps.everHadOutput {
-		return StatusQuiet
-	}
 	if !ps.lastKeystrokeAt.IsZero() && now.Sub(ps.lastKeystrokeAt) < keystrokeEchoWindow {
 		return StatusIdle
 	}
+	if !ps.everHadOutput {
+		if ps.bell {
+			return StatusAttention
+		}
+		return StatusQuiet
+	}
 	if silenceThreshold <= 0 {
-		// Operator disabled the silence FSM. Once a pane has
-		// had any output it stays Working forever (until a
-		// bell flips it to Attention or the echo-window gate
-		// above fires). This is a deliberate opt-out shape:
-		// `monitor_silence = "0s"` in TOML.
 		return StatusWorking
 	}
-	if now.Sub(ps.lastOutputAt) >= silenceThreshold {
-		return StatusIdle
+	silent := now.Sub(ps.lastOutputAt) >= silenceThreshold
+	if !silent {
+		return StatusWorking
 	}
-	return StatusWorking
+	if ps.bell {
+		return StatusAttention
+	}
+	return StatusIdle
 }
 
 // spinnerFrames is the classic 10-frame braille spinner used by
@@ -238,55 +279,64 @@ var spinnerFrames = []string{
 // still reading as obviously animated.
 const statusFrameInterval = 100 * time.Millisecond
 
-// attentionStyle renders the Attention glyph in ANSI red plus
-// bold. Red (color 1) is the universal "needs you / error /
-// warning" color across every mainstream terminal theme
-// (Solarized, Gruvbox, Iceberg, GitHub Dark, Apple defaults,
-// Nord, Dracula), which is the semantic we want.
+// attentionStyle is the identity style — attentionGlyph
+// renders in the same weight and color as the surrounding
+// row, with no bold / foreground override.
 //
-// Hex colors are forbidden by the existing CI grep gate; color
-// 1 is the best 0-15 match to the intent. Bright-red (9) looks
-// slightly louder on dark themes but tends to wash out on light
-// themes, whereas color 1 paints consistently across both.
+// The progression of choices here encodes a deliberate
+// de-escalation of visual weight as we learned what the
+// signal actually needs to convey:
 //
-// Important rendering note: the Attention glyph itself
-// (attentionGlyph below) is intentionally a shape-distinct
-// character, not a colored dot. Earlier iterations used `●`
-// with a red foreground, which worked fine on unhighlighted
-// rows but surfaced a "color around the dot changes, not the
-// dot itself" complaint on the highlighted row. Reason: the
-// highlighted row is painted with rowHighlightStyle
-// (Reverse(true)), which — per ANSI SGR semantics — swaps
-// foreground and background at render time. Applied on top of
-// a `Foreground(red)` glyph, that swap pushes red into the
-// background channel and leaves the glyph drawn in the default
-// foreground. So the user saw "a red-backed cell with a
-// default-colored dot inside", not "a red dot". Using a
-// character whose shape alone screams "attention" means the
-// signal survives the swap: even if red becomes background on
-// the highlighted row, the glyph is still obviously different
-// from the Idle/Quiet dots and the Working spinner. Color is
-// now a reinforcement, not the sole carrier.
-var attentionStyle = lipgloss.NewStyle().
-	Foreground(lipgloss.Color("1")).
-	Bold(true)
+//   - red `●`: loud, semantically "alarm". Problem: users
+//     mapped it to "something broke" when the common case
+//     is the opposite — claude finished successfully and
+//     wants to hand control back.
+//   - red `!`: slightly less loud but still read as
+//     error/warning. Same semantic mismatch.
+//   - bold `✓`: checkmark shape fixes the semantic (reads
+//     as "done / your turn"), but bold made it stand out
+//     more than the Working spinner or Idle dot, which
+//     overstated the signal's urgency. Attention IS
+//     more interesting than Idle — but it is not MORE
+//     urgent; it is just a richer flavor of "done".
+//   - regular `✓`: this version. Shape alone carries the
+//     signal (checkmark is unmistakably different from the
+//     round Idle/Quiet dots and the braille spinner), and
+//     regular weight keeps every sidebar row visually
+//     equal — no row shouts louder than any other.
+//
+// The shape-distinct approach means the signal survives
+// rows painted with rowHighlightStyle's Reverse(true),
+// which swaps foreground/background per ANSI SGR: a
+// color-only signal would invert on highlighted rows, but
+// a checkmark is still a checkmark regardless.
+var attentionStyle = lipgloss.NewStyle()
 
 // attentionGlyph is the character we render for a pane in the
-// Attention state. `!` was chosen because:
+// Attention state. `✓` (U+2713 CHECK MARK) was chosen because:
 //
-//   - It is universally understood as "alert / warning"
-//     regardless of writing system or terminal theme.
+//   - It reads as "task completed / your turn" rather than
+//     "error", which matches the actual semantic of the state
+//     (claude finished a response and, at some point during
+//     the run, rang the bell to say "hey, look at me"). The
+//     previous `!` was technically accurate but read as
+//     alarm/error in live usage — users associated it with
+//     "something broke" when in the common case the session
+//     is simply done and waiting.
 //   - It occupies exactly one cell in every terminal font so
-//     the two-cell status column never jitters.
-//   - Its vertical-stroke shape is unmistakably different from
-//     the round dots (`·`, `●`) used for Quiet/Idle, the
-//     braille spinner used for Working, and anything else the
-//     sidebar is likely to render, which means the attention
-//     signal survives even if the foreground color does not
-//     (see attentionStyle's rendering note).
-//   - ASCII means no font-coverage risk; every terminal sm4c
-//     runs on renders it identically, full stop.
-const attentionGlyph = "!"
+//     the two-cell status column never jitters. Unlike the
+//     heavier `✔` (U+2714), which is width-ambiguous in some
+//     fonts, the narrow `✓` renders as a single cell
+//     consistently across the terminals sm4c targets
+//     (Terminal.app, iTerm2, Alacritty, Kitty, WezTerm,
+//     Ghostty, GNOME Terminal, Konsole).
+//   - Its shape — two diagonal strokes meeting at a point —
+//     is unmistakably different from the round dots (`·`,
+//     `●`) used for Quiet/Idle and the braille spinner used
+//     for Working, so the signal carries even when color
+//     does not (see attentionStyle's rendering note about
+//     Reverse).
+const attentionGlyph = "✓"
 
 // statusGlyph renders the two-column status cell for one
 // session, given the current status and the animation frame.

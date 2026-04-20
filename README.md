@@ -122,9 +122,9 @@ To rename a session, type `/rename <newname>` directly inside the claude pane �
 Session status glyphs (M3d). Each sidebar row starts with a two-column cell that reflects that session's live state:
 
 - `·` (faint) — Quiet: the session is alive but hasn't produced any output yet.
-- `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` (animated braille spinner) — Working: claude is streaming output right now.
-- `●` — Idle: claude finished its response and is waiting for you. Threshold is `monitor_silence` from `config.toml` (default 3s).
-- `!` (red, bold) — Attention: claude rang the terminal bell (permission prompt, error). The glyph stays as a bang until you type into that session's pane, which acknowledges the bell. The shape is deliberately different from the Idle/Quiet dots so the signal carries even on the highlighted row (which paints in reverse video).
+- `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` (animated braille spinner) — Working: claude is streaming output right now. The spinner keeps animating through tool-call boundaries and mid-response bells; it only stops once the pane goes quiet for `monitor_silence` (default 1.5s).
+- `●` — Idle: claude finished its response and the pane has gone quiet.
+- `✓` — Attention: claude rang the terminal bell at some point during the run AND the pane has since gone quiet. The check surfaces only after the byte stream settles, so it genuinely means "claude is done and wants you" rather than "claude rang the bell mid-stream". The check stays up until you type into that session's pane, which acknowledges the bell. The shape is deliberately different from the Idle/Quiet dots so the signal carries even on the highlighted row (which paints in reverse video). The check is rendered in the sidebar's native weight — not bold, not colored — so Attention reads as a calm "done, your turn" rather than an alarm.
 
 The Working spinner is deliberately silenced for ~400ms after every keystroke you forward to a pane. Claude's TUI redraws its prompt line on every keypress, which shows up as a burst of bytes in the pane stream; without this echo-suppression window the spinner would animate while you type and freeze the moment you stop, which is exactly backwards of what "working" should mean.
 

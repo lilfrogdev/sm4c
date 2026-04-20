@@ -46,13 +46,20 @@ type Config struct {
 	// dot in the sidebar. This is wired to tmux's `monitor-silence`
 	// window option on every managed window at spawn time.
 	//
-	// The default (3s) is tuned so a claude response that ends at a
-	// prompt flips to idle within one poll tick after streaming
-	// stops, but a brief mid-response pause (typing indicator, a
-	// slow tool call) does not prematurely flip the glyph. Lowering
-	// this to 1s produces a more reactive sidebar at the cost of
-	// occasional flicker; raising it past 5s delays the "ready for
-	// you" cue.
+	// The default (1.5s) is tuned so a claude response that ends
+	// at a prompt flips to idle within one poll tick after
+	// streaming stops. Earlier iterations used 3s; live usage
+	// showed that was overly generous — users waited a visible
+	// beat after claude finished before the sidebar caught up,
+	// and for short prompts the "done" signal often landed
+	// after the user had already started typing their next
+	// message. 1.5s sits in the tight window between "long
+	// enough to bridge claude's brief mid-response pauses
+	// (thinking-indicator updates, slow tool calls)" and
+	// "short enough that the sidebar reacts in human time".
+	// Lowering further to sub-second values produces visible
+	// flicker on the thinking-indicator boundary; raising past
+	// 2-3s noticeably lags the "ready for you" cue.
 	//
 	// Zero disables monitor-silence entirely — the sidebar will
 	// still track working/quiet via monitor-activity, but will
@@ -82,7 +89,7 @@ func Default() Config {
 	return Config{
 		SocketName:          "sm4c",
 		PrefixKey:           "C-a",
-		MonitorSilence:      Duration(3 * time.Second),
+		MonitorSilence:      Duration(1500 * time.Millisecond),
 		SessionPollInterval: Duration(1 * time.Second),
 		LogLevel:            "info",
 	}
