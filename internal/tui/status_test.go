@@ -3,7 +3,6 @@ package tui
 import (
 	"strings"
 	"testing"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -96,50 +95,49 @@ func TestNotePaneKeystrokeTransitions(t *testing.T) {
 	}
 }
 
-// TestNotificationDebouncedAfterDone pins the time-gate: a Notification that
-// arrives within notificationDebounce of a Done event is suppressed (it is
-// the automatic "I'm done" desktop ping), while one that arrives after the
-// window is allowed through as a genuine "waiting for input" signal.
-func TestNotificationDebouncedAfterDone(t *testing.T) {
+// TestWaitingGatedAfterDone pins the waitingGated state machine:
+//   - Notification after Done is blocked (gate is set by Stop).
+//   - Notification after Done → Working is allowed (gate cleared by Working).
+//   - Notification with no prior Done is always allowed.
+func TestWaitingGatedAfterDone(t *testing.T) {
 	t.Parallel()
 
-	t.Run("within debounce window — blocked", func(t *testing.T) {
+	t.Run("after Done — blocked", func(t *testing.T) {
 		t.Parallel()
 		m := NewModel(Deps{})
 		m.paneByWindow["@1"] = "%1"
 		m.paneToWindow["%1"] = "@1"
-		// doneAt just now → within the 6 s window
 		m.paneStatuses["@1"] = paneStatus{
-			hookState:   hookEventDone,
-			everHadHook: true,
-			doneAt:      time.Now(),
+			hookState:    hookEventDone,
+			everHadHook:  true,
+			waitingGated: true, // set by the Stop event
 		}
 
 		updated, _ := m.Update(hookMsg{paneID: "%1", event: hookEventWaiting})
 		next := updated.(Model)
 		got := next.paneStatuses["@1"].hookState
 		if got != hookEventDone {
-			t.Fatalf("hookState = %v after Notification within debounce; want hookEventDone (blocked)", got)
+			t.Fatalf("hookState = %v after Notification while gated; want hookEventDone (blocked)", got)
 		}
 	})
 
-	t.Run("after debounce window — allowed", func(t *testing.T) {
+	t.Run("after Done then Working — allowed", func(t *testing.T) {
 		t.Parallel()
 		m := NewModel(Deps{})
 		m.paneByWindow["@1"] = "%1"
 		m.paneToWindow["%1"] = "@1"
-		// doneAt well in the past → outside the debounce window
+		// gate was set by Done, then cleared by Working
 		m.paneStatuses["@1"] = paneStatus{
-			hookState:   hookEventDone,
-			everHadHook: true,
-			doneAt:      time.Now().Add(-(notificationDebounce + time.Second)),
+			hookState:    hookEventWorking,
+			everHadHook:  true,
+			waitingGated: false,
 		}
 
 		updated, _ := m.Update(hookMsg{paneID: "%1", event: hookEventWaiting})
 		next := updated.(Model)
 		got := next.paneStatuses["@1"].hookState
 		if got != hookEventWaiting {
-			t.Fatalf("hookState = %v after Notification outside debounce; want hookEventWaiting (allowed)", got)
+			t.Fatalf("hookState = %v after Notification with gate cleared; want hookEventWaiting (allowed)", got)
 		}
 	})
 
@@ -148,7 +146,6 @@ func TestNotificationDebouncedAfterDone(t *testing.T) {
 		m := NewModel(Deps{})
 		m.paneByWindow["@1"] = "%1"
 		m.paneToWindow["%1"] = "@1"
-		// doneAt is zero — no Stop has fired, so Notification is not debounced
 		m.paneStatuses["@1"] = paneStatus{hookState: hookEventNone}
 
 		updated, _ := m.Update(hookMsg{paneID: "%1", event: hookEventWaiting})
@@ -156,6 +153,26 @@ func TestNotificationDebouncedAfterDone(t *testing.T) {
 		got := next.paneStatuses["@1"].hookState
 		if got != hookEventWaiting {
 			t.Fatalf("hookState = %v after Notification with no prior Done; want hookEventWaiting", got)
+		}
+	})
+
+	t.Run("Done sets gate, Working clears it", func(t *testing.T) {
+		t.Parallel()
+		m := NewModel(Deps{})
+		m.paneByWindow["@1"] = "%1"
+		m.paneToWindow["%1"] = "@1"
+
+		// Working → Done: gate should be set
+		m2, _ := m.Update(hookMsg{paneID: "%1", event: hookEventWorking})
+		m3, _ := m2.(Model).Update(hookMsg{paneID: "%1", event: hookEventDone})
+		if !m3.(Model).paneStatuses["@1"].waitingGated {
+			t.Fatalf("waitingGated not set after Done")
+		}
+
+		// Working again: gate should be cleared
+		m4, _ := m3.(Model).Update(hookMsg{paneID: "%1", event: hookEventWorking})
+		if m4.(Model).paneStatuses["@1"].waitingGated {
+			t.Fatalf("waitingGated not cleared after Working")
 		}
 	})
 }
@@ -415,6 +432,73 @@ func TestSidebarRendersWorkingSpinner(t *testing.T) {
 	wantChar := spinnerFrames[0]
 	if !strings.Contains(row, wantChar) {
 		t.Fatalf("rendered row missing Working glyph %q: %q", wantChar, row)
+	}
+}
+
+// TestSpinnerRestartsAfterDone pins the multi-cycle spinner case:
+// Working → Done → Working must re-arm the spinner, not leave it dead.
+// This covers the "spinner stops after first answer" regression.
+func TestSpinnerRestartsAfterDone(t *testing.T) {
+	t.Parallel()
+	m := NewModel(Deps{})
+	m.paneByWindow["@1"] = "%1"
+	m.paneToWindow["%1"] = "@1"
+
+	// Cycle 1: Working → Done
+	m2, _ := m.Update(hookMsg{paneID: "%1", event: hookEventWorking})
+	if !m2.(Model).statusTickArmed {
+		t.Fatalf("cycle 1: Working did not arm ticker")
+	}
+	m3, _ := m2.(Model).Update(hookMsg{paneID: "%1", event: hookEventDone})
+	if m3.(Model).statusTickArmed {
+		t.Fatalf("cycle 1: Done did not clear ticker")
+	}
+	if m3.(Model).statusForWindow("@1") != StatusDone {
+		t.Fatalf("cycle 1: expected StatusDone after Stop")
+	}
+
+	// Cycle 2: Working again — spinner must re-arm
+	m4, cmd := m3.(Model).Update(hookMsg{paneID: "%1", event: hookEventWorking})
+	if !m4.(Model).statusTickArmed {
+		t.Fatalf("cycle 2: Working did not re-arm ticker after prior Done")
+	}
+	if cmd == nil {
+		t.Fatalf("cycle 2: Working returned no Cmd")
+	}
+	if m4.(Model).statusForWindow("@1") != StatusWorking {
+		t.Fatalf("cycle 2: expected StatusWorking, got %v", m4.(Model).statusForWindow("@1"))
+	}
+}
+
+// TestSpinnerRestartsAfterDoneAndKeystroke pins the full observed failure
+// sequence: Working → Done → user keystroke (clears glyph) → Working.
+// The spinner must still re-arm after the keystroke clears Done to Idle.
+func TestSpinnerRestartsAfterDoneAndKeystroke(t *testing.T) {
+	t.Parallel()
+	m := NewModel(Deps{})
+	m.paneByWindow["@1"] = "%1"
+	m.paneToWindow["%1"] = "@1"
+
+	// Working → Done
+	m2, _ := m.Update(hookMsg{paneID: "%1", event: hookEventWorking})
+	m3, _ := m2.(Model).Update(hookMsg{paneID: "%1", event: hookEventDone})
+
+	// Keystroke clears Done → Idle (simulated via notePaneKeystroke)
+	m3.(Model).notePaneKeystroke("%1")
+	if m3.(Model).paneStatuses["@1"].hookState != hookEventNone {
+		t.Fatalf("keystroke did not clear Done to None")
+	}
+	if m3.(Model).statusTickArmed {
+		t.Fatalf("statusTickArmed should be false after Done")
+	}
+
+	// Working again — spinner must re-arm
+	m4, cmd := m3.(Model).Update(hookMsg{paneID: "%1", event: hookEventWorking})
+	if !m4.(Model).statusTickArmed {
+		t.Fatalf("Working did not re-arm ticker after Done+keystroke")
+	}
+	if cmd == nil {
+		t.Fatalf("Working returned no Cmd after Done+keystroke")
 	}
 }
 

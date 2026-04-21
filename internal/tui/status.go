@@ -13,10 +13,10 @@ import (
 //
 // State machine per pane (hook-driven):
 //
-//	Any  ──(UserPromptSubmit)──> Working   (spinner animates)
-//	Any  ──(Stop)──────────────> Done      (green ✓)
-//	Any  ──(Notification)──────> Waiting   (yellow ?)
-//	Any  ──(user keystroke)────> Idle      (clears Done/Waiting)
+//	Any     ──(UserPromptSubmit)──> Working   (spinner animates; clears waitingGated)
+//	Any     ──(Stop)──────────────> Done      (green ✓; sets waitingGated)
+//	Working ──(Notification)──────> Waiting   (yellow ?; blocked while waitingGated)
+//	Any     ──(user keystroke)────> Idle      (clears Done/Waiting)
 //
 // Sessions that have never received a hook event show StatusQuiet (faint
 // dot). Sessions whose hook state was cleared by a keystroke show StatusIdle
@@ -71,14 +71,6 @@ const (
 	StatusWaiting
 )
 
-// notificationDebounce is the window after a Stop event during which a
-// Notification (hookEventWaiting) is suppressed. Claude Code fires its
-// desktop notification ~5 s after Stop for both task completions and
-// genuine questions; 7 s catches the automatic completion notification
-// while leaving the pathway open for future Claude Code versions that
-// may fire sooner or with different semantics.
-const notificationDebounce = 7 * time.Second
-
 // paneStatus is the per-window hook state record.
 type paneStatus struct {
 	// hookState is the most recent hook event received for this window.
@@ -91,12 +83,11 @@ type paneStatus struct {
 	// time any hook event arrives; never cleared.
 	everHadHook bool
 
-	// doneAt records when the most recent Stop hook was received. Used
-	// by applyHookEvent to debounce the Notification hook: a Notification
-	// that arrives within notificationDebounce of Done is the automatic
-	// "I'm done" desktop ping, not a genuine "waiting for input" signal,
-	// and is suppressed. Zero value means no Stop has been received yet.
-	doneAt time.Time
+	// waitingGated is true after a Stop event and false after a Working
+	// event. While set, Notification (hookEventWaiting) events are
+	// suppressed: the ? indicator can only appear after the next spinner
+	// cycle, not immediately after a ✓.
+	waitingGated bool
 }
 
 // derivedStatus maps the hook state record to the user-facing SessionStatus.

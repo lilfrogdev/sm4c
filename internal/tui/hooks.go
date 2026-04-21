@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -115,31 +114,31 @@ func (m Model) waitForHookEvent() tea.Cmd {
 // applyHookEvent records the hook state for the pane's owning window.
 // Unknown panes (not yet resolved via paneToWindow) are silently dropped.
 //
-// Done records ps.doneAt so that subsequent Notification events can be
-// debounced: Claude Code fires its desktop notification ~5 s after Stop for
-// both task completions and genuine questions. A Notification that arrives
-// within notificationDebounce of doneAt is suppressed (it's the automatic
-// "I'm done" ping). A Notification that arrives after the window may be a
-// genuine "waiting for input" signal and is allowed through.
+// waitingGated suppresses Notification events until the next Working event:
+// once a Stop fires (✓), the ? indicator is blocked until the user submits
+// another prompt. This prevents both Claude Code's automatic post-completion
+// desktop notification and any stale Notification from showing ? immediately
+// after a ✓.
 func (m Model) applyHookEvent(msg hookMsg) {
 	if msg.paneID == "" {
 		return
 	}
 	windowID := m.paneToWindow[msg.paneID]
 	if windowID == "" {
+		debugf("applyHookEvent: DROP pane=%s event=%d (no window mapping; known panes: %v)", msg.paneID, msg.event, m.paneToWindow)
 		return
 	}
+	debugf("applyHookEvent: pane=%s window=%s event=%d", msg.paneID, windowID, msg.event)
 	ps := m.paneStatuses[windowID]
-	if msg.event == hookEventWaiting {
-		// Suppress Notification if it arrives within the debounce window of
-		// the last Stop. This eliminates the spurious ✓ → ? transition that
-		// occurs when Claude Code fires its automatic completion notification.
-		if !ps.doneAt.IsZero() && time.Since(ps.doneAt) < notificationDebounce {
+	switch msg.event {
+	case hookEventWaiting:
+		if ps.waitingGated {
 			return
 		}
-	}
-	if msg.event == hookEventDone {
-		ps.doneAt = time.Now()
+	case hookEventDone:
+		ps.waitingGated = true
+	case hookEventWorking:
+		ps.waitingGated = false
 	}
 	ps.hookState = msg.event
 	ps.everHadHook = true
