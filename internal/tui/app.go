@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -2142,7 +2143,7 @@ func (m Model) renderSessionList() string {
 		// list-windows poll, so the sidebar reflects the dynamic
 		// session/project label rather than the hardcoded "claude" name.
 		if s.Title != "" {
-			name = s.Title
+			name = stripTitleIcon(s.Title)
 		}
 		if name == "" {
 			// tmux always has a window name; an empty one would
@@ -2287,6 +2288,26 @@ func (m Model) sidebarContentWidth() int {
 //  2. Leave overflow handling to truncLeft, which is applied
 //     later at render time once the column width is known.
 //
+// stripTitleIcon removes the status icon that Claude Code prepends to the
+// terminal title before the project/session name. Claude Code formats its
+// title as "<icon> <name>" where <icon> is a single non-alphanumeric rune
+// (a braille spinner frame, ✓, ?, or similar) followed by a space. The
+// icon is decorative metadata that sm4c already surfaces through its own
+// status glyph column, so we strip it to avoid showing it twice.
+//
+// The rule: if the first rune is not a Unicode letter or decimal digit,
+// and the second rune is a space, drop both. Otherwise the title is
+// returned as-is. This is intentionally narrow — only the single-char
+// prefix pattern is matched — so titles that legitimately start with
+// punctuation (e.g. "(archived) my-project") are left untouched.
+func stripTitleIcon(title string) string {
+	runes := []rune(title)
+	if len(runes) >= 2 && !unicode.IsLetter(runes[0]) && !unicode.IsDigit(runes[0]) && runes[1] == ' ' {
+		return strings.TrimSpace(string(runes[2:]))
+	}
+	return title
+}
+
 // Returns "" for empty input so callers can skip the whole
 // "render a second line" branch with a cheap string check.
 func shortPath(p string) string {

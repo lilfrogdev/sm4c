@@ -388,3 +388,32 @@ func TestSidebarBindingsAdvertiseHide(t *testing.T) {
 		t.Fatalf("sidebarBindings `z` desc does not mention hide/zoom/collapse: %+v", sidebarBindings)
 	}
 }
+
+// TestStripTitleIcon pins the icon-stripping logic for Claude Code's
+// "<icon> <name>" terminal title format.
+func TestStripTitleIcon(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"⠋ my-project", "my-project"},
+		{"✓ my-project", "my-project"},
+		{"? my-project", "my-project"},
+		{"my-project", "my-project"},
+		{"", ""},
+		{"a", "a"},
+		{"claude", "claude"},
+		{"(archived) project", "(archived) project"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			got := stripTitleIcon(tc.in)
+			if got != tc.want {
+				t.Fatalf("stripTitleIcon(%q) = %q; want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

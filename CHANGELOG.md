@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Sidebar session names strip Claude Code's animated status icon prefix. Claude Code formats its terminal title as `<icon> <name>` (e.g. `⠋ my-project`) where the icon is a spinner frame, `✓`, or `?`. sm4c already surfaces session status through its own glyph column, so the icon is stripped — only the project/session name is shown. The rule is narrow: only a single non-alphanumeric leading rune followed by a space is removed, so titles that happen to start with punctuation are left untouched.
 - Sidebar session names now reflect Claude Code's dynamic terminal title. Claude Code writes its session/project name via OSC 0/2 escape sequences. tmux intercepts and stores these as `#{pane_title}`, which sm4c now includes in the `list-windows` poll format. `renderSessionList` prefers the OSC title over the static tmux window name ("claude") when one is available, so the sidebar shows names like "my-project" — identical to what Ghostty/WezTerm tab titles show.
 
 ### Fixed
