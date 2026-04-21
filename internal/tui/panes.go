@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"io"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/vt"
@@ -103,6 +104,18 @@ type KeySender func(ctx context.Context, paneID string, data []byte) error
 // where the user's tmux is pre-3.2. Production callers wrap
 // tmuxctl.OneShot.ResizeWindow.
 type WindowResizer func(ctx context.Context, windowID string, width, height int) error
+
+// PaneScroller asks tmux to scroll the given pane's scrollback history up
+// or down. The TUI calls it when the user spins the mouse wheel in pane
+// focus mode. Unlike KeySender, which writes raw bytes into the pane's
+// PTY input (reaching Claude Code's process), PaneScroller engages
+// tmux's own copy-mode mechanism, which operates on tmux's scrollback
+// buffer independently of the process running in the pane.
+//
+// A nil PaneScroller disables mouse-wheel scrollback in pane focus;
+// the scroll events are silently dropped and the view stays put.
+// Production callers wrap tmuxctl.OneShot.ScrollPane.
+type PaneScroller func(ctx context.Context, paneID string, up bool) error
 
 // WindowCloser terminates a tmux window (the "close session" action)
 // identified by its tmux window ID. The TUI invokes it when the user
@@ -212,7 +225,11 @@ func (p *paneTerminal) render() string {
 	if p == nil || p.emu == nil {
 		return ""
 	}
-	return p.emu.Render()
+	// cellbuf.Render() joins rows with \r\n. Strip the \r so Bubble Tea's
+	// incremental diff sees plain \n-terminated lines: the \r would confuse
+	// the visible-width measurement, causing the diff to skip "erase to end
+	// of line" sequences and leave stale characters on screen.
+	return strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
 }
 
 // paneDataMsg is delivered when the pane event stream yielded a
@@ -387,6 +404,23 @@ func (m Model) captureActivePane(paneID string) tea.Cmd {
 		defer cancel()
 		data, err := capturer(ctx, paneID)
 		return paneCaptureMsg{paneID: paneID, data: data, err: err}
+	}
+}
+
+// scrollPaneCmd returns a tea.Cmd that asks PaneScroller to scroll
+// the tmux pane's scrollback history. up=true scrolls towards older
+// output; up=false scrolls towards newer output. Returns nil when no
+// scroller is wired or paneID is empty.
+func (m Model) scrollPaneCmd(paneID string, up bool) tea.Cmd {
+	if m.paneScroller == nil || paneID == "" {
+		return nil
+	}
+	scroller := m.paneScroller
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+		defer cancel()
+		_ = scroller(ctx, paneID, up)
+		return nil
 	}
 }
 

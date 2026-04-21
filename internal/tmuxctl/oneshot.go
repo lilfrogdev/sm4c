@@ -552,6 +552,50 @@ func intToDecimal(n int) string {
 	return string(buf[i:])
 }
 
+// ScrollPane scrolls the given pane's scrollback buffer inside tmux
+// copy-mode. up=true scrolls toward older output; up=false toward newer.
+//
+// It issues two tmux commands in sequence:
+//
+//  1. copy-mode -e: enter copy-mode on the pane (no-op if already in it;
+//     -e makes copy-mode exit automatically when the user reaches the
+//     bottom of the scrollback buffer, restoring the live view).
+//  2. send-keys -X scroll-up / scroll-down: scroll one unit in the
+//     chosen direction.
+//
+// This is the correct way to scroll tmux's scrollback from outside: SGR
+// mouse sequences (\x1b[<64;1;1M) go to the pane's PTY input (i.e.
+// claude's stdin), not to tmux's scroll mechanism.
+//
+// Missing server / missing pane returns ErrNoSuchPane. The TUI treats
+// scroll failures as silent drops — one missed scroll event is better
+// than flashing an error on every wheel tick.
+func (o OneShot) ScrollPane(ctx context.Context, paneID string, up bool) error {
+	if err := safe.Arg(paneID); err != nil {
+		return fmt.Errorf("tmuxctl: ScrollPane: paneID: %w", err)
+	}
+	if _, err := parsePaneID([]byte(paneID)); err != nil {
+		return fmt.Errorf("tmuxctl: ScrollPane: %w", err)
+	}
+	if _, err := o.run(ctx, "copy-mode", "-e", "-t", paneID); err != nil {
+		if errors.Is(err, ErrServerNotRunning) {
+			return ErrNoSuchPane
+		}
+		return err
+	}
+	direction := "scroll-up"
+	if !up {
+		direction = "scroll-down"
+	}
+	if _, err := o.run(ctx, "send-keys", "-t", paneID, "-X", direction); err != nil {
+		if errors.Is(err, ErrServerNotRunning) {
+			return ErrNoSuchPane
+		}
+		return err
+	}
+	return nil
+}
+
 // KillServer terminates the sm4c tmux server. It returns nil if the
 // server was already gone (idempotent teardown is the only sensible
 // behavior for a `sm4c stop`).

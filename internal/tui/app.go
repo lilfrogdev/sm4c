@@ -126,7 +126,9 @@ type Deps struct {
 	PaneCapturer     PaneCapturer
 	WindowResizer    WindowResizer
 	WindowCloser     WindowCloser
-	KeySender        KeySender
+	KeySender    KeySender
+	PaneScroller PaneScroller
+
 	InitialHighlight string
 	InitialFocus     Focus
 
@@ -402,6 +404,12 @@ type Model struct {
 	// UX is testable without a live tmux server).
 	keySender KeySender
 
+	// paneScroller is the mouse-wheel scrollback seam. When non-nil and
+	// the user scrolls the wheel in pane focus mode, it is called to
+	// engage tmux's copy-mode on the highlighted pane's scrollback
+	// buffer. Nil silently drops wheel events in pane focus.
+	paneScroller PaneScroller
+
 	// skipCaptureWindow is the tmux window ID for which the first
 	// pane resolution should skip the capture-pane backfill round-
 	// trip. It is set from Deps.InitialHighlight and consumed
@@ -517,6 +525,7 @@ func NewModel(deps Deps) Model {
 		windowResizer:     deps.WindowResizer,
 		windowCloser:      deps.WindowCloser,
 		keySender:         deps.KeySender,
+		paneScroller:      deps.PaneScroller,
 		paneByWindow:      make(map[string]string),
 		paneErrByWindow:   make(map[string]error),
 		paneTerminals:     make(map[string]*paneTerminal),
@@ -1420,9 +1429,11 @@ func (m Model) handleKeyInPaneFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // handleMouse handles mouse wheel events for scrolling. In sidebar focus
-// mode, wheel-up/down navigate the session list. In pane focus mode, the
-// scroll bytes are forwarded to the tmux pane using SGR 1006 extended mouse
-// encoding so claude's terminal receives standard wheel-scroll sequences.
+// mode, wheel-up/down navigate the session list. In pane focus mode,
+// wheel-up/down engage tmux copy-mode on the highlighted pane's scrollback
+// buffer via PaneScroller (two tmux round-trips: copy-mode then scroll-up/
+// scroll-down). SGR sequences are NOT used here — they would go to claude's
+// PTY input, not to tmux's scroll mechanism.
 func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
@@ -1436,7 +1447,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// Pane focus: forward SGR wheel-up sequence.
+		// Pane focus: engage tmux copy-mode scrollback (scroll up = older output).
 		if m.highlight < 0 || m.highlight >= len(m.sessions) {
 			return m, nil
 		}
@@ -1444,7 +1455,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if !ok || paneID == "" {
 			return m, nil
 		}
-		return m, m.sendKeysToPane(paneID, []byte("\x1b[<64;1;1M"))
+		return m, m.scrollPaneCmd(paneID, true)
 
 	case tea.MouseButtonWheelDown:
 		if m.focus == FocusSidebar {
@@ -1457,7 +1468,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// Pane focus: forward SGR wheel-down sequence.
+		// Pane focus: engage tmux copy-mode scrollback (scroll down = newer output).
 		if m.highlight < 0 || m.highlight >= len(m.sessions) {
 			return m, nil
 		}
@@ -1465,7 +1476,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if !ok || paneID == "" {
 			return m, nil
 		}
-		return m, m.sendKeysToPane(paneID, []byte("\x1b[<65;1;1M"))
+		return m, m.scrollPaneCmd(paneID, false)
 	}
 	return m, nil
 }
