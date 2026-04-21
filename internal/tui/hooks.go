@@ -55,7 +55,7 @@ func startHookListener(path string) (<-chan hookMsg, error) {
 	}
 	ch := make(chan hookMsg, 32)
 	go func() {
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		defer close(ch)
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
