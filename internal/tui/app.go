@@ -1240,7 +1240,7 @@ func (m Model) handleKeyInSidebarFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		fp.FileAllowed = false
 		fp.ShowHidden = false
 		fp.AutoHeight = false
-		fp.Height = dirPickerHeight
+		fp.SetHeight(dirPickerHeight)
 		m.dirPicker = &fp
 		return m, fp.Init()
 
