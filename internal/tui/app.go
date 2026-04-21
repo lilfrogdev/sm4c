@@ -2118,11 +2118,8 @@ func (m Model) renderHeader() string {
 // the "highlighted row contains <name> in reverse" contract
 // stays stable for Tests that never emit a WindowSizeMsg.
 //
-// Cards are separated by a single blank line so the list reads
-// as discrete items rather than a tight table — breathing room
-// is the secondary visual channel that carries the "this is a
-// set of separate sessions, not lines of a single document"
-// mental model.
+// Cards are separated by a single newline (no extra blank line
+// between items — live feedback found double spacing too loose).
 //
 // Earlier iterations trailed the first line with the opaque
 // tmux window ID ("@3") rendered faintly. Live usage found the
@@ -2158,7 +2155,7 @@ func (m Model) renderSessionList() string {
 		card := m.renderSessionCard(glyph, name, s.Cwd, contentW, highlighted)
 		cards = append(cards, card)
 	}
-	return strings.Join(cards, "\n\n")
+	return strings.Join(cards, "\n")
 }
 
 // renderSessionCard formats a single session row. Extracted so
@@ -2167,10 +2164,9 @@ func (m Model) renderSessionList() string {
 // being inlined into the loop above.
 //
 // Width accounting. Both cardBaseStyle and sidebarHighlightStyle
-// apply Padding(1, 2) — outer width = Width param, inner text
-// width = Width - cardPaddingW (horizontal padding only). The cwd
-// truncation target subtracts that padding AND the 2-col indent
-// that lines the path up under the session name.
+// apply Padding(1, 0) — outer width = Width param; no horizontal
+// padding, so inner text width equals Width minus the 2-col indent
+// for the cwd line only.
 func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highlighted bool) string {
 	header := glyph + name
 
@@ -2235,13 +2231,13 @@ func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highligh
 }
 
 // cardPaddingW is the total horizontal padding both card variants
-// consume — 2 cols per side from Padding(_, 2). Centralized so the
-// Width math in renderSessionCard stays in agreement with style.go.
-const cardPaddingW = 4
+// consume (none — Padding(1, 0)). Kept as zero so path truncation
+// math stays explicit if we reintroduce side padding later.
+const cardPaddingW = 0
 
 // sidebarContentWidth returns the content-area width inside the
-// sidebar column (sidebarColumnStyle applies Padding(0, 1)). On
-// the test / narrow-terminal paths where we never got a
+// sidebar column (sidebarColumnStyle has no horizontal padding).
+// On the test / narrow-terminal paths where we never got a
 // WindowSizeMsg, returns 0 to signal "unconstrained" — callers
 // downgrade to pre-M3e rendering paths that don't depend on a
 // known column width.
@@ -2249,7 +2245,7 @@ func (m Model) sidebarContentWidth() int {
 	if m.width < minSplitWidth || m.height < 1 {
 		return 0
 	}
-	w := m.sidebarWidth() - 2 // Padding(0, 1) on each side.
+	w := m.sidebarWidth()
 	if w < 1 {
 		return 0
 	}

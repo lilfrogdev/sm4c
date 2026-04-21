@@ -104,7 +104,7 @@ func Default() Config {
 		SessionPollInterval: Duration(1 * time.Second),
 		LogLevel:            "info",
 		SidebarHighlightBG:  "8",
-		SidebarHighlightFG:  "15",
+		SidebarHighlightFG:  "255",
 	}
 }
 

@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Sidebar session cards use **Padding(1, 2)** (was `Padding(0, 1)`): one blank row above/below the text and two columns left/right inside the band so the highlight does not sit flush against the glyphs. `cardPaddingW` is now **4** to match the horizontal padding math. Selected row uses **Bold** on the bar for stronger contrast; the cwd second line no longer uses **Faint** on top of the bar (it was washing out against non-black backgrounds).
+- Sidebar layout: session cards are joined with a **single newline** (no extra blank line between items). **sidebarColumnStyle** and card styles drop horizontal padding so the selection band runs to the sidebar edges; **Padding(1, 0)** keeps only vertical air inside each card. Default highlight foreground is **`255`** (xterm white) instead of **`15`**, and **Bold** on the bar was removed — on many terminals Bold+ANSI15 rendered as a muted blue-gray instead of white. **cardPaddingW** is **0**; **sidebarContentWidth** no longer subtracts sidebar gutters.
 
 ### Added
 

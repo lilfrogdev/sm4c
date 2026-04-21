@@ -65,13 +65,12 @@ var (
 	rowHighlightStyle = lipgloss.NewStyle().Reverse(true)
 
 	// cardBaseStyle is the non-highlighted session-card chrome.
-	// Padding(1, 2) adds one blank row above/below the text and
-	// two columns left/right so the card never sits flush against
-	// the highlight band — live feedback called the old Padding(0,1)
-	// "sniffing the text's crack". Highlighted and non-highlighted
-	// cards share the same padding so the column width stays stable
-	// when cursoring.
-	cardBaseStyle = lipgloss.NewStyle().Padding(1, 2)
+	// Padding(1, 0): vertical gap only so the highlight band does
+	// not sit flush against the glyphs; horizontal padding is
+	// omitted so the bar can run edge-to-edge inside the sidebar
+	// (see sidebarColumnStyle). Highlighted and non-highlighted
+	// cards share the same padding so the column width stays stable.
+	cardBaseStyle = lipgloss.NewStyle().Padding(1, 0)
 
 	// sidebarColumnStyle frames the left column. BorderRight plus
 	// the default NormalBorder gives us a visible vertical line
@@ -79,12 +78,14 @@ var (
 	// NOT call BorderForeground with a color so the separator uses
 	// the terminal's own foreground — stays readable on every
 	// theme, same rationale as every other "color" choice here.
-	// Padding(0, 1) buys a one-column gutter on each side so the
-	// content never touches the border glyphs.
+	// No horizontal padding — session cards span the full inner
+	// width so the selection bar meets the left edge and the
+	// vertical rule (live feedback: gutters looked like accidental
+	// margins). Vertical padding is handled per-card.
 	sidebarColumnStyle = lipgloss.NewStyle().
 				BorderStyle(lipgloss.NormalBorder()).
 				BorderRight(true).
-				Padding(0, 1)
+				Padding(0, 0)
 
 	// rightPaneStyle frames the right (hosted-pane) column. In M3a
 	// it only carries a placeholder string; the style is kept thin
@@ -102,7 +103,11 @@ const (
 	// 0–255 in sm4c.toml (256-color indices are down-mapped by
 	// lipgloss/termenv when the terminal is 16-color only).
 	defaultSidebarHighlightBG = "8"
-	defaultSidebarHighlightFG = "15"
+	// 255 is xterm's brightest grayscale white; ANSI 15 often maps
+	// to the same slot but Bold+15 on some terminals renders as a
+	// muted blue-gray. Default fg 255 survives lipgloss/termenv
+	// down-mapping on 16-color-only sessions.
+	defaultSidebarHighlightFG = "255"
 )
 
 // sidebarHighlightStyle is the selected session card: full-width
@@ -113,12 +118,9 @@ const (
 // can map indices to the terminal's actual color profile.
 func sidebarHighlightStyle(bg, fg string) lipgloss.Style {
 	return lipgloss.NewStyle().
-		Padding(1, 2).
+		Padding(1, 0).
 		Background(lipgloss.Color(bg)).
-		Foreground(lipgloss.Color(fg)).
-		// Bold improves contrast on low-contrast palette mappings
-		// (e.g. "bright black" bg + default-weight fg reading as mud).
-		Bold(true)
+		Foreground(lipgloss.Color(fg))
 }
 
 // sidebarHighlightPathStyle is the cwd second line inside a

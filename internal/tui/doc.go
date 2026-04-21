@@ -16,10 +16,10 @@
 //         working directory, shortened with "~/…" when it lives
 //         under the user's home directory and truncated from the
 //         head with "…" when it would overflow the column. Cards
-//         are separated by a blank line so the list reads as
+//         are separated by a single newline so the list stays
 //         discrete items. The highlighted card is painted as a
 //         solid full-width band using configurable color indices
-//         (default ANSI "8" bg + "15" fg; sm4c.toml allows 0–255
+//         (default "8" bg + "255" fg for bright white; sm4c.toml allows 0–255
 //         with lipgloss/termenv mapping to the terminal profile).
 //         An earlier
 //         round wrapped the highlight in a rounded border; live
@@ -27,7 +27,7 @@
 //         stopped at the border interior, and the border vs.
 //         no-border width mismatch made the list visibly jump
 //         horizontally as the cursor moved). Both variants now
-//         share Padding(1, 2) and no border or margin, so the
+//         share Padding(1, 0) and no border or margin, so the
 //         only visible difference between selected and
 //         unselected rows is the background fill. The unit-test
 //         path (no WindowSizeMsg, unknown content width) falls

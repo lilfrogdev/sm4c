@@ -80,7 +80,7 @@ sm4c reads `sm4c.toml` when you pass `--config` (see `sm4c setup` / `docs` in th
 
 - **`session_poll_interval`** — how often the sidebar refreshes from tmux (default `1s`).
 - **`monitor_silence`** — how long a pane must be quiet before the status glyph treats it as idle (default `1.5s`).
-- **`sidebar_highlight_bg`** / **`sidebar_highlight_fg`** — decimal strings **`"0"`** through **`"255"`**. Indices **`0`–`15`** are the classic ANSI colors; **`16`–`255`** are the xterm 256-color palette. Lipgloss maps them to what your terminal supports (on 16-color-only sessions, higher indices are approximated). Defaults are **`8`** (gray bar) and **`15`** (bright white text). **Opacity / alpha is not available** in the terminal color model. Sm4c does not use hex colors in the TUI (CI-enforced).
+- **`sidebar_highlight_bg`** / **`sidebar_highlight_fg`** — decimal strings **`"0"`** through **`"255"`**. Indices **`0`–`15`** are the classic ANSI colors; **`16`–`255`** are the xterm 256-color palette. Lipgloss maps them to what your terminal supports (on 16-color-only sessions, higher indices are approximated). Defaults are **`8`** (gray bar) and **`255`** (brightest white in the 256 grayscale — reads cleaner than ANSI **`15`** on some themes when combined with backgrounds). **Opacity / alpha is not available** in the terminal color model. Sm4c does not use hex colors in the TUI (CI-enforced).
 
 ## Quickstart
 
