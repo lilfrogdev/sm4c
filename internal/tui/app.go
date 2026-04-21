@@ -857,17 +857,14 @@ func (m Model) handlePaneData(msg paneDataMsg) Model {
 }
 
 // notePaneKeystroke is called when the user sends a keystroke into a pane.
-// It transitions the hook state to reflect that the user is now responding:
-//   - Done / Waiting → Working: show the spinner immediately, before
-//     UserPromptSubmit has a chance to arrive. This also ensures a stale
-//     Notification that arrives after the keystroke cannot override the
-//     spinner (applyHookEvent blocks Notification from Working).
-//   - None / Quiet → None: pane was idle, just clear (stays Idle).
-//   - Working → no-op: UserPromptSubmit already armed the spinner; a
-//     trailing keystroke echo must not clobber it.
+// It clears Done/Waiting glyphs back to Idle — the "user acknowledged and
+// is now responding" signal. The spinner (Working) is not set here; it
+// arrives via the UserPromptSubmit hook once Claude Code processes the
+// submission. statusTickArmed is reset on Done (in the hookMsg handler)
+// so the next Working transition always arms the tick cleanly.
 //
 // everHadHook is preserved so the pane shows Idle (·) rather than
-// snapping back to Quiet (·) when the state is None after a clear.
+// snapping back to Quiet (·) when the state is cleared.
 func (m Model) notePaneKeystroke(paneID string) {
 	if paneID == "" {
 		return
@@ -877,14 +874,12 @@ func (m Model) notePaneKeystroke(paneID string) {
 		return
 	}
 	ps := m.paneStatuses[windowID]
+	// Don't clear Working: if UserPromptSubmit already fired, a trailing
+	// keystroke echo must not clobber the spinner.
 	if ps.hookState == hookEventWorking {
 		return
 	}
-	if ps.hookState == hookEventDone || ps.hookState == hookEventWaiting {
-		ps.hookState = hookEventWorking
-	} else {
-		ps.hookState = hookEventNone
-	}
+	ps.hookState = hookEventNone
 	m.paneStatuses[windowID] = ps
 }
 
@@ -1372,22 +1367,14 @@ func (m Model) handleKeyInPaneFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		wrapped = append(wrapped, "\x1b[201~"...)
 		data = wrapped
 	}
-	// A keystroke into a pane serves two status purposes (see
-	// notePaneKeystroke): it acknowledges any pending Done/Waiting state
-	// by transitioning to Working (spinner) AND it clears idle state so
-	// the pane shows Idle rather than Quiet. We also arm the animation
-	// ticker here when the keystroke transitions to Working, because the
-	// hookMsg path that normally arms it won't fire until UserPromptSubmit
-	// lands asynchronously — without this the spinner would not appear
-	// until the next tick event, which may be 100 ms later or not at all
-	// if the ticker had already self-terminated.
+	// notePaneKeystroke clears any Done/Waiting glyph back to Idle so the
+	// user gets immediate acknowledgement that their input was registered.
+	// The spinner (Working) is NOT set here — it arrives via the
+	// UserPromptSubmit hook. statusTickArmed is reset when Done fires (in
+	// the hookMsg handler) so the hook-driven Working transition always
+	// arms the tick cleanly without needing to arm it here.
 	m.notePaneKeystroke(paneID)
-	cmds := []tea.Cmd{m.sendKeysToPane(paneID, data)}
-	if tick := m.scheduleStatusTick(); tick != nil {
-		m.statusTickArmed = true
-		cmds = append(cmds, tick)
-	}
-	return m, tea.Batch(cmds...)
+	return m, m.sendKeysToPane(paneID, data)
 }
 
 // handleKeysSent reacts to the KeySender round-trip finishing.

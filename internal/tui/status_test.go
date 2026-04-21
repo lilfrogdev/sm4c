@@ -57,8 +57,8 @@ func TestDerivedStatus(t *testing.T) {
 }
 
 // TestNotePaneKeystrokeTransitions pins the keystroke state machine:
-//   - Done → Working (spinner immediately, before UserPromptSubmit arrives)
-//   - Waiting → Working (same)
+//   - Done → None (clears glyph to Idle; spinner comes from UserPromptSubmit hook)
+//   - Waiting → None (same)
 //   - None → None (idle pane stays idle)
 //   - Working → Working (guard: don't clobber an already-armed spinner)
 //
@@ -70,8 +70,8 @@ func TestNotePaneKeystrokeTransitions(t *testing.T) {
 		before    hookEvent
 		wantAfter hookEvent
 	}{
-		{"done → working", hookEventDone, hookEventWorking},
-		{"waiting → working", hookEventWaiting, hookEventWorking},
+		{"done → none", hookEventDone, hookEventNone},
+		{"waiting → none", hookEventWaiting, hookEventNone},
 		{"none → none", hookEventNone, hookEventNone},
 		{"working → working (no-op)", hookEventWorking, hookEventWorking},
 	}
