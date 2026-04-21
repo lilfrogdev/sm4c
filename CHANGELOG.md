@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Mouse wheel scrolling. Scrolling up/down in the sidebar navigates the session list (same as `k`/`j`). Scrolling in pane focus mode forwards SGR wheel-up/down sequences (`\x1b[<64;1;1M` / `\x1b[<65;1;1M`) to the active tmux pane so Claude Code's own scroll behavior works. Note: `WithMouseCellMotion` is now enabled, which means normal terminal text selection requires Shift+drag instead of plain drag.
+
+### Changed
+
+- Right-pane header now shows the Claude Code session title (OSC title, same as the sidebar) instead of the static tmux window name. In pane focus mode the title is highlighted using the chip style instead of appending a separate `[focus]` label — the highlighted name itself serves as the focus indicator. The sidebar-hidden hint (`[ctrl+b: show sidebar]`) is preserved beside the title when zoomed.
+- Notification debounce raised from 6 s to 7 s. The `?` glyph was still occasionally appearing after task completions on some machines where the Claude Code notification hook fires slightly after the 6 s window. 7 s provides an extra second of headroom while still leaving the pathway open for genuine "waiting for input" signals that arrive later.
+
+### Added
+
 - Sidebar session names strip Claude Code's animated status icon prefix. Claude Code formats its terminal title as `<icon> <name>` (e.g. `⠋ my-project`) where the icon is a spinner frame, `✓`, or `?`. sm4c already surfaces session status through its own glyph column, so the icon is stripped — only the project/session name is shown. The rule is narrow: only a single non-alphanumeric leading rune followed by a space is removed, so titles that happen to start with punctuation are left untouched.
 - Sidebar session names now reflect Claude Code's dynamic terminal title. Claude Code writes its session/project name via OSC 0/2 escape sequences. tmux intercepts and stores these as `#{pane_title}`, which sm4c now includes in the `list-windows` poll format. `renderSessionList` prefers the OSC title over the static tmux window name ("claude") when one is available, so the sidebar shows names like "my-project" — identical to what Ghostty/WezTerm tab titles show.
 

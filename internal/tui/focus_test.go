@@ -373,23 +373,23 @@ func TestNilKeySenderMakesPaneFocusReadOnly(t *testing.T) {
 func TestPaneFocusIndicatorAppearsInRightPaneHeader(t *testing.T) {
 	t.Parallel()
 
-	// The right-pane header carries a text marker so the user
+	// The right-pane header carries a text signal so the user
 	// can tell at a glance which surface owns keystrokes without
-	// relying on border color (sm4c's no-hex-colors rule). Pin
-	// both sides of the marker so a refactor can't silently
-	// drop it.
+	// relying on border color (sm4c's no-hex-colors rule).
 	m := withSessions([]Session{{WindowID: "@1", Name: "primary"}})
 
-	// Sidebar focus: the header tells the user how to focus.
+	// Sidebar focus: the header tells the user how to focus via ctrl+b.
 	sidebar := m.renderRightPaneHeader()
 	if !bytes.Contains([]byte(sidebar), []byte("ctrl+b")) {
 		t.Fatalf("sidebar-focus header missing ctrl+b hint: %q", sidebar)
 	}
 
-	// Pane focus: a distinct marker appears.
+	// Pane focus: the session name is highlighted (chip style) and the
+	// ctrl+b-to-focus hint disappears. The header must still contain the
+	// session name so the user knows which session owns the pane.
 	m.focus = FocusPane
 	pane := m.renderRightPaneHeader()
-	if !bytes.Contains([]byte(pane), []byte("[focus]")) {
-		t.Fatalf("pane-focus header missing [focus] marker: %q", pane)
+	if !bytes.Contains([]byte(pane), []byte("primary")) {
+		t.Fatalf("pane-focus header missing session name: %q", pane)
 	}
 }

@@ -74,10 +74,10 @@ const (
 // notificationDebounce is the window after a Stop event during which a
 // Notification (hookEventWaiting) is suppressed. Claude Code fires its
 // desktop notification ~5 s after Stop for both task completions and
-// genuine questions; 6 s catches the automatic completion notification
+// genuine questions; 7 s catches the automatic completion notification
 // while leaving the pathway open for future Claude Code versions that
 // may fire sooner or with different semantics.
-const notificationDebounce = 6 * time.Second
+const notificationDebounce = 7 * time.Second
 
 // paneStatus is the per-window hook state record.
 type paneStatus struct {

@@ -611,6 +611,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 	case sessionsMsg:
 		next := m.handleSessions(msg)
 		return next, tea.Batch(
@@ -1379,6 +1381,57 @@ func (m Model) handleKeyInPaneFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, m.sendKeysToPane(paneID, data)
 }
 
+// handleMouse handles mouse wheel events for scrolling. In sidebar focus
+// mode, wheel-up/down navigate the session list. In pane focus mode, the
+// scroll bytes are forwarded to the tmux pane using SGR 1006 extended mouse
+// encoding so claude's terminal receives standard wheel-scroll sequences.
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		if m.focus == FocusSidebar {
+			if m.highlight > 0 {
+				m.highlight--
+				return m, tea.Batch(
+					m.resolveHighlightedPaneIfNeeded(),
+					m.resizeHighlightedWindow(),
+				)
+			}
+			return m, nil
+		}
+		// Pane focus: forward SGR wheel-up sequence.
+		if m.highlight < 0 || m.highlight >= len(m.sessions) {
+			return m, nil
+		}
+		paneID, ok := m.paneByWindow[m.sessions[m.highlight].WindowID]
+		if !ok || paneID == "" {
+			return m, nil
+		}
+		return m, m.sendKeysToPane(paneID, []byte("\x1b[<64;1;1M"))
+
+	case tea.MouseButtonWheelDown:
+		if m.focus == FocusSidebar {
+			if m.highlight < len(m.sessions)-1 {
+				m.highlight++
+				return m, tea.Batch(
+					m.resolveHighlightedPaneIfNeeded(),
+					m.resizeHighlightedWindow(),
+				)
+			}
+			return m, nil
+		}
+		// Pane focus: forward SGR wheel-down sequence.
+		if m.highlight < 0 || m.highlight >= len(m.sessions) {
+			return m, nil
+		}
+		paneID, ok := m.paneByWindow[m.sessions[m.highlight].WindowID]
+		if !ok || paneID == "" {
+			return m, nil
+		}
+		return m, m.sendKeysToPane(paneID, []byte("\x1b[<65;1;1M"))
+	}
+	return m, nil
+}
+
 // handleKeysSent reacts to the KeySender round-trip finishing.
 // The only error we care about is "pane gone" — that means the
 // session closed between our forward and tmux's receive, and
@@ -1988,34 +2041,23 @@ func (m Model) renderRightPaneHeader() string {
 	}
 	s := m.sessions[m.highlight]
 	name := s.Name
+	if s.Title != "" {
+		name = stripTitleIcon(s.Title)
+	}
 	if name == "" {
 		name = "(unnamed)"
 	}
-	// Window ID (@N) is intentionally omitted from the header —
-	// it is an opaque tmux identifier users never refer to by
-	// hand, and live usage confirmed nobody was reading it. The
-	// session name is the only user-meaningful label in this
-	// slot; `sm4c ls` still surfaces IDs for debugging. This
-	// matches the same decision the sidebar row format made in
-	// M3d polish (see renderSessionList).
-	line := titleStyle.Render(name)
-	// Focus indicator: a bracketed tag lets the user tell at a
-	// glance which surface owns keystrokes. We avoid relying on
-	// border color (sm4c's no-hex-colors rule) and keep the
-	// signal purely in the text channel so every terminal
-	// renders it identically.
+	// In pane focus mode, highlight the session name itself rather
+	// than appending a "[focus]" chip — the name IS the indicator.
+	// In sidebar mode render it plainly with a hint for how to focus.
+	var line string
 	if m.focus == FocusPane {
-		line += "  " + m.chip().Render("[focus]")
-		// When the sidebar is zoomed away, spell out the
-		// restoration path right next to the focus chip —
-		// the only reserved shortcut in this mode is ctrl+b,
-		// and "show sidebar" carries more semantic weight than
-		// "back to sidebar" because there is no visible sidebar
-		// to go back to.
+		line = m.chip().Render(name)
 		if m.sidebarHidden {
 			line += "  " + hintStyle.Render("[ctrl+b: show sidebar]")
 		}
 	} else {
+		line = titleStyle.Render(name)
 		line += "  " + hintStyle.Render("[ctrl+b to focus]")
 	}
 	return line
@@ -2456,6 +2498,7 @@ func Run(
 		tea.WithInput(in),
 		tea.WithOutput(out),
 		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
 	)
 	final, err := p.Run()
 	if err != nil {
