@@ -154,31 +154,6 @@ func statusGlyph(status SessionStatus, frame int) string {
 	return "  "
 }
 
-// statusGlyphPlain is the unstyled two-column cell used when the parent
-// render already applies a background + foreground (the highlighted row).
-// Inner styled spans would fight the parent ANSI sequences; plain characters
-// let the selection band's own colors dominate while still carrying the
-// shape signal (✓ and ? are recognizable without color).
-func statusGlyphPlain(status SessionStatus, frame int) string {
-	switch status {
-	case StatusWorking:
-		idx := frame % len(spinnerFrames)
-		if idx < 0 {
-			idx += len(spinnerFrames)
-		}
-		return spinnerFrames[idx] + " "
-	case StatusDone:
-		return "✓ "
-	case StatusWaiting:
-		return "? "
-	case StatusIdle:
-		return "· "
-	case StatusQuiet:
-		return "· "
-	}
-	return "  "
-}
-
 // statusFrameTickMsg is delivered by the ticker while at least one pane is
 // Working. It carries no payload; the handler advances Model.statusFrame.
 type statusFrameTickMsg struct{}
