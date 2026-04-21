@@ -82,6 +82,16 @@ type Config struct {
 	// LogLevel controls slog output. Valid: "debug", "info", "warn",
 	// "error".
 	LogLevel string `toml:"log_level"`
+
+	// SidebarHighlightBG and SidebarHighlightFG select the ANSI palette
+	// indices (as decimal strings "0" through "15") for the sidebar
+	// session selection bar's background and foreground. They resolve
+	// through the user's terminal theme. Empty string means "use the
+	// built-in default" (blue bar, bright white text). Sm4c does not
+	// support hex colors, 256-color indexes, or alpha — true opacity
+	// is not available in portable 16-color mode.
+	SidebarHighlightBG string `toml:"sidebar_highlight_bg"`
+	SidebarHighlightFG string `toml:"sidebar_highlight_fg"`
 }
 
 // Default returns the built-in defaults. Safe for concurrent read.
@@ -92,6 +102,8 @@ func Default() Config {
 		MonitorSilence:      Duration(1500 * time.Millisecond),
 		SessionPollInterval: Duration(1 * time.Second),
 		LogLevel:            "info",
+		SidebarHighlightBG:  "4",
+		SidebarHighlightFG:  "15",
 	}
 }
 
@@ -159,6 +171,25 @@ func (c Config) Validate() error {
 	}
 	if c.SocketName == "" {
 		return errors.New("config: socket_name must not be empty")
+	}
+	if err := validateANSI16("sidebar_highlight_bg", c.SidebarHighlightBG); err != nil {
+		return err
+	}
+	if err := validateANSI16("sidebar_highlight_fg", c.SidebarHighlightFG); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateANSI16 accepts empty string (caller treats as default) or a
+// decimal string "0".."15" for lipgloss terminal palette indices.
+func validateANSI16(field, s string) error {
+	if s == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 || n > 15 {
+		return fmt.Errorf("config: %s must be empty or ANSI index 0-15, got %q", field, s)
 	}
 	return nil
 }

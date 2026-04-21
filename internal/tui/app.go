@@ -136,6 +136,13 @@ type Deps struct {
 	// environments where the Idle signal would be noise.
 	// Defaults to Config.MonitorSilence, default 3s.
 	SilenceThreshold time.Duration
+
+	// SidebarHighlightBG and SidebarHighlightFG are ANSI palette
+	// indices as decimal strings "0"–"15" for the session
+	// selection bar. Empty strings mean use style.go defaults
+	// (blue + bright white). Plumbed from config.toml by the CLI.
+	SidebarHighlightBG string
+	SidebarHighlightFG string
 }
 
 // Model is the Bubble Tea model backing the sidebar view. Its
@@ -200,6 +207,11 @@ type Model struct {
 	ready            bool
 	listErr          error
 	initialHighlight string
+
+	// sidebarHighlightBG / FG mirror Deps (or defaults); used when
+	// building the selection-band lipgloss style in renderSessionCard.
+	sidebarHighlightBG string
+	sidebarHighlightFG string
 
 	// width / height carry the last tea.WindowSizeMsg. They are 0
 	// until the Bubble Tea runtime sends the first resize (which it
@@ -482,6 +494,14 @@ func NewModel(deps Deps) Model {
 	if silenceThreshold < 0 {
 		silenceThreshold = 0
 	}
+	hlBG := deps.SidebarHighlightBG
+	if hlBG == "" {
+		hlBG = defaultSidebarHighlightBG
+	}
+	hlFG := deps.SidebarHighlightFG
+	if hlFG == "" {
+		hlFG = defaultSidebarHighlightFG
+	}
 	m := Model{
 		lister:            deps.Lister,
 		pollInterval:      pollInterval,
@@ -505,8 +525,10 @@ func NewModel(deps Deps) Model {
 		silenceThreshold:  silenceThreshold,
 		paneViewW:         defaultPaneWidth,
 		paneViewH:         defaultPaneHeight,
-		focus:             FocusSidebar,
-		pendingFocus:      deps.InitialFocus == FocusPane,
+		focus:              FocusSidebar,
+		pendingFocus:       deps.InitialFocus == FocusPane,
+		sidebarHighlightBG: hlBG,
+		sidebarHighlightFG: hlFG,
 	}
 	if deps.PaneStream != nil {
 		m.paneEvents = deps.PaneStream()
@@ -2178,7 +2200,7 @@ func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highligh
 			short = truncLeft(short, textW-2)
 		}
 		if highlighted {
-			body = "  " + cardHighlightPathStyle.Render(short)
+			body = "  " + sidebarHighlightPathStyle(m.sidebarHighlightFG).Render(short)
 		} else {
 			body = "  " + hintStyle.Render(short)
 		}
@@ -2200,7 +2222,9 @@ func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highligh
 	// keep matching.
 	if contentW > 0 {
 		if highlighted {
-			return cardHighlightStyle.Width(contentW).Render(card)
+			return sidebarHighlightStyle(m.sidebarHighlightBG, m.sidebarHighlightFG).
+				Width(contentW).
+				Render(card)
 		}
 		return cardBaseStyle.Width(contentW).Render(card)
 	}

@@ -74,6 +74,14 @@ make build
 ./sm4c --version
 ```
 
+## Configuration (optional)
+
+sm4c reads `sm4c.toml` when you pass `--config` (see `sm4c setup` / `docs` in the repo). Useful keys:
+
+- **`session_poll_interval`** — how often the sidebar refreshes from tmux (default `1s`).
+- **`monitor_silence`** — how long a pane must be quiet before the status glyph treats it as idle (default `1.5s`).
+- **`sidebar_highlight_bg`** / **`sidebar_highlight_fg`** — decimal strings **`"0"`** through **`"15"`** selecting the ANSI palette for the session selection bar. Defaults are **`4`** (blue) and **`15`** (bright white) for strong contrast. **Opacity / alpha is not available** in portable 16-color terminal mode; pick a different pair if your theme needs it. Sm4c does not use hex or 256-color indexes in the TUI.
+
 ## Quickstart
 
 *(M3e polish: session rows are now two-line cards (name + faint working directory), the selection highlight spans the full sidebar column, and `z` hides the sidebar entirely so claude takes the full viewport. Status badges, close-session confirmation, configurable poll cadence, and input routing carried over from M3c/M3d. The compose flow for `n` is the last remaining M3e item.)*

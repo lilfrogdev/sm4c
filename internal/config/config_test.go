@@ -128,6 +128,20 @@ func TestValidateRejectsBadLogLevel(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidSidebarHighlightANSI(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.SidebarHighlightBG = "99"
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted sidebar_highlight_bg=99")
+	}
+	c = Default()
+	c.SidebarHighlightFG = "not-a-number"
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted non-numeric sidebar_highlight_fg")
+	}
+}
+
 func TestValidateRejectsRelativeBinary(t *testing.T) {
 	t.Parallel()
 	c := Default()

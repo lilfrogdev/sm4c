@@ -6,9 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Config: `sidebar_highlight_bg` and `sidebar_highlight_fg` (TOML) — decimal strings **`"0"`**–**`"15"`** for the ANSI palette indices used by the sidebar session selection bar. Defaults **`4`** (blue) and **`15`** (bright white) for high contrast; gray (`8`) was hard to read on many light themes. Empty string means "use built-in default" for that slot. True opacity is not supported in portable 16-color mode (documented in README).
+
 ### Changed
 
-- Sidebar selection bar: `cardHighlightStyle` now sets **foreground ANSI 15** (bright white) on top of **background ANSI 8** (gray). Background-only highlighting left the terminal default text color on the bar — on light themes that often reads as dark blue/gray on dark gray and was nearly illegible. The cwd second line no longer uses `hintStyle` inside the highlight (faint default-fg on gray had the same problem); it uses `cardHighlightPathStyle` (15 + Faint) instead. Status glyphs on the highlighted row use `statusGlyphPlain` so nested lipgloss does not override the parent's foreground.
+- Sidebar selection bar: foreground + background are now configurable and default to blue + bright white instead of gray + white. The cwd line still uses the same foreground family with `Faint`. Status glyphs on the highlighted row still use `statusGlyphPlain` so nested lipgloss does not fight the bar colors.
 
 ### Fixed
 

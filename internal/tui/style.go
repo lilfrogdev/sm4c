@@ -58,9 +58,8 @@ var (
 	//
 	// This is the FALLBACK highlight used only when the sidebar
 	// column width is unknown (test path / narrow stacked layout).
-	// The primary highlight in the split layout is the rounded-
-	// card variant below, which matches the visual the user
-	// asked for in M3e polish.
+	// The primary highlight in the split layout is built by
+	// sidebarHighlightStyle with colors from config / Deps.
 	rowHighlightStyle = lipgloss.NewStyle().Reverse(true)
 
 	// cardBaseStyle is the non-highlighted session-card chrome.
@@ -70,61 +69,6 @@ var (
 	// adding a visible frame to each row (which would turn the
 	// sidebar into a grid of boxes).
 	cardBaseStyle = lipgloss.NewStyle().Padding(0, 1)
-
-	// cardHighlightStyle is the selected session card. It is
-	// identical to cardBaseStyle except for a single-attribute
-	// ANSI bright-black background ("8") that paints a solid
-	// full-width band across the sidebar column — the claude-
-	// squad "filled selection bar" shape the user asked for.
-	//
-	// Three deliberate non-choices:
-	//
-	//   1. No Border. An earlier iteration wrapped the card in
-	//      RoundedBorder(). Live feedback surfaced two problems
-	//      with that: the background color stopped at the
-	//      border interior and left a visible ring of
-	//      unpainted terminal-bg between the text and the
-	//      outline, and the 2-col outer border vs. the base
-	//      card's 0-col frame made the list visibly "jump"
-	//      horizontally as the cursor moved. Dropping the
-	//      border fixes both in one step.
-	//
-	//   2. No Margin. cardBaseStyle has no margin either, so
-	//      both variants have exactly the same outer width
-	//      (Padding(0, 1) on both). The only visual difference
-	//      between a selected and unselected row is the
-	//      background fill — text, indentation, and cwd line
-	//      all land at the same x-coordinates.
-	//
-	//   3. ANSI "8" background + "15" foreground. Background
-	//      alone left the terminal's default text color on top of
-	//      the gray bar — on light themes that is often a dark
-	//      blue/gray that disappears against ANSI 8 (live
-	//      feedback: "not very legible"). Bright white ("15")
-	//      on bright-black ("8") is the standard high-contrast
-	//      pairing within the 16-color rule. The cwd line uses
-	//      cardHighlightPathStyle (15 + Faint) so the second
-	//      line stays secondary without dropping to unreadable
-	//      gray like hintStyle did inside the highlight.
-	//
-	//      Reverse was considered instead of explicit fg/bg, but
-	//      nested lipgloss on status glyphs and the faint path
-	//      fought the parent's inversion unpredictably; explicit
-	//      colors keep one coherent band.
-	cardHighlightStyle = lipgloss.NewStyle().
-				Padding(0, 1).
-				Background(lipgloss.Color("8")).
-				Foreground(lipgloss.Color("15"))
-
-	// cardHighlightPathStyle is the cwd line inside a highlighted
-	// card only. Plain hintStyle applies Faint to the default
-	// foreground — on top of ANSI-8 that produced near-invisible
-	// text. We keep Faint for de-emphasis but pin the base
-	// color to 15 so it stays on the "light ink" side of the
-	// palette against the dark bar.
-	cardHighlightPathStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("15")).
-				Faint(true)
 
 	// sidebarColumnStyle frames the left column. BorderRight plus
 	// the default NormalBorder gives us a visible vertical line
@@ -147,3 +91,32 @@ var (
 	rightPaneStyle = lipgloss.NewStyle().
 			Padding(0, 1)
 )
+
+const (
+	// defaultSidebarHighlightBG / FG apply when Deps leaves the
+	// fields empty (tests, zero-Deps models). Blue + bright white
+	// is a high-contrast selection bar within the 16-color rule.
+	// Gray (8) backgrounds were hard to read with default terminal
+	// foreground on light themes; users can override via
+	// sidebar_highlight_bg / sidebar_highlight_fg in sm4c.toml.
+	defaultSidebarHighlightBG = "4"
+	defaultSidebarHighlightFG = "15"
+)
+
+// sidebarHighlightStyle is the selected session card: full-width
+// band, no border (see M3e doc). bg and fg are ANSI indices "0"–"15".
+func sidebarHighlightStyle(bg, fg string) lipgloss.Style {
+	return lipgloss.NewStyle().
+		Padding(0, 1).
+		Background(lipgloss.Color(bg)).
+		Foreground(lipgloss.Color(fg))
+}
+
+// sidebarHighlightPathStyle is the cwd second line inside a
+// highlighted card — same fg family as the title, Faint for
+// de-emphasis, never hintStyle (which used default fg + faint).
+func sidebarHighlightPathStyle(fg string) lipgloss.Style {
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.Color(fg)).
+		Faint(true)
+}
