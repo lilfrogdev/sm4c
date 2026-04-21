@@ -1654,9 +1654,11 @@ func (m Model) handleDirPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
-// renderDirPickerOverlay renders the directory-picker as a centered
-// floating box over the normal sidebar view. The box shows the current
-// path, the filepicker list, and key hints.
+// renderDirPickerOverlay renders the directory-picker overlay. On a
+// terminal wide enough to split, the sidebar remains visible on the
+// left and the picker box is centered in the right-pane area so the
+// user can still see which sessions exist while choosing a folder. On
+// narrow terminals the box is centered over the full screen.
 func (m Model) renderDirPickerOverlay() string {
 	fp := m.dirPicker
 	dir := fp.CurrentDirectory
@@ -1668,7 +1670,7 @@ func (m Model) renderDirPickerOverlay() string {
 	nav := chip.Render("j/k") + "  navigate   " +
 		chip.Render("l/enter") + "  open dir   " +
 		chip.Render("h") + "  go up"
-	confirm := chip.Render("space") + "  select highlighted   " +
+	confirm := chip.Render("space") + "  open   " +
 		chip.Render("esc") + "  cancel"
 
 	inner := strings.Join([]string{
@@ -1682,11 +1684,24 @@ func (m Model) renderDirPickerOverlay() string {
 		confirm,
 	}, "\n")
 
-	overlayW := 60
-	if m.width > 0 && m.width-8 < overlayW {
-		overlayW = m.width - 8
-		if overlayW < 24 {
-			overlayW = 24
+	// On a wide terminal the picker floats in the right-pane area; on
+	// a narrow terminal it gets the full width. Compute the canvas
+	// (rightW / m.width) first, then cap the inner box width to fit
+	// inside it (accounting for border 2 + padding 4 = 6 columns of
+	// chrome around the inner content).
+	canvasW := m.width
+	useSplit := m.width >= minSplitWidth && m.height > 0
+	sidebarW := 0
+	if useSplit {
+		sidebarW = m.sidebarWidth()
+		canvasW = m.width - sidebarW - 1 // -1 for the sidebar border
+	}
+
+	overlayW := 56
+	if maxInner := canvasW - 10; maxInner < overlayW {
+		overlayW = maxInner
+		if overlayW < 20 {
+			overlayW = 20
 		}
 	}
 
@@ -1695,6 +1710,15 @@ func (m Model) renderDirPickerOverlay() string {
 		Padding(0, 2).
 		Width(overlayW).
 		Render(inner)
+
+	if useSplit {
+		sidebar := sidebarColumnStyle.
+			Width(sidebarW).
+			Height(m.height).
+			Render(m.renderSidebarColumn())
+		right := lipgloss.Place(canvasW, m.height, lipgloss.Center, lipgloss.Center, box)
+		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, right)
+	}
 
 	if m.width > 0 && m.height > 0 {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
@@ -2303,9 +2327,6 @@ func (m Model) renderSessionList() string {
 		status := m.statusForWindow(s.WindowID)
 		highlighted := i == m.highlight
 		glyph := statusGlyph(status, m.statusFrame)
-		if highlighted && contentW > 0 {
-			glyph = statusGlyphPlain(status, m.statusFrame)
-		}
 		name := s.Name
 		// Prefer the OSC terminal title captured by tmux (#{pane_title})
 		// over the static tmux window name. Claude Code sets this via

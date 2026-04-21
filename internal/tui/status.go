@@ -143,9 +143,9 @@ func statusGlyph(status SessionStatus, frame int) string {
 		}
 		return spinnerFrames[idx] + " "
 	case StatusDone:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render("✓") + " "
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Bold(true).Render("✓") + " "
 	case StatusWaiting:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render("?") + " "
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true).Render("?") + " "
 	case StatusIdle:
 		return "· "
 	case StatusQuiet:
