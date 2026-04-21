@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Sidebar session cards use **Padding(1, 2)** (was `Padding(0, 1)`): one blank row above/below the text and two columns left/right inside the band so the highlight does not sit flush against the glyphs. `cardPaddingW` is now **4** to match the horizontal padding math. Selected row uses **Bold** on the bar for stronger contrast; the cwd second line no longer uses **Faint** on top of the bar (it was washing out against non-black backgrounds).
+
 ### Added
 
 - Config: `sidebar_highlight_bg` and `sidebar_highlight_fg` accept decimal indices **`"0"`**–**`"255"`** — ANSI **0–15** plus the **xterm 256-color** palette **16–255**. `tui.Run` calls **`lipgloss.SetDefaultRenderer(lipgloss.NewRenderer(out))`** so termenv probes the real output stream and lipgloss maps indices to the terminal's color profile (256-color sequences when supported, otherwise down-mapped to the nearest ANSI color). Empty string still means built-in defaults.

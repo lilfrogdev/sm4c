@@ -65,12 +65,13 @@ var (
 	rowHighlightStyle = lipgloss.NewStyle().Reverse(true)
 
 	// cardBaseStyle is the non-highlighted session-card chrome.
-	// Padding(0, 1) buys two columns of breathing room between
-	// the card content and the sidebar column border — the
-	// "add padding on the right and left" user ask — without
-	// adding a visible frame to each row (which would turn the
-	// sidebar into a grid of boxes).
-	cardBaseStyle = lipgloss.NewStyle().Padding(0, 1)
+	// Padding(1, 2) adds one blank row above/below the text and
+	// two columns left/right so the card never sits flush against
+	// the highlight band — live feedback called the old Padding(0,1)
+	// "sniffing the text's crack". Highlighted and non-highlighted
+	// cards share the same padding so the column width stays stable
+	// when cursoring.
+	cardBaseStyle = lipgloss.NewStyle().Padding(1, 2)
 
 	// sidebarColumnStyle frames the left column. BorderRight plus
 	// the default NormalBorder gives us a visible vertical line
@@ -112,16 +113,20 @@ const (
 // can map indices to the terminal's actual color profile.
 func sidebarHighlightStyle(bg, fg string) lipgloss.Style {
 	return lipgloss.NewStyle().
-		Padding(0, 1).
+		Padding(1, 2).
 		Background(lipgloss.Color(bg)).
-		Foreground(lipgloss.Color(fg))
+		Foreground(lipgloss.Color(fg)).
+		// Bold improves contrast on low-contrast palette mappings
+		// (e.g. "bright black" bg + default-weight fg reading as mud).
+		Bold(true)
 }
 
 // sidebarHighlightPathStyle is the cwd second line inside a
-// highlighted card — same fg index as the title, Faint for
-// de-emphasis, never hintStyle (which used default fg + faint).
+// highlighted card. We deliberately do NOT use Faint here — on top
+// of a colored bar it pushed the path below WCAG-ish contrast in
+// live testing; the second line is already de-emphasized by being
+// a separate line under the session name.
 func sidebarHighlightPathStyle(fg string) lipgloss.Style {
 	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color(fg)).
-		Faint(true)
+		Foreground(lipgloss.Color(fg))
 }

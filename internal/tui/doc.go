@@ -27,7 +27,7 @@
 //         stopped at the border interior, and the border vs.
 //         no-border width mismatch made the list visibly jump
 //         horizontally as the cursor moved). Both variants now
-//         share Padding(0, 1) and no border or margin, so the
+//         share Padding(1, 2) and no border or margin, so the
 //         only visible difference between selected and
 //         unselected rows is the background fill. The unit-test
 //         path (no WindowSizeMsg, unknown content width) falls

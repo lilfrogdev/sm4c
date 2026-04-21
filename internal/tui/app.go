@@ -2166,17 +2166,16 @@ func (m Model) renderSessionList() string {
 // inline-highlight) lives in one readable place instead of
 // being inlined into the loop above.
 //
-// Width accounting. Both cardBaseStyle and cardHighlightStyle
-// apply Padding(0, 1) and nothing else, so lipgloss's Width()
-// sizes the block directly — outer width = Width param, inner
-// text width = Width - 2 (padding). The cwd truncation target
-// subtracts the padding AND the 2-col indent that lines the
-// path up under the session name.
+// Width accounting. Both cardBaseStyle and sidebarHighlightStyle
+// apply Padding(1, 2) — outer width = Width param, inner text
+// width = Width - cardPaddingW (horizontal padding only). The cwd
+// truncation target subtracts that padding AND the 2-col indent
+// that lines the path up under the session name.
 func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highlighted bool) string {
 	header := glyph + name
 
 	// textW is the width available for actual glyphs inside
-	// Padding(0, 1). Used to truncate the cwd line so it never
+	// horizontal padding. Used to truncate the cwd line so it never
 	// wraps into a third row.
 	textW := 0
 	if contentW > cardPaddingW {
@@ -2236,9 +2235,9 @@ func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highligh
 }
 
 // cardPaddingW is the total horizontal padding both card variants
-// consume — 2 cols of Padding(0, 1). Centralized so the Width
-// math in renderSessionCard stays in agreement with style.go.
-const cardPaddingW = 2
+// consume — 2 cols per side from Padding(_, 2). Centralized so the
+// Width math in renderSessionCard stays in agreement with style.go.
+const cardPaddingW = 4
 
 // sidebarContentWidth returns the content-area width inside the
 // sidebar column (sidebarColumnStyle applies Padding(0, 1)). On
