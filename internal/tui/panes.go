@@ -135,17 +135,9 @@ const (
 // drawn something", so we can keep showing a "waiting for output"
 // hint until claude actually emits bytes instead of flashing an
 // empty grid.
-//
-// title holds the most recent window title received via OSC 0 or
-// OSC 2 sequences. Claude Code writes its session/project name as
-// the terminal title; sm4c propagates this into the sidebar so
-// session names reflect dynamic context rather than the static tmux
-// window name ("claude"). Updated synchronously by the vt.Callbacks
-// Title hook during emu.Write — no goroutine or channel needed.
 type paneTerminal struct {
 	emu     *vt.Emulator
 	written bool
-	title   string
 }
 
 // newPaneTerminal constructs a fresh emulator at the given
@@ -183,16 +175,7 @@ func newPaneTerminal(width, height int) *paneTerminal {
 	go func() {
 		_, _ = io.Copy(io.Discard, emu)
 	}()
-	pt := &paneTerminal{emu: emu}
-	// Wire the OSC title callback so Claude Code's dynamic session/project
-	// name (written via OSC 0/2) propagates into the sidebar. The callback
-	// fires synchronously during emu.Write, so no channel or goroutine is
-	// needed — write → callback → pt.title updated, all on the caller's
-	// goroutine (the Bubble Tea main loop).
-	emu.SetCallbacks(vt.Callbacks{
-		Title: func(t string) { pt.title = t },
-	})
-	return pt
+	return &paneTerminal{emu: emu}
 }
 
 // write feeds a chunk of bytes to the emulator and records that we

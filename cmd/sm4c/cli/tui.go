@@ -444,6 +444,7 @@ func sessionLister(o tmuxctl.OneShot) tui.SessionLister {
 				Name:     w.Name,
 				Active:   w.Active,
 				Cwd:      w.CurrentPath,
+				Title:    w.PaneTitle,
 			})
 		}
 		return out, nil

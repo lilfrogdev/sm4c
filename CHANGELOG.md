@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Sidebar session names now reflect Claude Code's dynamic terminal title. Claude Code writes its session/project name via OSC 0/2 sequences (the same mechanism terminal tabs use for renaming). The VT emulator's `Title` callback captures these sequences synchronously during pane writes, and `paneTitles[windowID]` is updated on every `%output` chunk. `renderSessionList` prefers the OSC title over the static tmux window name ("claude") when one is available, so the sidebar shows names like "my-project" or whatever Claude Code set — identical to what Ghostty/WezTerm tab titles show.
+- Sidebar session names now reflect Claude Code's dynamic terminal title. Claude Code writes its session/project name via OSC 0/2 escape sequences. tmux intercepts and stores these as `#{pane_title}`, which sm4c now includes in the `list-windows` poll format. `renderSessionList` prefers the OSC title over the static tmux window name ("claude") when one is available, so the sidebar shows names like "my-project" — identical to what Ghostty/WezTerm tab titles show.
 
 ### Fixed
 

@@ -182,6 +182,15 @@ type Window struct {
 	// hint under each session name, in the same spirit as
 	// claude-squad and Cursor's grouped-by-repo sidebar.
 	CurrentPath string
+
+	// PaneTitle is the terminal title last set by the pane's process via
+	// OSC 0 or OSC 2 escape sequences, as captured by tmux in
+	// `#{pane_title}`. Claude Code writes its session/project name here
+	// on startup and on context changes. When non-empty this takes
+	// precedence over Name in the sidebar so sessions show their
+	// Claude-assigned label rather than the static tmux window name.
+	// Sanitized via safe.Label before storage.
+	PaneTitle string
 }
 
 // Managed reports whether this window was created by sm4c (tagged with
@@ -210,8 +219,9 @@ func (w Window) Managed() bool { return w.Kind == KindClaude }
 //   - #{@sm4c-kind}          : controlled by sm4c ("" or "claude")
 //   - #{window_flags}        : subset of "*+-!#~M"
 //   - #{pane_current_path}   : active pane's cwd, absolute path
-//   - #{window_name}         : untrusted
-const listWindowsFormat = "#{window_id}\t#{window_active}\t#{session_name}\t#{@sm4c-kind}\t#{window_flags}\t#{pane_current_path}\t#{window_name}"
+//   - #{pane_title}          : last OSC 0/2 title set by the pane, untrusted
+//   - #{window_name}         : untrusted, must be last (free-form field)
+const listWindowsFormat = "#{window_id}\t#{window_active}\t#{session_name}\t#{@sm4c-kind}\t#{window_flags}\t#{pane_current_path}\t#{pane_title}\t#{window_name}"
 
 // ListWindows returns every window visible on the sm4c tmux server, in
 // tmux's native ordering. If the server is not running this returns
@@ -237,11 +247,15 @@ func parseWindows(out []byte) ([]Window, error) {
 		if len(rawLine) == 0 {
 			continue
 		}
-		// Splitn with N=7 so that any tabs present in the free-form
-		// window_name stay bundled into the final field. See
+		// Splitn with N=8 so that any tabs present in the free-form
+		// window_name (last field) stay bundled into the final slot.
+		// pane_title (second-to-last) is also untrusted but rarely
+		// contains tabs in practice; a tab would truncate the title
+		// at the tab boundary after safe.Label strips the control byte,
+		// which is an acceptable cosmetic degradation. See
 		// listWindowsFormat for the slot order.
-		parts := strings.SplitN(string(rawLine), "\t", 7)
-		if len(parts) != 7 {
+		parts := strings.SplitN(string(rawLine), "\t", 8)
+		if len(parts) != 8 {
 			return nil, fmt.Errorf("tmuxctl: malformed list-windows row: %q", safe.Line(string(rawLine)))
 		}
 		w := Window{
@@ -250,7 +264,8 @@ func parseWindows(out []byte) ([]Window, error) {
 			Kind:        parts[3],
 			Flags:       parts[4],
 			CurrentPath: safe.Line(parts[5]),
-			Name:        safe.Label(parts[6]),
+			PaneTitle:   safe.Label(parts[6]),
+			Name:        safe.Label(parts[7]),
 			Active:      parts[1] == "1",
 		}
 		wins = append(wins, w)

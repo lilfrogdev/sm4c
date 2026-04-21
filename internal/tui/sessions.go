@@ -64,6 +64,14 @@ type Session struct {
 	// remember the mapping from session name to filesystem. Purely
 	// informational; sm4c itself never chdir's based on it.
 	Cwd string
+
+	// Title is the terminal title set by Claude Code via OSC 0/2
+	// sequences, as captured by tmux in #{pane_title}. When non-empty
+	// the sidebar shows this instead of Name, so sessions reflect
+	// Claude Code's dynamic session/project label rather than the
+	// static tmux window name ("claude"). Updated on every
+	// SessionLister poll tick.
+	Title string
 }
 
 // SessionLister is the TUI's seam onto tmux. It is injected by the
