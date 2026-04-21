@@ -548,6 +548,18 @@ func (o OneShot) KillServer(ctx context.Context) error {
 	return err
 }
 
+// SetGlobalEnv sets a global tmux environment variable on the sm4c socket.
+// It is used to propagate SM4C_HOOK_FIFO so that Claude Code lifecycle hooks
+// running inside managed panes know where to write their events.
+// Best-effort: callers should ignore errors when the server is not yet running.
+func (o OneShot) SetGlobalEnv(ctx context.Context, key, value string) error {
+	if err := safe.Arg(key); err != nil {
+		return fmt.Errorf("tmuxctl: SetGlobalEnv: key %q: %w", key, err)
+	}
+	_, err := o.run(ctx, "set-environment", "-g", key, value)
+	return err
+}
+
 // SessionExists returns true iff the sm4c session is present on a live
 // server. The difference from ServerRunning is that a live server with
 // no sm4c session returns (false, nil) here.

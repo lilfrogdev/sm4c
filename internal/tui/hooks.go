@@ -1,0 +1,133 @@
+package tui
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"strings"
+	"syscall"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+// hookEvent is the state transition reported by a Claude Code lifecycle hook.
+type hookEvent uint8
+
+const (
+	hookEventNone    hookEvent = iota
+	hookEventWorking           // UserPromptSubmit: Claude received input, now working
+	hookEventDone             // Stop: Claude finished responding
+	hookEventWaiting          // Notification: Claude needs attention or input
+)
+
+// hookMsg is delivered to the Bubble Tea runtime when a hook fires.
+type hookMsg struct {
+	paneID string
+	event  hookEvent
+}
+
+// hookStreamClosedMsg fires when the FIFO reader goroutine terminates.
+type hookStreamClosedMsg struct{}
+
+// startHookListener creates the FIFO at path (mkfifo), opens it O_RDWR so
+// the reader holds both ends — preventing EOF when hook writers close between
+// writes — and starts a goroutine that parses lines and sends hookMsg values
+// on the returned channel.
+//
+// Each line written by a hook script must be: "<pane_id> <event_type>\n"
+// where event_type is one of: "prompt_submit", "stop", "notification".
+// Unrecognized lines are silently skipped.
+//
+// The hook scripts that write to this FIFO should look up the path from the
+// SM4C_HOOK_FIFO tmux environment variable and no-op when it is unset — this
+// prevents global ~/.claude/settings.json hooks from cross-talking into
+// unrelated sm4c instances or plain claude invocations outside tmux.
+func startHookListener(path string) (<-chan hookMsg, error) {
+	if err := syscall.Mkfifo(path, 0600); err != nil && !os.IsExist(err) {
+		return nil, fmt.Errorf("tui: hook listener: mkfifo %s: %w", path, err)
+	}
+	// O_RDWR keeps both ends open so we never receive EOF when the last
+	// hook writer closes its end between writes.
+	f, err := os.OpenFile(path, os.O_RDWR, os.ModeNamedPipe) // #nosec G304 -- path constructed by sm4c, not user input
+	if err != nil {
+		return nil, fmt.Errorf("tui: hook listener: open %s: %w", path, err)
+	}
+	ch := make(chan hookMsg, 32)
+	go func() {
+		defer f.Close()
+		defer close(ch)
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			parts := strings.SplitN(line, " ", 2)
+			if len(parts) != 2 || parts[0] == "" {
+				continue
+			}
+			paneID, evStr := parts[0], parts[1]
+			var ev hookEvent
+			switch evStr {
+			case "prompt_submit":
+				ev = hookEventWorking
+			case "stop":
+				ev = hookEventDone
+			case "notification":
+				ev = hookEventWaiting
+			default:
+				continue
+			}
+			ch <- hookMsg{paneID: paneID, event: ev}
+		}
+	}()
+	return ch, nil
+}
+
+// waitForHookEvent returns a Bubble Tea command that blocks until the next
+// hookMsg arrives. Returns nil when hookEvents is nil (hooks disabled).
+func (m Model) waitForHookEvent() tea.Cmd {
+	if m.hookEvents == nil {
+		return nil
+	}
+	ch := m.hookEvents
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return hookStreamClosedMsg{}
+		}
+		return msg
+	}
+}
+
+// applyHookEvent records the hook state for the pane's owning window.
+// Unknown panes (not yet resolved via paneToWindow) are silently dropped.
+//
+// Done records ps.doneAt so that subsequent Notification events can be
+// debounced: Claude Code fires its desktop notification ~5 s after Stop for
+// both task completions and genuine questions. A Notification that arrives
+// within notificationDebounce of doneAt is suppressed (it's the automatic
+// "I'm done" ping). A Notification that arrives after the window may be a
+// genuine "waiting for input" signal and is allowed through.
+func (m Model) applyHookEvent(msg hookMsg) {
+	if msg.paneID == "" {
+		return
+	}
+	windowID := m.paneToWindow[msg.paneID]
+	if windowID == "" {
+		return
+	}
+	ps := m.paneStatuses[windowID]
+	if msg.event == hookEventWaiting {
+		// Suppress Notification if it arrives within the debounce window of
+		// the last Stop. This eliminates the spurious ✓ → ? transition that
+		// occurs when Claude Code fires its automatic completion notification.
+		if !ps.doneAt.IsZero() && time.Since(ps.doneAt) < notificationDebounce {
+			return
+		}
+	}
+	if msg.event == hookEventDone {
+		ps.doneAt = time.Now()
+	}
+	ps.hookState = msg.event
+	ps.everHadHook = true
+	m.paneStatuses[windowID] = ps
+}

@@ -3,6 +3,7 @@ package tui
 import (
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -127,15 +128,20 @@ type Deps struct {
 	InitialHighlight string
 	InitialFocus     Focus
 
-	// SilenceThreshold is the per-pane "silence" window used by
-	// the M3d status FSM. A pane that has not emitted any bytes
-	// for at least this duration is considered Idle (claude
-	// response finished, prompt waiting). Zero means "never
-	// flip to Idle" — once a pane has had output, it stays
-	// Working forever; this is the opt-out path for
-	// environments where the Idle signal would be noise.
-	// Defaults to Config.MonitorSilence, default 3s.
+	// SilenceThreshold is retained for backward-compatible config
+	// unmarshalling but is no longer used at runtime; status is now
+	// driven entirely by Claude Code lifecycle hooks. Callers that
+	// still pass it will see no effect.
 	SilenceThreshold time.Duration
+
+	// HookFifoPath is the path to the named pipe Claude Code hook
+	// scripts write event lines to. When non-empty the TUI creates
+	// the FIFO (if absent) and reads hook events to drive session
+	// status indicators. Empty means hooks are disabled and all
+	// sessions appear as StatusQuiet/StatusIdle. The path is
+	// propagated to claude sessions via the SM4C_HOOK_FIFO
+	// environment variable on the tmux socket.
+	HookFifoPath string
 
 	// SidebarHighlightBG and SidebarHighlightFG are decimal color
 	// index strings "0"–"255" (ANSI 0–15 or xterm 256 palette).
@@ -422,33 +428,22 @@ type Model struct {
 	// for a settled session but correct for a still-booting one.
 	skipCaptureWindow string
 
-	// paneStatuses holds the M3d activity record for each tmux
-	// window sm4c has ever seen output for. Keyed by WINDOW ID
-	// (e.g. "@42") rather than pane ID because status is a
-	// session-level concern — the sidebar shows one row per
-	// window — and because the pane ID underneath a window can
-	// get invalidated and re-resolved during a close-window
-	// storm (see handleWindowClosed). Keying by window ID means
-	// the derived glyph survives that churn: the byte-stream
-	// timestamp is what matters, not which concrete pane ID we
-	// happened to learn first. Populated from handlePaneData,
-	// which looks up the owning window via paneByWindow at
-	// byte-arrival time.
+	// paneStatuses holds the hook-driven status record for each tmux
+	// window. Keyed by WINDOW ID (e.g. "@42") so the derived glyph
+	// survives pane-ID churn during close-window storms. Populated
+	// by applyHookEvent when hook scripts write events to the FIFO.
 	paneStatuses map[string]paneStatus
 
 	// paneToWindow is the reverse of paneByWindow: given a pane
-	// ID (the key %output events carry), find the owning window
-	// ID (the key paneStatuses uses). Maintained alongside
-	// paneByWindow in handlePaneResolved so handlePaneData can
-	// do the paneID → windowID lookup without iterating.
+	// ID (the key %output events and TMUX_PANE carry), find the
+	// owning window ID (the key paneStatuses uses). Maintained
+	// alongside paneByWindow in handlePaneResolved.
 	paneToWindow map[string]string
 
-	// silenceThreshold is the M3d "no output for this long = Idle"
-	// cutoff. Copied from Deps.SilenceThreshold at NewModel time
-	// and never mutated, so the derived-status calculation is
-	// referentially transparent for a given (paneStatus, now)
-	// tuple.
-	silenceThreshold time.Duration
+	// hookEvents is the channel delivering hookMsg values from the
+	// FIFO listener started in NewModel. Nil when no HookFifoPath
+	// was configured or the listener failed to start.
+	hookEvents <-chan hookMsg
 
 	// statusFrame is the animation counter consumed by
 	// statusGlyph when a pane is Working. Advanced on each
@@ -491,10 +486,6 @@ func NewModel(deps Deps) Model {
 	if pollInterval < 0 {
 		pollInterval = 0
 	}
-	silenceThreshold := deps.SilenceThreshold
-	if silenceThreshold < 0 {
-		silenceThreshold = 0
-	}
 	hlBG := deps.SidebarHighlightBG
 	if hlBG == "" {
 		hlBG = defaultSidebarHighlightBG
@@ -523,7 +514,6 @@ func NewModel(deps Deps) Model {
 		sizedFor:          make(map[string][2]int),
 		paneStatuses:      make(map[string]paneStatus),
 		paneToWindow:      make(map[string]string),
-		silenceThreshold:  silenceThreshold,
 		paneViewW:         defaultPaneWidth,
 		paneViewH:         defaultPaneHeight,
 		focus:              FocusSidebar,
@@ -533,6 +523,14 @@ func NewModel(deps Deps) Model {
 	}
 	if deps.PaneStream != nil {
 		m.paneEvents = deps.PaneStream()
+	}
+	if deps.HookFifoPath != "" {
+		ch, err := startHookListener(deps.HookFifoPath)
+		if err != nil {
+			debugf("hook listener failed: %v", err)
+		} else {
+			m.hookEvents = ch
+		}
 	}
 	return m
 }
@@ -559,17 +557,23 @@ func (m Model) Action() Action { return m.action }
 // lister, no stream, no resolver — from needing to drive message
 // plumbing they do not care about.
 func (m Model) Init() tea.Cmd {
-	fetch := m.fetchSessions()
-	pane := m.waitForPaneEvent()
-	switch {
-	case fetch != nil && pane != nil:
-		return tea.Batch(fetch, pane)
-	case fetch != nil:
-		return fetch
-	case pane != nil:
-		return pane
+	cmds := make([]tea.Cmd, 0, 3)
+	if c := m.fetchSessions(); c != nil {
+		cmds = append(cmds, c)
 	}
-	return nil
+	if c := m.waitForPaneEvent(); c != nil {
+		cmds = append(cmds, c)
+	}
+	if c := m.waitForHookEvent(); c != nil {
+		cmds = append(cmds, c)
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	if len(cmds) == 1 {
+		return cmds[0]
+	}
+	return tea.Batch(cmds...)
 }
 
 // Update is the pure state-transition function. The only messages
@@ -619,23 +623,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// a slow fetch and the next ticker firing.
 		return m, m.fetchSessions()
 	case paneDataMsg:
-		// Three things must happen on a byte chunk:
-		//  1. Fold the bytes into the VT emulator and status
-		//     record (handlePaneData).
-		//  2. Re-arm the pane event reader so the next chunk
-		//     arrives (waitForPaneEvent).
-		//  3. Arm the status animation ticker if this chunk
-		//     just flipped a pane into Working. We record the
-		//     armed flag on the returned Model so concurrent
-		//     paneDataMsg messages can't each mint their own
-		//     ticker (Bubble Tea has no de-dup on tea.Tick).
+		// Feed bytes into the VT emulator and re-arm the reader.
+		// Pane data no longer drives status — that is handled by
+		// hookMsg events from Claude Code lifecycle hooks.
 		next := m.handlePaneData(msg)
-		cmds := []tea.Cmd{next.waitForPaneEvent()}
-		if tick := next.scheduleStatusTick(); tick != nil {
-			next.statusTickArmed = true
-			cmds = append(cmds, tick)
-		}
-		return next, tea.Batch(cmds...)
+		return next, next.waitForPaneEvent()
 	case statusFrameTickMsg:
 		// Advance the animation frame and, if any pane is
 		// still Working, schedule the next tick. The frame
@@ -651,6 +643,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusTickArmed = true
 			return m, tick
 		}
+		return m, nil
+	case hookMsg:
+		// A Claude Code lifecycle hook fired. Transition the pane's
+		// status and re-arm the hook reader. Arm the animation ticker
+		// when the event is Working (spinner needed).
+		//
+		// On Done we explicitly clear statusTickArmed before calling
+		// scheduleStatusTick. Without this there is a race: the ticker
+		// that was running for the previous Working state leaves
+		// statusTickArmed = true; if UserPromptSubmit arrives before the
+		// next statusFrameTickMsg clears it, scheduleStatusTick returns
+		// nil ("already armed") and the spinner never starts for the new
+		// round.
+		m.applyHookEvent(msg)
+		if msg.event == hookEventDone {
+			m.statusTickArmed = false
+		}
+		cmds := []tea.Cmd{m.waitForHookEvent()}
+		if tick := m.scheduleStatusTick(); tick != nil {
+			m.statusTickArmed = true
+			cmds = append(cmds, tick)
+		}
+		return m, tea.Batch(cmds...)
+	case hookStreamClosedMsg:
+		m.hookEvents = nil
 		return m, nil
 	case paneStreamClosedMsg:
 		// The upstream stream terminated (tmuxctl.Client exited, or
@@ -680,6 +697,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKeysSent(msg), nil
 	case windowClosedMsg:
 		return m.handleWindowClosed(msg)
+	}
+	// Forward unrecognised byte-sequence messages to the focused pane when
+	// in pane focus mode. bubbletea delivers enhanced terminal sequences it
+	// cannot name — such as Shift+Enter (ESC[13;2u) from kitty keyboard
+	// protocol — as its unexported unknownCSISequenceMsg type, which is a
+	// named []byte. We use reflect to extract the bytes rather than
+	// importing an unexported type; the Kind/Elem check is tight enough
+	// that no other bubbletea message type (all structs or exported scalars)
+	// passes through. macOS Terminal.app users will not see this path since
+	// that terminal sends plain 0x0d for Shift+Enter; users on
+	// iTerm2 / WezTerm / kitty / Alacritty get Shift+Enter routed correctly.
+	if m.focus == FocusPane {
+		val := reflect.ValueOf(msg)
+		if val.IsValid() && val.Kind() == reflect.Slice && val.Type().Elem().Kind() == reflect.Uint8 {
+			raw := val.Bytes()
+			if len(raw) > 0 && m.highlight >= 0 && m.highlight < len(m.sessions) {
+				paneID, ok := m.paneByWindow[m.sessions[m.highlight].WindowID]
+				if ok && paneID != "" {
+					m.notePaneKeystroke(paneID)
+					cmds := []tea.Cmd{m.sendKeysToPane(paneID, raw)}
+					if tick := m.scheduleStatusTick(); tick != nil {
+						m.statusTickArmed = true
+						cmds = append(cmds, tick)
+					}
+					return m, tea.Batch(cmds...)
+				}
+			}
+		}
 	}
 	return m, nil
 }
@@ -798,13 +843,6 @@ func (m Model) handlePaneData(msg paneDataMsg) Model {
 	if msg.paneID == "" {
 		return m
 	}
-	// Activity tracking runs BEFORE the capturing branch so a
-	// pane that spent its entire lifetime behind a slow capture-
-	// pane round-trip still has its status fields populated when
-	// the capture finally lands and the preview becomes live.
-	// Otherwise the sidebar would show "Quiet" for a pane that
-	// has been emitting bytes the whole time.
-	m.updatePaneStatus(msg.paneID, msg.data)
 	if m.paneCapturing[msg.paneID] {
 		m.appendPending(msg.paneID, msg.data)
 		return m
@@ -818,78 +856,18 @@ func (m Model) handlePaneData(msg paneDataMsg) Model {
 	return m
 }
 
-// updatePaneStatus folds a fresh byte chunk into paneStatuses
-// for the M3d FSM: records the activity timestamp, flips the
-// everHadOutput bit, and — critically for the Attention state —
-// scans the chunk for BEL (0x07). A BEL anywhere in the chunk
-// sets the sticky bell flag; we do not count them. The flag is
-// cleared only by clearPaneAttention, which runs on the next
-// keystroke the user forwards to this pane (see
-// handleKeyInPaneFocus).
+// notePaneKeystroke is called when the user sends a keystroke into a pane.
+// It transitions the hook state to reflect that the user is now responding:
+//   - Done / Waiting → Working: show the spinner immediately, before
+//     UserPromptSubmit has a chance to arrive. This also ensures a stale
+//     Notification that arrives after the keystroke cannot override the
+//     spinner (applyHookEvent blocks Notification from Working).
+//   - None / Quiet → None: pane was idle, just clear (stays Idle).
+//   - Working → no-op: UserPromptSubmit already armed the spinner; a
+//     trailing keystroke echo must not clobber it.
 //
-// Status is keyed by WINDOW ID, but %output events identify the
-// source pane — we translate via paneToWindow, which is kept in
-// sync by handlePaneResolved. If we see bytes from a pane we
-// have not yet resolved to a window (a race on brand-new
-// sessions where the first %output chunk arrives before the
-// resolver round-trip returns), we drop the status update for
-// this chunk; the next chunk after resolution will pick it up.
-// Losing a single chunk's worth of "working" signal on a <1s
-// window is imperceptible in the UI, and the alternative
-// (eagerly caching by pane ID and migrating later) pays
-// complexity costs for no user-visible gain.
-//
-// We deliberately do NOT filter BEL out of the byte stream
-// before writing to the emulator: the VT parser already treats
-// BEL as a no-op renderable, so leaving it in costs nothing and
-// preserves the original bytes for any downstream debugger that
-// later grows a tap on paneTerminals.
-func (m Model) updatePaneStatus(paneID string, data []byte) {
-	if paneID == "" || len(data) == 0 {
-		return
-	}
-	windowID := m.paneToWindow[paneID]
-	if windowID == "" {
-		return
-	}
-	ps := m.paneStatuses[windowID]
-	ps.lastOutputAt = time.Now()
-	ps.everHadOutput = true
-	if !ps.bell {
-		for _, b := range data {
-			if b == 0x07 {
-				ps.bell = true
-				break
-			}
-		}
-	}
-	m.paneStatuses[windowID] = ps
-}
-
-// notePaneKeystroke is called when the user sends a keystroke
-// into a pane. It does two related things:
-//
-//  1. Clears the owning window's sticky bell flag, so the
-//     Attention glyph flips back to the derived-from-activity
-//     state on the very next render. This is the "user noticed
-//     the bell" acknowledgement path.
-//
-//  2. Stamps lastKeystrokeAt = now, which opens an echo-
-//     suppression window (see keystrokeEchoWindow in
-//     status.go). During that window, any bytes arriving in
-//     %output are assumed to be claude's prompt redraw for the
-//     keypress rather than genuine work, and derivedStatus
-//     keeps the glyph on Idle instead of flipping to Working.
-//
-// We do NOT touch lastOutputAt / everHadOutput here: those
-// record historical activity, not user intent, and a window
-// that was Working before the user started typing should still
-// be considered "has bytes" once the echo window expires.
-//
-// Takes a pane ID because the call site (handleKeyInPaneFocus)
-// has that identifier in hand; we look up the owning window
-// internally so callers don't have to learn about the
-// window/pane split.
+// everHadHook is preserved so the pane shows Idle (·) rather than
+// snapping back to Quiet (·) when the state is None after a clear.
 func (m Model) notePaneKeystroke(paneID string) {
 	if paneID == "" {
 		return
@@ -899,8 +877,14 @@ func (m Model) notePaneKeystroke(paneID string) {
 		return
 	}
 	ps := m.paneStatuses[windowID]
-	ps.lastKeystrokeAt = time.Now()
-	ps.bell = false
+	if ps.hookState == hookEventWorking {
+		return
+	}
+	if ps.hookState == hookEventDone || ps.hookState == hookEventWaiting {
+		ps.hookState = hookEventWorking
+	} else {
+		ps.hookState = hookEventNone
+	}
 	m.paneStatuses[windowID] = ps
 }
 
@@ -1374,17 +1358,36 @@ func (m Model) handleKeyInPaneFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if len(data) == 0 {
 		return m, nil
 	}
+	// Bracketed paste: when bubbletea signals that this KeyMsg originated
+	// from a clipboard paste (msg.Paste == true), wrap the content with
+	// the standard ESC[200~ / ESC[201~ markers before forwarding. Without
+	// them the target pane treats every embedded newline as "submit prompt"
+	// rather than "literal newline". bubbletea enables bracketed paste
+	// mode by default, so pastes arrive here with Paste == true rather
+	// than as individual KeyRunes events.
+	if msg.Paste {
+		wrapped := make([]byte, 0, len(data)+12)
+		wrapped = append(wrapped, "\x1b[200~"...)
+		wrapped = append(wrapped, data...)
+		wrapped = append(wrapped, "\x1b[201~"...)
+		data = wrapped
+	}
 	// A keystroke into a pane serves two status purposes (see
-	// notePaneKeystroke): it acknowledges any pending bell
-	// (Attention → derived-from-activity) AND it opens the
-	// echo-suppression window so the byte burst that claude
-	// will send back in response to this keypress does not
-	// masquerade as "claude is working". We do this here
-	// rather than in handleKeysSent so both effects take hold
-	// immediately on the user's intent, even while the tmux
-	// send-keys round-trip is still in flight.
+	// notePaneKeystroke): it acknowledges any pending Done/Waiting state
+	// by transitioning to Working (spinner) AND it clears idle state so
+	// the pane shows Idle rather than Quiet. We also arm the animation
+	// ticker here when the keystroke transitions to Working, because the
+	// hookMsg path that normally arms it won't fire until UserPromptSubmit
+	// lands asynchronously — without this the spinner would not appear
+	// until the next tick event, which may be 100 ms later or not at all
+	// if the ticker had already self-terminated.
 	m.notePaneKeystroke(paneID)
-	return m, m.sendKeysToPane(paneID, data)
+	cmds := []tea.Cmd{m.sendKeysToPane(paneID, data)}
+	if tick := m.scheduleStatusTick(); tick != nil {
+		m.statusTickArmed = true
+		cmds = append(cmds, tick)
+	}
+	return m, tea.Batch(cmds...)
 }
 
 // handleKeysSent reacts to the KeySender round-trip finishing.
@@ -1627,7 +1630,7 @@ func (m Model) renderCloseConfirm() string {
 		}
 	}
 	prompt := "close " + name + "?"
-	return keyStyle.Render(" y ") + "  " +
+	return m.chip().Render(" y ") + "  " +
 		keyDescStyle.Render(prompt+" (any other key cancels)")
 }
 
@@ -1651,7 +1654,7 @@ func (m Model) renderCloseConfirm() string {
 func (m Model) renderHelp() string {
 	lines := []string{titleStyle.Render("keys")}
 	for _, b := range m.bindingsForFocus() {
-		lines = append(lines, "  "+keyStyle.Render(b.key)+"  "+keyDescStyle.Render(b.desc))
+		lines = append(lines, "  "+m.chip().Render(b.key)+"  "+keyDescStyle.Render(b.desc))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1959,7 +1962,7 @@ func (m Model) renderSidebarBottom() string {
 // "there is a discoverable help hint" contract without coupling
 // to the full binding list that the expanded help block uses.
 func (m Model) renderHelpHint() string {
-	return keyStyle.Render("?") + "  " + keyDescStyle.Render("help")
+	return m.chip().Render("?") + "  " + keyDescStyle.Render("help")
 }
 
 // renderRightPane paints the right-hand column: a live VT-emulated
@@ -2013,7 +2016,7 @@ func (m Model) renderRightPaneHeader() string {
 	// signal purely in the text channel so every terminal
 	// renders it identically.
 	if m.focus == FocusPane {
-		line += "  " + keyStyle.Render("[focus]")
+		line += "  " + m.chip().Render("[focus]")
 		// When the sidebar is zoomed away, spell out the
 		// restoration path right next to the focus chip —
 		// the only reserved shortcut in this mode is ctrl+b,
@@ -2135,11 +2138,10 @@ func (m Model) renderSessionList() string {
 	if len(m.sessions) == 0 {
 		return hintStyle.Render("  no sessions yet — press n to start one")
 	}
-	now := time.Now()
 	contentW := m.sidebarContentWidth()
 	cards := make([]string, 0, len(m.sessions))
 	for i, s := range m.sessions {
-		status := m.statusForWindow(s.WindowID, now)
+		status := m.statusForWindow(s.WindowID)
 		highlighted := i == m.highlight
 		glyph := statusGlyph(status, m.statusFrame)
 		if highlighted && contentW > 0 {
@@ -2245,6 +2247,19 @@ func (m Model) sessionCardHeader(glyph, name string, highlighted bool) string {
 	return glyph + nameStyle.Render(name)
 }
 
+// chip returns a chipStyle using this model's configured highlight colors.
+func (m Model) chip() lipgloss.Style {
+	bg := m.sidebarHighlightBG
+	if bg == "" {
+		bg = defaultSidebarHighlightBG
+	}
+	fg := m.sidebarHighlightFG
+	if fg == "" {
+		fg = defaultSidebarHighlightFG
+	}
+	return chipStyle(bg, fg)
+}
+
 // cardPaddingW is the total horizontal padding both card variants
 // consume — one column of PaddingLeft only.
 const cardPaddingW = 1
@@ -2337,20 +2352,13 @@ func truncLeft(s string, max int) string {
 }
 
 // statusForWindow resolves a tmux window ID to the user-facing
-// SessionStatus. Because paneStatuses is keyed directly by
-// window ID, this is a single map lookup — no dependency on
-// paneByWindow, which means a transient reset of the
-// pane-resolution cache (see handleWindowClosed) does not
-// flicker the sidebar glyph. A window with no status record
-// (never emitted a byte, or resolver hasn't fired yet) is
-// reported as Quiet; that is the correct "we don't know
-// anything about this session yet" signal.
-func (m Model) statusForWindow(windowID string, now time.Time) SessionStatus {
+// SessionStatus. A window with no hook events yet is StatusQuiet.
+func (m Model) statusForWindow(windowID string) SessionStatus {
 	ps, ok := m.paneStatuses[windowID]
 	if !ok {
 		return StatusQuiet
 	}
-	return ps.derivedStatus(now, m.silenceThreshold)
+	return ps.derivedStatus()
 }
 
 // pluralize is a tiny helper kept inline so the sidebar header's

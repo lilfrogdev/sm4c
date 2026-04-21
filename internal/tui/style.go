@@ -126,6 +126,17 @@ func sidebarHighlightStyle(bg, fg string) lipgloss.Style {
 		Foreground(lipgloss.Color(fg))
 }
 
+// chipStyle renders a small key-indicator chip (e.g. "?", "[focus]")
+// using the same bg/fg as the sidebar highlight so the UI palette is
+// consistent. Created inline per render so it captures the correct
+// lipgloss renderer (same rationale as sidebarHighlightStyle).
+func chipStyle(bg, fg string) lipgloss.Style {
+	return lipgloss.NewStyle().
+		Background(lipgloss.Color(bg)).
+		Foreground(lipgloss.Color(fg)).
+		Padding(0, 1)
+}
+
 // sidebarHighlightPathStyle is the cwd line on the highlighted row.
 // Faint keeps the path visually secondary vs. the bold session name
 // on the first line (user request); Foreground pins the base color so

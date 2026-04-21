@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -86,10 +87,27 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 			"stdin is not a TTY; refusing to open the TUI. For non-interactive use, run `sm4c ls` or `sm4c status`")
 	}
 
+	// Auto-install sm4c's lifecycle hooks into ~/.claude/settings.json.
+	// Idempotent: a no-op if hooks are already present. Non-fatal on error.
+	if err := installClaudeHooks(); err != nil {
+		debugBridgef("installClaudeHooks: %v", err)
+	}
+
+	// Derive the hook FIFO path from the socket name so each sm4c
+	// instance gets an isolated pipe. Propagate it to the tmux
+	// environment so Claude Code hook scripts inherit it via $SM4C_HOOK_FIFO.
+	fifoPath := filepath.Join(os.TempDir(), "sm4c-"+o.SocketName+"-hooks.fifo")
+	hookCtx := cmd.Context()
+	if hookCtx == nil {
+		hookCtx = context.Background()
+	}
+	// Best-effort: silently ignore if the server is not yet running.
+	_ = o.SetGlobalEnv(hookCtx, "SM4C_HOOK_FIFO", fifoPath)
+
 	highlight := initialWindowID
 	focus := initialFocus
 	for {
-		final, err := runTUIProgram(cmd, o, highlight, focus, pollInterval, silenceThreshold, sidebarHighlightBG, sidebarHighlightFG)
+		final, err := runTUIProgram(cmd, o, highlight, focus, pollInterval, silenceThreshold, sidebarHighlightBG, sidebarHighlightFG, fifoPath)
 		if err != nil {
 			return fmt.Errorf("tui: %w", err)
 		}
@@ -144,7 +162,7 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 // relative to setupOneShot.
 var runTUIProgram = runTUIProgramReal
 
-func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID string, initialFocus tui.Focus, pollInterval, silenceThreshold time.Duration, sidebarHighlightBG, sidebarHighlightFG string) (tui.Model, error) {
+func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID string, initialFocus tui.Focus, pollInterval, silenceThreshold time.Duration, sidebarHighlightBG, sidebarHighlightFG, hookFifoPath string) (tui.Model, error) {
 	// Bubble Tea wants the actual process stdin/stdout to drive
 	// raw-mode input and terminal-level escape sequences. cmd.InOrStdin
 	// and cmd.OutOrStdout return interfaces that are os.Stdin /
@@ -240,6 +258,7 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 			InitialHighlight:   initialWindowID,
 			InitialFocus:       initialFocus,
 			SilenceThreshold:   silenceThreshold,
+			HookFifoPath:       hookFifoPath,
 			SidebarHighlightBG: sidebarHighlightBG,
 			SidebarHighlightFG: sidebarHighlightFG,
 		},
