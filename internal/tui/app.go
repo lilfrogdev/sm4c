@@ -459,6 +459,15 @@ type Model struct {
 	// again on the next race, etc.). Set when we schedule a
 	// tick; cleared when the tick arrives.
 	statusTickArmed bool
+
+	// paneTitles maps tmux window ID → the most recent OSC terminal
+	// title emitted by the Claude Code process in that pane. Populated
+	// by propagatePaneTitle, called after every pane write. When
+	// non-empty for a window, renderSessionList shows this title
+	// instead of Session.Name so the sidebar reflects Claude Code's
+	// dynamic session/project name rather than the static tmux window
+	// name ("claude").
+	paneTitles map[string]string
 }
 
 // paneBackfillBuffer bounds panePending per pane. 64 KiB is
@@ -514,6 +523,7 @@ func NewModel(deps Deps) Model {
 		sizedFor:          make(map[string][2]int),
 		paneStatuses:      make(map[string]paneStatus),
 		paneToWindow:      make(map[string]string),
+		paneTitles:        make(map[string]string),
 		paneViewW:         defaultPaneWidth,
 		paneViewH:         defaultPaneHeight,
 		focus:              FocusSidebar,
@@ -853,6 +863,7 @@ func (m Model) handlePaneData(msg paneDataMsg) Model {
 		m.paneTerminals[msg.paneID] = term
 	}
 	term.write(msg.data)
+	m.propagatePaneTitle(msg.paneID, term)
 	return m
 }
 
@@ -881,6 +892,22 @@ func (m Model) notePaneKeystroke(paneID string) {
 	}
 	ps.hookState = hookEventNone
 	m.paneStatuses[windowID] = ps
+}
+
+// propagatePaneTitle copies the terminal title from a paneTerminal
+// into paneTitles[windowID]. Called after every pane write so the
+// sidebar reflects the latest OSC title without a separate message
+// round-trip. No-op when the pane has no title yet or the pane ID
+// is unknown.
+func (m Model) propagatePaneTitle(paneID string, term *paneTerminal) {
+	if term == nil || term.title == "" {
+		return
+	}
+	windowID := m.paneToWindow[paneID]
+	if windowID == "" {
+		return
+	}
+	m.paneTitles[windowID] = term.title
 }
 
 // appendPending queues bytes in panePending[paneID] while capture
@@ -938,6 +965,7 @@ func (m Model) handlePaneCapture(msg paneCaptureMsg) Model {
 			m.paneTerminals[paneID] = term
 		}
 		term.write(normalizeCaptureEOL(msg.data))
+		m.propagatePaneTitle(paneID, term)
 	}
 	if pending, ok := m.panePending[paneID]; ok && len(pending) > 0 {
 		term, ok2 := m.paneTerminals[paneID]
@@ -946,6 +974,7 @@ func (m Model) handlePaneCapture(msg paneCaptureMsg) Model {
 			m.paneTerminals[paneID] = term
 		}
 		term.write(pending)
+		m.propagatePaneTitle(paneID, term)
 	}
 	delete(m.panePending, paneID)
 	return m
@@ -1451,6 +1480,7 @@ func (m Model) handleWindowClosed(msg windowClosedMsg) (tea.Model, tea.Cmd) {
 	delete(m.paneByWindow, msg.windowID)
 	delete(m.paneErrByWindow, msg.windowID)
 	delete(m.paneStatuses, msg.windowID)
+	delete(m.paneTitles, msg.windowID)
 	if m.skipCaptureWindow == msg.windowID {
 		m.skipCaptureWindow = ""
 	}
@@ -2135,6 +2165,13 @@ func (m Model) renderSessionList() string {
 			glyph = statusGlyphPlain(status, m.statusFrame)
 		}
 		name := s.Name
+		// Prefer the OSC terminal title emitted by Claude Code (e.g.
+		// "project: foo" or the session name from /rename) over the
+		// static tmux window name. Claude Code writes this via OSC 0/2;
+		// the VT emulator captures it and propagatePaneTitle stores it.
+		if t := m.paneTitles[s.WindowID]; t != "" {
+			name = t
+		}
 		if name == "" {
 			// tmux always has a window name; an empty one would
 			// indicate a parser bug in tmuxctl. Render a sentinel

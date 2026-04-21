@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Sidebar session names now reflect Claude Code's dynamic terminal title. Claude Code writes its session/project name via OSC 0/2 sequences (the same mechanism terminal tabs use for renaming). The VT emulator's `Title` callback captures these sequences synchronously during pane writes, and `paneTitles[windowID]` is updated on every `%output` chunk. `renderSessionList` prefers the OSC title over the static tmux window name ("claude") when one is available, so the sidebar shows names like "my-project" or whatever Claude Code set — identical to what Ghostty/WezTerm tab titles show.
+
 ### Fixed
 
 - Hook auto-install is now idempotent against command changes. Previously `installClaudeHooks` detected existing sm4c entries only by the presence of the `SM4C_HOOK_FIFO` marker string, so a stale hook command (e.g. from an older sm4c build) was never replaced — the user had to manually clear `~/.claude/settings.json`. The new `findSm4cEntry` helper returns the array index of the matching entry; if the entry exists but its command differs from the current build, it is replaced in-place. Other tools' entries in the same event array are untouched. A debug log line is emitted when a stale entry is upgraded.
