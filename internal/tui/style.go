@@ -63,47 +63,46 @@ var (
 	// asked for in M3e polish.
 	rowHighlightStyle = lipgloss.NewStyle().Reverse(true)
 
-	// cardBaseStyle is the non-highlighted session-card chrome:
-	// inner padding for breathing room plus a matching horizontal
-	// margin that reserves exactly the same outer width the
-	// highlighted card consumes once its rounded border is drawn.
-	// Keeping the outer widths identical prevents the column from
-	// "jumping" as the user cursors through the list — only the
-	// selected card grows a visible border, everything else slots
-	// into the same horizontal band.
-	cardBaseStyle = lipgloss.NewStyle().
-			Padding(0, 1).
-			Margin(0, 1)
+	// cardBaseStyle is the non-highlighted session-card chrome.
+	// Padding(0, 1) buys two columns of breathing room between
+	// the card content and the sidebar column border — the
+	// "add padding on the right and left" user ask — without
+	// adding a visible frame to each row (which would turn the
+	// sidebar into a grid of boxes).
+	cardBaseStyle = lipgloss.NewStyle().Padding(0, 1)
 
-	// cardHighlightStyle is the selected session card. Three
-	// decisions worth calling out, all driven by the M3e polish
-	// pass:
+	// cardHighlightStyle is the selected session card. It is
+	// identical to cardBaseStyle except for a single-attribute
+	// ANSI bright-black background ("8") that paints a solid
+	// full-width band across the sidebar column — the claude-
+	// squad "filled selection bar" shape the user asked for.
 	//
-	//   1. RoundedBorder — the user asked for slightly rounded
-	//      corners. RoundedBorder uses ╭╮╰╯ which every modern
-	//      terminal renders correctly; we deliberately avoid any
-	//      border-foreground color so the outline inherits the
-	//      user's default foreground and stays legible on any
-	//      theme.
+	// Three deliberate non-choices:
 	//
-	//   2. ANSI bright-black background ("8"). The pre-polish
-	//      highlight was Reverse, which on a light terminal
-	//      produces a near-black band that reads as harsh. ANSI
-	//      8 is the canonical "slightly brighter than bg on dark
-	//      themes, slightly dimmer than fg on light themes"
-	//      shade — the same color neovim's CursorLine and most
-	//      TUI selection backgrounds land on. It honors the
-	//      terminal-native-colors rule (no hex, no 256-index)
-	//      and works across both theme polarities without us
-	//      picking a specific shade.
+	//   1. No Border. An earlier iteration wrapped the card in
+	//      RoundedBorder(). Live feedback surfaced two problems
+	//      with that: the background color stopped at the
+	//      border interior and left a visible ring of
+	//      unpainted terminal-bg between the text and the
+	//      outline, and the 2-col outer border vs. the base
+	//      card's 0-col frame made the list visibly "jump"
+	//      horizontally as the cursor moved. Dropping the
+	//      border fixes both in one step.
 	//
-	//   3. Padding(0, 1) plus Border's implicit 1-col side =
-	//      2 cols of "air" between the edge of the band and the
-	//      text — the extra left/right padding the user asked
-	//      for, matched by cardBaseStyle's Margin(0, 1) so the
-	//      outer width stays identical.
+	//   2. No Margin. cardBaseStyle has no margin either, so
+	//      both variants have exactly the same outer width
+	//      (Padding(0, 1) on both). The only visual difference
+	//      between a selected and unselected row is the
+	//      background fill — text, indentation, and cwd line
+	//      all land at the same x-coordinates.
+	//
+	//   3. ANSI color "8", not Reverse. Reverse on a dark
+	//      terminal produces a near-white band that can read
+	//      as harsh; ANSI 8 is the canonical "slightly off
+	//      base background" shade (neovim's CursorLine,
+	//      tmux's default mode-style, etc.) and stays on the
+	//      terminal-native-colors rule — no hex, no 256-index.
 	cardHighlightStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
 				Padding(0, 1).
 				Background(lipgloss.Color("8"))
 

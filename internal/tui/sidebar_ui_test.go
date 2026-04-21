@@ -270,17 +270,17 @@ func TestTruncLeft(t *testing.T) {
 	}
 }
 
-// TestSessionCardHighlightUsesRoundedBorder pins the M3e polish
-// selection chrome: when the sidebar has a known content width,
-// the highlighted card renders with RoundedBorder glyphs. We
-// assert on the top-left and top-right corner characters
-// (╭ / ╮) because those are specific to RoundedBorder — swapping
-// to NormalBorder (┌ / ┐) or dropping the border entirely would
-// flip these assertions. The non-highlighted row MUST NOT carry
-// the corner glyphs, which pins the "only the selected card
-// grows a visible border" contract that keeps the sidebar from
-// looking like a grid of outlined boxes.
-func TestSessionCardHighlightUsesRoundedBorder(t *testing.T) {
+// TestSessionCardHighlightHasNoBorder pins the M3e-round-3
+// return to a flat selection band. The earlier rounded-border
+// experiment showed two failure modes in live use: the fill
+// color left a visible ring between the text and the outline
+// (lipgloss paints Background inside padding, not into the
+// border's interior), and the border vs. no-border width
+// mismatch made the sidebar visibly jump as the highlight
+// moved. Both are fixed by dropping the border entirely —
+// which means any future attempt to reintroduce border
+// glyphs around the selection needs to flip this test first.
+func TestSessionCardHighlightHasNoBorder(t *testing.T) {
 	t.Parallel()
 	m := withSessions([]Session{
 		{WindowID: "@1", Name: "sel"},
@@ -290,33 +290,27 @@ func TestSessionCardHighlightUsesRoundedBorder(t *testing.T) {
 	m = next.(Model)
 
 	list := m.renderSessionList()
-	if !strings.Contains(list, "╭") || !strings.Contains(list, "╮") {
-		t.Fatalf("highlighted card missing rounded top corners: %q", list)
-	}
-	if !strings.Contains(list, "╰") || !strings.Contains(list, "╯") {
-		t.Fatalf("highlighted card missing rounded bottom corners: %q", list)
-	}
-	// Only one card should be highlighted at a time, so exactly
-	// one pair of ╭/╮ should appear. strings.Count gives us a
-	// cheap regression guard against every card accidentally
-	// wearing the border.
-	if n := strings.Count(list, "╭"); n != 1 {
-		t.Fatalf("expected exactly 1 highlighted card border; got %d in %q", n, list)
+	// Rounded / normal / double border glyphs MUST NOT leak
+	// into the card list. (The sidebar column itself still has
+	// a normal border on its right edge — rendered by
+	// sidebarColumnStyle in renderSidebarView, not by
+	// renderSessionList — so we scope this check to the list
+	// output only.)
+	for _, glyph := range []string{"╭", "╮", "╰", "╯", "┌", "┐", "└", "┘"} {
+		if strings.Contains(list, glyph) {
+			t.Fatalf("session list leaked border glyph %q: %q", glyph, list)
+		}
 	}
 }
 
-// TestSessionCardBaseReservesChromeSpace pins the anti-jump
-// contract: cardBaseStyle's horizontal Margin must match
-// cardHighlightStyle's border so the two variants have the
-// same outer width. We render both a highlighted and a non-
-// highlighted card into the same list and assert that the
-// lines containing the session names have the same visual
-// width (measured via lipgloss.Width, which accounts for
-// wide runes and ANSI escapes). Without the margin, the
-// highlighted row would be 2 cols wider than its neighbors
-// and the eye would catch the list "jumping" as the cursor
-// moves.
-func TestSessionCardBaseReservesChromeSpace(t *testing.T) {
+// TestSessionCardsShareOuterWidth pins the anti-jump contract:
+// cardBaseStyle and cardHighlightStyle MUST produce the same
+// outer width when rendered with the same Width(). This is
+// what keeps the sidebar column visually stable as the user
+// cursors through the list — the only difference the eye
+// should register between a selected and unselected row is
+// the background fill, never horizontal shift.
+func TestSessionCardsShareOuterWidth(t *testing.T) {
 	t.Parallel()
 	m := withSessions([]Session{
 		{WindowID: "@1", Name: "highlighted"},
@@ -333,15 +327,17 @@ func TestSessionCardBaseReservesChromeSpace(t *testing.T) {
 	hi := m.renderSessionCard("● ", "highlighted", "", contentW, true)
 	base := m.renderSessionCard("● ", "plain", "", contentW, false)
 
-	// Both rendered blocks must be as wide as the sidebar
-	// content column. lipgloss.Width counts visible cells and
-	// ignores ANSI styling, so it's the right measure for
-	// "does this line fill the column?".
+	// lipgloss.Width counts visible cells and ignores ANSI
+	// styling — the right measure for "does this block fill
+	// the column?".
 	if w := lipglossWidth(hi); w != contentW {
 		t.Fatalf("highlighted card width = %d; want contentW = %d (%q)", w, contentW, hi)
 	}
 	if w := lipglossWidth(base); w != contentW {
 		t.Fatalf("base card width = %d; want contentW = %d (%q)", w, contentW, base)
+	}
+	if lipglossWidth(hi) != lipglossWidth(base) {
+		t.Fatalf("card widths diverge: hi=%d base=%d", lipglossWidth(hi), lipglossWidth(base))
 	}
 }
 // sidebarHidden on causes rightPaneBodyDims to return the full-

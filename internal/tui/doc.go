@@ -17,17 +17,23 @@
 //         under the user's home directory and truncated from the
 //         head with "…" when it would overflow the column. Cards
 //         are separated by a blank line so the list reads as
-//         discrete items. The highlighted card wears a rounded-
-//         corner border over an ANSI bright-black (color "8")
-//         background — a lighter, calmer selection than the old
-//         reverse-video band, while still relying exclusively on
-//         the user's terminal palette. Non-highlighted cards
-//         carry a matching horizontal margin so both variants
-//         consume the same outer width and the list does not
-//         visibly shift as the cursor moves. The unit-test path
-//         (no WindowSizeMsg, unknown content width) falls back
-//         to the pre-M3e single-run reverse-video highlight, so
-//         substring-based tests keep working unchanged. The
+//         discrete items. The highlighted card is painted as a
+//         solid full-width band over an ANSI bright-black
+//         (color "8") background — the claude-squad "filled
+//         selection bar" shape, calmer than reverse video while
+//         staying on the terminal-native palette. An earlier
+//         round wrapped the highlight in a rounded border; live
+//         use surfaced two failure modes (the background color
+//         stopped at the border interior, and the border vs.
+//         no-border width mismatch made the list visibly jump
+//         horizontally as the cursor moved). Both variants now
+//         share Padding(0, 1) and no border or margin, so the
+//         only visible difference between selected and
+//         unselected rows is the background fill. The unit-test
+//         path (no WindowSizeMsg, unknown content width) falls
+//         back to the pre-M3e single-run reverse-video
+//         highlight, so substring-based tests keep working
+//         unchanged. The
 //         status glyph (M3d) reflects that session's live
 //         state: faint `·` (Quiet), solid `●` (Idle), animated
 //         braille spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ — Working), `✓`

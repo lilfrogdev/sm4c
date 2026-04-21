@@ -826,9 +826,14 @@ func TestPanePendingBufferIsBounded(t *testing.T) {
 func TestWindowSizeEmitsResizeForHighlightedWindow(t *testing.T) {
 	t.Parallel()
 	// A terminal resize that actually changes the right-pane
-	// body geometry MUST issue one resize-window for the
-	// currently-highlighted session. Same-size resizes are
-	// debounced (the viewport did not actually change).
+	// body geometry MUST issue resize-window commands for the
+	// currently-highlighted session. The first-ever resize for
+	// a given window goes through the wiggle path (two resizes,
+	// W,H+1 then W,H) so tmux is guaranteed to SIGWINCH claude
+	// even when tmux's cached dims already matched after a CLI
+	// pre-size — this is the "typing lands at the bottom" fix.
+	// Same-size resizes issued after the first are debounced
+	// (the viewport did not actually change).
 	rz := &resizerStub{}
 	m := NewModel(Deps{WindowResizer: rz.resizer()})
 	m = m.handleSessions(sessionsMsg{sessions: []Session{{WindowID: "@1", Name: "a"}}})
@@ -837,21 +842,89 @@ func TestWindowSizeEmitsResizeForHighlightedWindow(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("WindowSizeMsg with live session did not emit resize cmd")
 	}
-	// Run the cmd to observe the resizer call.
+	// Run the cmd to observe the resizer calls.
 	msg := cmd()
 	if _, ok := msg.(windowResizedMsg); !ok {
 		t.Fatalf("resize cmd returned %T; want windowResizedMsg", msg)
 	}
-	if len(rz.calls) != 1 || rz.calls[0].WindowID != "@1" {
-		t.Fatalf("resizer calls = %+v; want exactly one for @1", rz.calls)
+	// Wiggle shape: two calls, both for @1, differing by 1 row.
+	if len(rz.calls) != 2 {
+		t.Fatalf("resizer calls = %+v; want two (wiggle) for @1", rz.calls)
 	}
-	// Re-send the same size — no new resize.
+	for _, c := range rz.calls {
+		if c.WindowID != "@1" {
+			t.Fatalf("unexpected WindowID in wiggle: %+v", c)
+		}
+	}
+	if rz.calls[0].Height == rz.calls[1].Height {
+		t.Fatalf("wiggle did not vary height: %+v", rz.calls)
+	}
+	// Re-send the same size — no new resize. The wiggle is a
+	// one-time cost per window; after it fires, the debounce
+	// takes over.
 	_, cmd2 := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	if cmd2 != nil {
 		t.Fatalf("re-sending same size emitted cmd %T; want nil (debounced)", cmd2)
 	}
-	if len(rz.calls) != 1 {
+	if len(rz.calls) != 2 {
 		t.Fatalf("same-size resize re-ran resizer; calls = %+v", rz.calls)
+	}
+}
+
+// TestFirstResizePerWindowWiggles pins the "typing lands at
+// the bottom" fix at its most targeted level: the FIRST time
+// resizeHighlightedWindow is asked to size a given window, it
+// must emit a wiggle (W,H+1 → W,H) rather than a single same-
+// size resize. Subsequent calls for the same window at the
+// same dims are debounced; calls for OTHER windows also take
+// the wiggle path on their own first visit. This is what
+// guarantees tmux SIGWINCHs claude even when the CLI pre-sized
+// the window to the current sm4c viewport.
+func TestFirstResizePerWindowWiggles(t *testing.T) {
+	t.Parallel()
+	rz := &resizerStub{}
+	m := NewModel(Deps{WindowResizer: rz.resizer()})
+	m = m.handleSessions(sessionsMsg{sessions: []Session{
+		{WindowID: "@1", Name: "a"},
+		{WindowID: "@2", Name: "b"},
+	}})
+	next, cmd0 := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = next.(Model)
+	if cmd0 == nil {
+		t.Fatal("WindowSizeMsg with live session did not emit resize cmd")
+	}
+	// Drain the initial resize cmd so rz.calls reflects the @1
+	// wiggle from startup.
+	_ = cmd0()
+	if n := len(rz.calls); n != 2 {
+		t.Fatalf("initial size did not wiggle @1; rz.calls = %+v", rz.calls)
+	}
+	rz.calls = nil
+	// Navigate to @2 — first-ever resize for @2 must wiggle too.
+	_, cmd := applyKey(t, m, "j")
+	if cmd == nil {
+		t.Fatal("j to @2 emitted no cmd")
+	}
+	drained := cmd()
+	if bm, ok := drained.(tea.BatchMsg); ok {
+		for _, c := range bm {
+			if c != nil {
+				_ = c()
+			}
+		}
+	}
+	if len(rz.calls) < 2 {
+		t.Fatalf("first visit to @2 did not wiggle; calls = %+v", rz.calls)
+	}
+	sawH := map[int]bool{}
+	for _, c := range rz.calls {
+		if c.WindowID != "@2" {
+			t.Fatalf("unexpected wiggle target %+v; want @2", c)
+		}
+		sawH[c.Height] = true
+	}
+	if len(sawH) < 2 {
+		t.Fatalf("wiggle did not vary height: %+v", rz.calls)
 	}
 }
 
