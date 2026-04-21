@@ -34,13 +34,6 @@ var (
 	// us having to pick a specific color.
 	hintStyle = lipgloss.NewStyle().Faint(true)
 
-	// keyStyle renders the key name portion of a keybind hint (e.g.
-	// the "n" in "n  new session"). Reverse makes each key chip
-	// legible against any background — a dark key on a light terminal
-	// and a light key on a dark terminal, without us guessing which
-	// theme the user has.
-	keyStyle = lipgloss.NewStyle().Reverse(true).Padding(0, 1)
-
 	// keyDescStyle is the descriptive half of a keybind row. Plain,
 	// no decoration — the contrast comes from keyStyle on the left.
 	keyDescStyle = lipgloss.NewStyle()
