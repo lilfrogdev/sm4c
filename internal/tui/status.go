@@ -154,6 +154,37 @@ func statusGlyph(status SessionStatus, frame int) string {
 	return "  "
 }
 
+// statusGlyphHighlighted renders the status glyph for the highlighted
+// sidebar row. It differs from statusGlyph in one critical way: any
+// inner lipgloss.Render call ends with \033[0m, which resets the outer
+// sidebarHighlightStyle's background, causing the session name that
+// follows to render on the wrong (default) background — the "white bar"
+// symptom. For Done/Waiting we apply the glyph colour as a raw ANSI
+// sequence and then explicitly re-apply the highlight bg+fg so the rest
+// of the card is not affected. Other statuses use plain text with no
+// inner ANSI at all.
+func statusGlyphHighlighted(status SessionStatus, frame int, bg, fg string) string {
+	// restore re-applies the outer highlight colours after the glyph reset.
+	restore := "\033[48;5;" + bg + "m\033[38;5;" + fg + "m"
+	switch status {
+	case StatusWorking:
+		idx := frame % len(spinnerFrames)
+		if idx < 0 {
+			idx += len(spinnerFrames)
+		}
+		return spinnerFrames[idx] + " " // braille chars need no colour
+	case StatusDone:
+		return "\033[32;1m✓\033[0m" + restore + " "
+	case StatusWaiting:
+		return "\033[33;1m?\033[0m" + restore + " "
+	case StatusIdle:
+		return "· "
+	case StatusQuiet:
+		return "· "
+	}
+	return "  "
+}
+
 // statusFrameTickMsg is delivered by the ticker while at least one pane is
 // Working. It carries no payload; the handler advances Model.statusFrame.
 type statusFrameTickMsg struct{}

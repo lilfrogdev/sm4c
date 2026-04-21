@@ -2327,6 +2327,17 @@ func (m Model) renderSessionList() string {
 		status := m.statusForWindow(s.WindowID)
 		highlighted := i == m.highlight
 		glyph := statusGlyph(status, m.statusFrame)
+		if highlighted && contentW > 0 {
+			bg := m.sidebarHighlightBG
+			if bg == "" {
+				bg = defaultSidebarHighlightBG
+			}
+			fg := m.sidebarHighlightFG
+			if fg == "" {
+				fg = defaultSidebarHighlightFG
+			}
+			glyph = statusGlyphHighlighted(status, m.statusFrame, bg, fg)
+		}
 		name := s.Name
 		// Prefer the OSC terminal title captured by tmux (#{pane_title})
 		// over the static tmux window name. Claude Code sets this via
