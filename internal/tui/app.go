@@ -1630,7 +1630,19 @@ func (m Model) handleDirPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.dirPicker = nil
 		return m, nil
 	case " ":
-		m.newSessionDir = m.dirPicker.CurrentDirectory
+		// Confirm the highlighted directory. We simulate Enter so the
+		// filepicker navigates into the highlighted entry — if the
+		// cursor is on a subdirectory, CurrentDirectory updates to that
+		// subdirectory synchronously. If the cursor is on a file (or
+		// the directory is empty), Enter is a no-op and CurrentDirectory
+		// stays as the directory the user is currently browsing, which
+		// is the right fallback ("open session here").
+		fp, _ := m.dirPicker.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		selectedDir := fp.CurrentDirectory
+		if selectedDir == "" {
+			selectedDir = "/"
+		}
+		m.newSessionDir = selectedDir
 		m.dirPicker = nil
 		m.action = ActionNewSession
 		m.quitting = true
@@ -1652,6 +1664,13 @@ func (m Model) renderDirPickerOverlay() string {
 		dir = "/"
 	}
 
+	chip := m.chip()
+	nav := chip.Render("j/k") + "  navigate   " +
+		chip.Render("l/enter") + "  open dir   " +
+		chip.Render("h") + "  go up"
+	confirm := chip.Render("space") + "  select highlighted   " +
+		chip.Render("esc") + "  cancel"
+
 	inner := strings.Join([]string{
 		titleStyle.Render("open new session"),
 		"",
@@ -1659,7 +1678,8 @@ func (m Model) renderDirPickerOverlay() string {
 		"",
 		fp.View(),
 		"",
-		m.chip().Render("space") + "  open here    " + m.chip().Render("esc") + "  cancel",
+		nav,
+		confirm,
 	}, "\n")
 
 	overlayW := 60
