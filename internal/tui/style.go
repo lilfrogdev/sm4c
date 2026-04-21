@@ -65,12 +65,14 @@ var (
 	rowHighlightStyle = lipgloss.NewStyle().Reverse(true)
 
 	// cardBaseStyle is the non-highlighted session-card chrome.
-	// Padding(1, 0): vertical gap only so the highlight band does
-	// not sit flush against the glyphs; horizontal padding is
-	// omitted so the bar can run edge-to-edge inside the sidebar
-	// (see sidebarColumnStyle). Highlighted and non-highlighted
-	// cards share the same padding so the column width stays stable.
-	cardBaseStyle = lipgloss.NewStyle().Padding(1, 0)
+	// Vertical padding plus one column of left inset so the list
+	// does not sit flush against the sidebar edge; the right edge
+	// stays flush with the column for the divider. Matches
+	// sidebarHighlightStyle geometry.
+	cardBaseStyle = lipgloss.NewStyle().
+			PaddingTop(1).
+			PaddingBottom(1).
+			PaddingLeft(1)
 
 	// sidebarColumnStyle frames the left column. BorderRight plus
 	// the default NormalBorder gives us a visible vertical line
@@ -78,10 +80,9 @@ var (
 	// NOT call BorderForeground with a color so the separator uses
 	// the terminal's own foreground — stays readable on every
 	// theme, same rationale as every other "color" choice here.
-	// No horizontal padding — session cards span the full inner
-	// width so the selection bar meets the left edge and the
-	// vertical rule (live feedback: gutters looked like accidental
-	// margins). Vertical padding is handled per-card.
+	// No column-level horizontal padding — per-card **PaddingLeft(1)**
+	// insets text from the vertical rule; the right edge stays flush.
+	// Vertical padding is handled per-card.
 	sidebarColumnStyle = lipgloss.NewStyle().
 				BorderStyle(lipgloss.NormalBorder()).
 				BorderRight(true).
@@ -118,17 +119,19 @@ const (
 // can map indices to the terminal's actual color profile.
 func sidebarHighlightStyle(bg, fg string) lipgloss.Style {
 	return lipgloss.NewStyle().
-		Padding(1, 0).
+		PaddingTop(1).
+		PaddingBottom(1).
+		PaddingLeft(1).
 		Background(lipgloss.Color(bg)).
 		Foreground(lipgloss.Color(fg))
 }
 
-// sidebarHighlightPathStyle is the cwd second line inside a
-// highlighted card. We deliberately do NOT use Faint here — on top
-// of a colored bar it pushed the path below WCAG-ish contrast in
-// live testing; the second line is already de-emphasized by being
-// a separate line under the session name.
+// sidebarHighlightPathStyle is the cwd line on the highlighted row.
+// Faint keeps the path visually secondary vs. the bold session name
+// on the first line (user request); Foreground pins the base color so
+// Faint does not fall back to the terminal default on the bar.
 func sidebarHighlightPathStyle(fg string) lipgloss.Style {
 	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color(fg))
+		Foreground(lipgloss.Color(fg)).
+		Faint(true)
 }

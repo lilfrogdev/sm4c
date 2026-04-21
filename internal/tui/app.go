@@ -2164,11 +2164,10 @@ func (m Model) renderSessionList() string {
 // being inlined into the loop above.
 //
 // Width accounting. Both cardBaseStyle and sidebarHighlightStyle
-// apply Padding(1, 0) — outer width = Width param; no horizontal
-// padding, so inner text width equals Width minus the 2-col indent
-// for the cwd line only.
+// apply PaddingLeft(1) plus vertical padding — outer width = Width
+// param; inner text width subtracts cardPaddingW (left inset only).
 func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highlighted bool) string {
-	header := glyph + name
+	header := m.sessionCardHeader(glyph, name, highlighted)
 
 	// textW is the width available for actual glyphs inside
 	// horizontal padding. Used to truncate the cwd line so it never
@@ -2230,10 +2229,26 @@ func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highligh
 	return card
 }
 
+// sessionCardHeader renders the first line of a session card. The
+// session name is bold on the highlighted row only; the status
+// glyph stays unstyled so braille/●/✓ colors stay consistent.
+func (m Model) sessionCardHeader(glyph, name string, highlighted bool) string {
+	if !highlighted {
+		return glyph + name
+	}
+	fg := m.sidebarHighlightFG
+	if fg == "" {
+		fg = defaultSidebarHighlightFG
+	}
+	return glyph + lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color(fg)).
+		Render(name)
+}
+
 // cardPaddingW is the total horizontal padding both card variants
-// consume (none — Padding(1, 0)). Kept as zero so path truncation
-// math stays explicit if we reintroduce side padding later.
-const cardPaddingW = 0
+// consume — one column of PaddingLeft only.
+const cardPaddingW = 1
 
 // sidebarContentWidth returns the content-area width inside the
 // sidebar column (sidebarColumnStyle has no horizontal padding).

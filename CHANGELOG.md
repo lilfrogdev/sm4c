@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Sidebar layout: session cards are joined with a **single newline** (no extra blank line between items). **sidebarColumnStyle** and card styles drop horizontal padding so the selection band runs to the sidebar edges; **Padding(1, 0)** keeps only vertical air inside each card. Default highlight foreground is **`255`** (xterm white) instead of **`15`**, and **Bold** on the bar was removed — on many terminals Bold+ANSI15 rendered as a muted blue-gray instead of white. **cardPaddingW** is **0**; **sidebarContentWidth** no longer subtracts sidebar gutters.
+- Sidebar layout: session cards are joined with a **single newline** (no extra blank line between items). Card styles use **PaddingTop/Bottom(1)** plus **PaddingLeft(1)** so the list has a small left inset while the right edge stays flush with the column divider. The highlighted session **name** is **Bold** with the configured highlight foreground; the cwd line uses **Faint** on the same foreground so it stays secondary. Default highlight foreground is **`255`** (xterm white) instead of **`15`** — Bold on the bar targets the name only (earlier Bold+ANSI15 on the whole bar could read as muted blue-gray on some terminals). **cardPaddingW** is **1** to match the left inset for path truncation.
 
 ### Added
 
