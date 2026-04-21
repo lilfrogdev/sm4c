@@ -6,7 +6,9 @@ import "github.com/charmbracelet/lipgloss"
 //
 // Hard rule (enforced by the no-hex-color CI gate in
 // scripts/check-no-hex-colors.sh): NEVER call lipgloss.Color with a
-// hex string or a 256-color index. sm4c intentionally piggybacks on
+// hex string. Decimal indices "0"–"255" (ANSI + xterm 256) are OK;
+// lipgloss/termenv maps them to the terminal's color profile. sm4c
+// intentionally piggybacks on
 // whatever color scheme the user already has configured in their
 // terminal emulator — we do not ship opinions about red vs. blue.
 // Emphasis comes from three attributes that honor any theme:
@@ -94,17 +96,20 @@ var (
 
 const (
 	// defaultSidebarHighlightBG / FG apply when Deps leaves the
-	// fields empty (tests, zero-Deps models). Blue + bright white
-	// is a high-contrast selection bar within the 16-color rule.
-	// Gray (8) backgrounds were hard to read with default terminal
-	// foreground on light themes; users can override via
-	// sidebar_highlight_bg / sidebar_highlight_fg in sm4c.toml.
-	defaultSidebarHighlightBG = "4"
+	// fields empty (tests, zero-Deps models). ANSI bright-black (8)
+	// + bright white (15) is the default selection bar; users can set
+	// 0–255 in sm4c.toml (256-color indices are down-mapped by
+	// lipgloss/termenv when the terminal is 16-color only).
+	defaultSidebarHighlightBG = "8"
 	defaultSidebarHighlightFG = "15"
 )
 
 // sidebarHighlightStyle is the selected session card: full-width
-// band, no border (see M3e doc). bg and fg are ANSI indices "0"–"15".
+// band, no border (see M3e doc). bg and fg are decimal color indices
+// "0"–"255" (ANSI 0–15 or xterm 256 palette). Rendering uses the
+// process default lipgloss Renderer — Run must call
+// lipgloss.SetDefaultRenderer(lipgloss.NewRenderer(out)) so termenv
+// can map indices to the terminal's actual color profile.
 func sidebarHighlightStyle(bg, fg string) lipgloss.Style {
 	return lipgloss.NewStyle().
 		Padding(0, 1).
@@ -113,7 +118,7 @@ func sidebarHighlightStyle(bg, fg string) lipgloss.Style {
 }
 
 // sidebarHighlightPathStyle is the cwd second line inside a
-// highlighted card — same fg family as the title, Faint for
+// highlighted card — same fg index as the title, Faint for
 // de-emphasis, never hintStyle (which used default fg + faint).
 func sidebarHighlightPathStyle(fg string) lipgloss.Style {
 	return lipgloss.NewStyle().

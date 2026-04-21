@@ -137,10 +137,11 @@ type Deps struct {
 	// Defaults to Config.MonitorSilence, default 3s.
 	SilenceThreshold time.Duration
 
-	// SidebarHighlightBG and SidebarHighlightFG are ANSI palette
-	// indices as decimal strings "0"–"15" for the session
-	// selection bar. Empty strings mean use style.go defaults
-	// (blue + bright white). Plumbed from config.toml by the CLI.
+	// SidebarHighlightBG and SidebarHighlightFG are decimal color
+	// index strings "0"–"255" (ANSI 0–15 or xterm 256 palette).
+	// Empty strings mean use style.go defaults (gray + bright
+	// white). Plumbed from config.toml by the CLI; lipgloss maps
+	// indices using the renderer set in Run.
 	SidebarHighlightBG string
 	SidebarHighlightFG string
 }
@@ -2410,6 +2411,12 @@ func Run(
 	},
 	deps Deps,
 ) (Model, error) {
+	// Bind lipgloss's global renderer to this program's output so
+	// termenv can detect color capability (ANSI vs 256 vs true
+	// color) and downgrade 256-color indices when the terminal only
+	// supports 16 ANSI colors. Without this, styles use
+	// termenv.DefaultOutput() which may not match `out`.
+	lipgloss.SetDefaultRenderer(lipgloss.NewRenderer(out))
 	p := tea.NewProgram(
 		NewModel(deps),
 		tea.WithInput(in),

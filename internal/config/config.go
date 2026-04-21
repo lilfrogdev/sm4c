@@ -83,13 +83,14 @@ type Config struct {
 	// "error".
 	LogLevel string `toml:"log_level"`
 
-	// SidebarHighlightBG and SidebarHighlightFG select the ANSI palette
-	// indices (as decimal strings "0" through "15") for the sidebar
-	// session selection bar's background and foreground. They resolve
-	// through the user's terminal theme. Empty string means "use the
-	// built-in default" (blue bar, bright white text). Sm4c does not
-	// support hex colors, 256-color indexes, or alpha — true opacity
-	// is not available in portable 16-color mode.
+	// SidebarHighlightBG and SidebarHighlightFG are decimal strings naming
+	// a terminal color index: **0–15** for the classic ANSI palette, or
+	// **16–255** for the xterm 256-color palette. At render time lipgloss
+	// (via termenv) maps indices to the best sequence the terminal can
+	// display — on 16-color-only sessions, 256 indices are approximated
+	// to the nearest ANSI color. Empty string means "use the built-in
+	// default" (gray bar, bright white text). Hex colors and true opacity
+	// are not supported.
 	SidebarHighlightBG string `toml:"sidebar_highlight_bg"`
 	SidebarHighlightFG string `toml:"sidebar_highlight_fg"`
 }
@@ -102,7 +103,7 @@ func Default() Config {
 		MonitorSilence:      Duration(1500 * time.Millisecond),
 		SessionPollInterval: Duration(1 * time.Second),
 		LogLevel:            "info",
-		SidebarHighlightBG:  "4",
+		SidebarHighlightBG:  "8",
 		SidebarHighlightFG:  "15",
 	}
 }
@@ -172,24 +173,24 @@ func (c Config) Validate() error {
 	if c.SocketName == "" {
 		return errors.New("config: socket_name must not be empty")
 	}
-	if err := validateANSI16("sidebar_highlight_bg", c.SidebarHighlightBG); err != nil {
+	if err := validateColorIndex("sidebar_highlight_bg", c.SidebarHighlightBG); err != nil {
 		return err
 	}
-	if err := validateANSI16("sidebar_highlight_fg", c.SidebarHighlightFG); err != nil {
+	if err := validateColorIndex("sidebar_highlight_fg", c.SidebarHighlightFG); err != nil {
 		return err
 	}
 	return nil
 }
 
-// validateANSI16 accepts empty string (caller treats as default) or a
-// decimal string "0".."15" for lipgloss terminal palette indices.
-func validateANSI16(field, s string) error {
+// validateColorIndex accepts empty string (caller treats as default) or a
+// decimal string "0".."255" for ANSI + xterm 256-color indices.
+func validateColorIndex(field, s string) error {
 	if s == "" {
 		return nil
 	}
 	n, err := strconv.Atoi(s)
-	if err != nil || n < 0 || n > 15 {
-		return fmt.Errorf("config: %s must be empty or ANSI index 0-15, got %q", field, s)
+	if err != nil || n < 0 || n > 255 {
+		return fmt.Errorf("config: %s must be empty or color index 0-255, got %q", field, s)
 	}
 	return nil
 }

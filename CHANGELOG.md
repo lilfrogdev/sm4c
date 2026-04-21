@@ -8,11 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Config: `sidebar_highlight_bg` and `sidebar_highlight_fg` (TOML) — decimal strings **`"0"`**–**`"15"`** for the ANSI palette indices used by the sidebar session selection bar. Defaults **`4`** (blue) and **`15`** (bright white) for high contrast; gray (`8`) was hard to read on many light themes. Empty string means "use built-in default" for that slot. True opacity is not supported in portable 16-color mode (documented in README).
+- Config: `sidebar_highlight_bg` and `sidebar_highlight_fg` accept decimal indices **`"0"`**–**`"255"`** — ANSI **0–15** plus the **xterm 256-color** palette **16–255**. `tui.Run` calls **`lipgloss.SetDefaultRenderer(lipgloss.NewRenderer(out))`** so termenv probes the real output stream and lipgloss maps indices to the terminal's color profile (256-color sequences when supported, otherwise down-mapped to the nearest ANSI color). Empty string still means built-in defaults.
 
 ### Changed
 
-- Sidebar selection bar: foreground + background are now configurable and default to blue + bright white instead of gray + white. The cwd line still uses the same foreground family with `Faint`. Status glyphs on the highlighted row still use `statusGlyphPlain` so nested lipgloss does not fight the bar colors.
+- Default sidebar selection colors reverted from blue (**`4`**) to gray (**`8`**) + bright white (**`15`**); live feedback preferred the neutral bar over the blue default. The cwd line still uses the same foreground index with `Faint`. Status glyphs on the highlighted row still use `statusGlyphPlain` so nested lipgloss does not fight the bar colors.
 
 ### Fixed
 

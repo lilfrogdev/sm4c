@@ -18,10 +18,10 @@
 //         head with "…" when it would overflow the column. Cards
 //         are separated by a blank line so the list reads as
 //         discrete items. The highlighted card is painted as a
-//         solid full-width band over an ANSI bright-black
-//         (color "8") background — the claude-squad "filled
-//         selection bar" shape, calmer than reverse video while
-//         staying on the terminal-native palette. An earlier
+//         solid full-width band using configurable color indices
+//         (default ANSI "8" bg + "15" fg; sm4c.toml allows 0–255
+//         with lipgloss/termenv mapping to the terminal profile).
+//         An earlier
 //         round wrapped the highlight in a rounded border; live
 //         use surfaced two failure modes (the background color
 //         stopped at the border interior, and the border vs.
@@ -33,8 +33,8 @@
 //         path (no WindowSizeMsg, unknown content width) falls
 //         back to the pre-M3e single-run reverse-video
 //         highlight, so substring-based tests keep working
-//         unchanged. The
-//         status glyph (M3d) reflects that session's live
+//         unchanged.
+//         The status glyph (M3d) reflects that session's live
 //         state: faint `·` (Quiet), solid `●` (Idle), animated
 //         braille spinner (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ — Working), `✓`
 //         (Attention — claude finished AND rang the bell at

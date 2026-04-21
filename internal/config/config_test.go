@@ -128,17 +128,27 @@ func TestValidateRejectsBadLogLevel(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsInvalidSidebarHighlightANSI(t *testing.T) {
+func TestValidateRejectsInvalidSidebarHighlightColorIndex(t *testing.T) {
 	t.Parallel()
 	c := Default()
-	c.SidebarHighlightBG = "99"
+	c.SidebarHighlightBG = "256"
 	if err := c.Validate(); err == nil {
-		t.Fatal("Validate accepted sidebar_highlight_bg=99")
+		t.Fatal("Validate accepted sidebar_highlight_bg=256")
 	}
 	c = Default()
 	c.SidebarHighlightFG = "not-a-number"
 	if err := c.Validate(); err == nil {
 		t.Fatal("Validate accepted non-numeric sidebar_highlight_fg")
+	}
+}
+
+func TestValidateAccepts256ColorIndex(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.SidebarHighlightBG = "240"
+	c.SidebarHighlightFG = "252"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate rejected valid 256 indices: %v", err)
 	}
 }
 
