@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Sidebar layout: session cards are joined with a **single newline** (no extra blank line between items). Card styles use **PaddingTop/Bottom(1)** plus **PaddingLeft(1)** so the list has a small left inset while the right edge stays flush with the column divider. The highlighted session **name** is **Bold** with the configured highlight foreground; the cwd line uses **Faint** on the same foreground so it stays secondary. Default highlight foreground is **`255`** (xterm white) instead of **`15`** — Bold on the bar targets the name only (earlier Bold+ANSI15 on the whole bar could read as muted blue-gray on some terminals). **cardPaddingW** is **1** to match the left inset for path truncation.
+- Sidebar layout: session cards are joined with a **single newline** (no extra blank line between items). Card styles use **PaddingTop/Bottom(1)** plus **PaddingLeft(1)** so the list has a small left inset while the right edge stays flush with the column divider. Session **names** are **Bold** on every row; the highlighted row also applies the configured highlight foreground to the name. The cwd line uses **Faint** on the highlight bar so it stays secondary to the name. Default highlight foreground is **`255`** (xterm white) instead of **`15`** — Bold on the bar targets the name only (earlier Bold+ANSI15 on the whole bar could read as muted blue-gray on some terminals). **cardPaddingW** is **1** to match the left inset for path truncation.
 
 ### Added
 

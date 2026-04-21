@@ -2230,20 +2230,19 @@ func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highligh
 }
 
 // sessionCardHeader renders the first line of a session card. The
-// session name is bold on the highlighted row only; the status
-// glyph stays unstyled so braille/●/✓ colors stay consistent.
+// session name is always bold; on the highlighted row it also
+// uses the configured highlight foreground. The status glyph stays
+// unstyled so braille/●/✓ colors stay consistent.
 func (m Model) sessionCardHeader(glyph, name string, highlighted bool) string {
-	if !highlighted {
-		return glyph + name
+	nameStyle := lipgloss.NewStyle().Bold(true)
+	if highlighted {
+		fg := m.sidebarHighlightFG
+		if fg == "" {
+			fg = defaultSidebarHighlightFG
+		}
+		nameStyle = nameStyle.Foreground(lipgloss.Color(fg))
 	}
-	fg := m.sidebarHighlightFG
-	if fg == "" {
-		fg = defaultSidebarHighlightFG
-	}
-	return glyph + lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color(fg)).
-		Render(name)
+	return glyph + nameStyle.Render(name)
 }
 
 // cardPaddingW is the total horizontal padding both card variants
