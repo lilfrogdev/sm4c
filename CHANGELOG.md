@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Sidebar selection bar: `cardHighlightStyle` now sets **foreground ANSI 15** (bright white) on top of **background ANSI 8** (gray). Background-only highlighting left the terminal default text color on the bar — on light themes that often reads as dark blue/gray on dark gray and was nearly illegible. The cwd second line no longer uses `hintStyle` inside the highlight (faint default-fg on gray had the same problem); it uses `cardHighlightPathStyle` (15 + Faint) instead. Status glyphs on the highlighted row use `statusGlyphPlain` so nested lipgloss does not override the parent's foreground.
+
 ### Fixed
 
 - M3e polish (round 3): "typing lands at the bottom of the pane" reappears when switching to a session whose tmux cached dims already match the sm4c viewport. `resizeHighlightedWindow` now detects the first-ever resize for each window and takes the wiggle path (W,H+1 → W,H) on that visit so tmux is guaranteed to SIGWINCH claude even when the matching-dim `resize-window` would have been a no-op. Subsequent resizes for the same window at the same dims stay debounced, so the fix costs exactly one extra `resize-window` round-trip per window per TUI lifetime. The earlier handleWindowClosed-driven wiggle is preserved untouched — the two arms together cover the "new window" and "post-close survivor" failure modes of the same underlying tmux quirk. Two tests updated/added: `TestWindowSizeEmitsResizeForHighlightedWindow` now expects the wiggle shape on startup, and the new `TestFirstResizePerWindowWiggles` asserts the first visit to EACH window wiggles while later visits debounce.

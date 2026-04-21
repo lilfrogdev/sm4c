@@ -96,15 +96,35 @@ var (
 	//      background fill — text, indentation, and cwd line
 	//      all land at the same x-coordinates.
 	//
-	//   3. ANSI color "8", not Reverse. Reverse on a dark
-	//      terminal produces a near-white band that can read
-	//      as harsh; ANSI 8 is the canonical "slightly off
-	//      base background" shade (neovim's CursorLine,
-	//      tmux's default mode-style, etc.) and stays on the
-	//      terminal-native-colors rule — no hex, no 256-index.
+	//   3. ANSI "8" background + "15" foreground. Background
+	//      alone left the terminal's default text color on top of
+	//      the gray bar — on light themes that is often a dark
+	//      blue/gray that disappears against ANSI 8 (live
+	//      feedback: "not very legible"). Bright white ("15")
+	//      on bright-black ("8") is the standard high-contrast
+	//      pairing within the 16-color rule. The cwd line uses
+	//      cardHighlightPathStyle (15 + Faint) so the second
+	//      line stays secondary without dropping to unreadable
+	//      gray like hintStyle did inside the highlight.
+	//
+	//      Reverse was considered instead of explicit fg/bg, but
+	//      nested lipgloss on status glyphs and the faint path
+	//      fought the parent's inversion unpredictably; explicit
+	//      colors keep one coherent band.
 	cardHighlightStyle = lipgloss.NewStyle().
 				Padding(0, 1).
-				Background(lipgloss.Color("8"))
+				Background(lipgloss.Color("8")).
+				Foreground(lipgloss.Color("15"))
+
+	// cardHighlightPathStyle is the cwd line inside a highlighted
+	// card only. Plain hintStyle applies Faint to the default
+	// foreground — on top of ANSI-8 that produced near-invisible
+	// text. We keep Faint for de-emphasis but pin the base
+	// color to 15 so it stays on the "light ink" side of the
+	// palette against the dark bar.
+	cardHighlightPathStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("15")).
+				Faint(true)
 
 	// sidebarColumnStyle frames the left column. BorderRight plus
 	// the default NormalBorder gives us a visible vertical line

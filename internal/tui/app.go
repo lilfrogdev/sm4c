@@ -2120,7 +2120,11 @@ func (m Model) renderSessionList() string {
 	cards := make([]string, 0, len(m.sessions))
 	for i, s := range m.sessions {
 		status := m.statusForWindow(s.WindowID, now)
+		highlighted := i == m.highlight
 		glyph := statusGlyph(status, m.statusFrame)
+		if highlighted && contentW > 0 {
+			glyph = statusGlyphPlain(status, m.statusFrame)
+		}
 		name := s.Name
 		if name == "" {
 			// tmux always has a window name; an empty one would
@@ -2128,7 +2132,7 @@ func (m Model) renderSessionList() string {
 			// so the sidebar doesn't become an empty column.
 			name = "(unnamed)"
 		}
-		card := m.renderSessionCard(glyph, name, s.Cwd, contentW, i == m.highlight)
+		card := m.renderSessionCard(glyph, name, s.Cwd, contentW, highlighted)
 		cards = append(cards, card)
 	}
 	return strings.Join(cards, "\n\n")
@@ -2173,7 +2177,11 @@ func (m Model) renderSessionCard(glyph, name, cwd string, contentW int, highligh
 		if textW > 2 {
 			short = truncLeft(short, textW-2)
 		}
-		body = "  " + hintStyle.Render(short)
+		if highlighted {
+			body = "  " + cardHighlightPathStyle.Render(short)
+		} else {
+			body = "  " + hintStyle.Render(short)
+		}
 	}
 
 	card := header

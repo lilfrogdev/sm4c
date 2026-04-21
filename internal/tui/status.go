@@ -367,6 +367,33 @@ func statusGlyph(status SessionStatus, frame int) string {
 	return "  "
 }
 
+// statusGlyphPlain is the unstyled two-column cell matching
+// statusGlyph's character choice, but without lipgloss wrapping
+// Quiet/Attention in hintStyle / attentionStyle. Used when the
+// parent render (the session card highlight) already applies
+// Background + Foreground — inner styled spans would fight the
+// parent's ANSI sequences and leave the glyph at the terminal's
+// default color on top of the selection bar, reintroducing the
+// low-contrast failure mode statusGlyph exists to avoid in the
+// non-highlighted path.
+func statusGlyphPlain(status SessionStatus, frame int) string {
+	switch status {
+	case StatusWorking:
+		idx := frame % len(spinnerFrames)
+		if idx < 0 {
+			idx += len(spinnerFrames)
+		}
+		return spinnerFrames[idx] + " "
+	case StatusAttention:
+		return attentionGlyph + " "
+	case StatusIdle:
+		return "● "
+	case StatusQuiet:
+		return "· "
+	}
+	return "  "
+}
+
 // statusFrameTickMsg is delivered by the ticker command
 // scheduleStatusTick fires while at least one pane is Working.
 // It carries no payload: the handler advances Model.statusFrame
