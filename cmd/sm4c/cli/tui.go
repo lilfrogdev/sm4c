@@ -128,7 +128,7 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 				ctx = context.Background()
 			}
 			spawnCtx, cancel := context.WithTimeout(ctx, launchTimeout)
-			newID, spawnErr := spawnClaudeWindow(spawnCtx, cmd.OutOrStdout(), o, claudeBin, nil)
+			newID, spawnErr := spawnClaudeWindow(spawnCtx, cmd.OutOrStdout(), o, claudeBin, nil, final.WorkingDir())
 			cancel()
 			if spawnErr != nil {
 				return spawnErr

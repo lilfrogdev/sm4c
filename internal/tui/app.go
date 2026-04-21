@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/charmbracelet/bubbles/filepicker"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -461,6 +462,15 @@ type Model struct {
 	// tick; cleared when the tick arrives.
 	statusTickArmed bool
 
+	// dirPicker is non-nil while the directory-picker overlay is
+	// open (triggered by `n` in sidebar focus). When the user
+	// confirms with space, newSessionDir is set and the TUI quits
+	// with ActionNewSession; esc closes the overlay without action.
+	dirPicker *filepicker.Model
+
+	// newSessionDir is the directory the user selected in the dir
+	// picker. It is read by WorkingDir() after the TUI exits.
+	newSessionDir string
 }
 
 // paneBackfillBuffer bounds panePending per pane. 64 KiB is
@@ -536,6 +546,11 @@ func NewModel(deps Deps) Model {
 // field is only authoritative once tea.Quit has fired.
 func (m Model) Action() Action { return m.action }
 
+// WorkingDir returns the directory the user selected in the dir
+// picker, or "" if the picker was cancelled or never opened.
+// Only meaningful after the TUI exits with ActionNewSession.
+func (m Model) WorkingDir() string { return m.newSessionDir }
+
 // Init is the Bubble Tea entry point. It kicks off both concurrent
 // streams the Model depends on:
 //
@@ -596,12 +611,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		prevW, prevH := m.paneViewW, m.paneViewH
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.dirPicker != nil {
+			fp, cmd := m.dirPicker.Update(msg)
+			m.dirPicker = &fp
+			return m, cmd
+		}
 		m.syncPaneViewport()
 		if m.paneViewW != prevW || m.paneViewH != prevH {
 			return m, m.resizeHighlightedWindow()
 		}
 		return m, nil
 	case tea.KeyMsg:
+		if m.dirPicker != nil {
+			return m.handleDirPickerKey(msg)
+		}
 		return m.handleKey(msg)
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
@@ -693,6 +716,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKeysSent(msg), nil
 	case windowClosedMsg:
 		return m.handleWindowClosed(msg)
+	}
+	// Forward unrecognised messages to the dir picker when it is open.
+	// The filepicker uses an internal readDirMsg type for async directory
+	// reads; it never matches any case above, so it lands here.
+	if m.dirPicker != nil {
+		fp, cmd := m.dirPicker.Update(msg)
+		m.dirPicker = &fp
+		return m, cmd
 	}
 	// Forward unrecognised byte-sequence messages to the focused pane when
 	// in pane focus mode. bubbletea delivers enhanced terminal sequences it
@@ -1181,22 +1212,37 @@ func (m Model) handleKeyInSidebarFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "n":
-		// Signal "spawn a new session" and exit the Bubble Tea
-		// runtime so the CLI layer can do the tmux round-trip
-		// without holding the raw-mode terminal. The CLI then re-
-		// enters the TUI with the new window ID as initial
-		// highlight and FocusPane so the user can type
-		// immediately into the freshly-spawned session.
-		//
-		// TODO (M3e): replace this one-shot exit with an in-TUI
-		// compose sub-view (cwd picker + optional session name +
-		// args). Today pressing `n` spawns a bare claude in the
-		// process's current working directory, which matches the
-		// previous M2c behavior and lets us ship the re-entry
-		// loop before the compose UI is built.
-		m.action = ActionNewSession
-		m.quitting = true
-		return m, tea.Quit
+		// Open the directory picker overlay so the user can choose
+		// which folder the new session starts in before the TUI
+		// exits. Pressing space confirms the current directory and
+		// triggers ActionNewSession + quit; esc cancels without
+		// spawning anything.
+		startDir := ""
+		if m.highlight >= 0 && m.highlight < len(m.sessions) {
+			startDir = m.sessions[m.highlight].Cwd
+		}
+		if startDir == "" {
+			if wd, err := os.Getwd(); err == nil {
+				startDir = wd
+			}
+		}
+		if startDir == "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				startDir = home
+			}
+		}
+		if startDir == "" {
+			startDir = "/"
+		}
+		fp := filepicker.New()
+		fp.CurrentDirectory = startDir
+		fp.DirAllowed = false
+		fp.FileAllowed = false
+		fp.ShowHidden = false
+		fp.AutoHeight = false
+		fp.Height = dirPickerHeight
+		m.dirPicker = &fp
+		return m, fp.Init()
 
 	case "enter", "ctrl+b":
 		// Both keys move focus to the pane. Enter is a discoverable
@@ -1569,6 +1615,73 @@ var errPaneGone = errors.New("tui: pane gone")
 // responses from stub senders.
 func ErrPaneGone() error { return errPaneGone }
 
+// dirPickerHeight is the number of file rows the picker renders inside
+// the overlay. Keep it small enough to fit on short terminals without
+// scrolling the overlay off-screen.
+const dirPickerHeight = 10
+
+// handleDirPickerKey routes keystrokes while the directory picker
+// overlay is open. esc cancels without action; space confirms the
+// current directory and triggers ActionNewSession + quit. Every other
+// key is forwarded to the filepicker for navigation (j/k, h/l, etc.).
+func (m Model) handleDirPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.dirPicker = nil
+		return m, nil
+	case " ":
+		m.newSessionDir = m.dirPicker.CurrentDirectory
+		m.dirPicker = nil
+		m.action = ActionNewSession
+		m.quitting = true
+		return m, tea.Quit
+	default:
+		fp, cmd := m.dirPicker.Update(msg)
+		m.dirPicker = &fp
+		return m, cmd
+	}
+}
+
+// renderDirPickerOverlay renders the directory-picker as a centered
+// floating box over the normal sidebar view. The box shows the current
+// path, the filepicker list, and key hints.
+func (m Model) renderDirPickerOverlay() string {
+	fp := m.dirPicker
+	dir := fp.CurrentDirectory
+	if dir == "" {
+		dir = "/"
+	}
+
+	inner := strings.Join([]string{
+		titleStyle.Render("open new session"),
+		"",
+		keyDescStyle.Render(dir),
+		"",
+		fp.View(),
+		"",
+		m.chip().Render("space") + "  open here    " + m.chip().Render("esc") + "  cancel",
+	}, "\n")
+
+	overlayW := 60
+	if m.width > 0 && m.width-8 < overlayW {
+		overlayW = m.width - 8
+		if overlayW < 24 {
+			overlayW = 24
+		}
+	}
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		Padding(0, 2).
+		Width(overlayW).
+		Render(inner)
+
+	if m.width > 0 && m.height > 0 {
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	}
+	return box
+}
+
 // View renders the current screen. It is called on every re-render;
 // returning the same bytes twice is cheap and by design.
 //
@@ -1593,6 +1706,9 @@ func (m Model) View() string {
 		// and re-enters the TUI, or returns to the shell on
 		// ActionNone).
 		return ""
+	}
+	if m.dirPicker != nil {
+		return m.renderDirPickerOverlay()
 	}
 	return m.renderSidebarView()
 }

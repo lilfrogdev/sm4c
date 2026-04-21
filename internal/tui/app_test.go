@@ -122,14 +122,57 @@ func TestQuitKeysRecordNoneAndRequestTeaQuit(t *testing.T) {
 	}
 }
 
-func TestNewSessionKeyRecordsActionAndRequestsTeaQuit(t *testing.T) {
+func TestNewSessionKeyOpensDirPicker(t *testing.T) {
 	t.Parallel()
 	m, cmd := applyKey(t, emptyModel(), "n")
-	if m.Action() != ActionNewSession {
-		t.Fatalf("Action = %v, want ActionNewSession", m.Action())
+	if m.dirPicker == nil {
+		t.Fatal("pressing `n` must open the dir picker overlay")
+	}
+	if m.Action() != ActionNone {
+		t.Fatalf("Action = %v before picker confirmed; want ActionNone", m.Action())
 	}
 	if cmd == nil {
-		t.Fatalf("expected tea.Quit cmd after `n`, got nil")
+		t.Fatal("expected filepicker Init cmd after `n`, got nil")
+	}
+}
+
+func TestDirPickerEscCancels(t *testing.T) {
+	t.Parallel()
+	m, _ := applyKey(t, emptyModel(), "n")
+	if m.dirPicker == nil {
+		t.Skip("picker did not open; skip cancel test")
+	}
+	m, cmd := applyKey(t, m, "esc")
+	if m.dirPicker != nil {
+		t.Fatal("esc must close the dir picker")
+	}
+	if m.Action() != ActionNone {
+		t.Fatalf("Action = %v after esc; want ActionNone", m.Action())
+	}
+	if cmd != nil {
+		t.Fatalf("esc produced cmd %T; want nil", cmd)
+	}
+}
+
+func TestDirPickerSpaceConfirms(t *testing.T) {
+	t.Parallel()
+	m, _ := applyKey(t, emptyModel(), "n")
+	if m.dirPicker == nil {
+		t.Skip("picker did not open; skip confirm test")
+	}
+	wantDir := m.dirPicker.CurrentDirectory
+	m, cmd := applyKey(t, m, " ")
+	if m.dirPicker != nil {
+		t.Fatal("space must close the dir picker")
+	}
+	if m.Action() != ActionNewSession {
+		t.Fatalf("Action = %v after space; want ActionNewSession", m.Action())
+	}
+	if m.WorkingDir() != wantDir {
+		t.Fatalf("WorkingDir = %q; want %q", m.WorkingDir(), wantDir)
+	}
+	if cmd == nil {
+		t.Fatal("expected tea.Quit cmd after space confirmation")
 	}
 }
 

@@ -74,7 +74,7 @@ func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 	spawnCtx, cancel := context.WithTimeout(ctx, launchTimeout)
 	defer cancel()
 
-	windowID, err := spawnClaudeWindow(spawnCtx, cmd.OutOrStdout(), o, report.ClaudePath, args)
+	windowID, err := spawnClaudeWindow(spawnCtx, cmd.OutOrStdout(), o, report.ClaudePath, args, "")
 	if err != nil {
 		return err
 	}
@@ -95,8 +95,8 @@ func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 // and may have modified files or emitted output. Silently killing
 // it would lose that work. The user can recover manually via
 // `sm4c ls` and a future close action.
-func spawnClaudeWindow(ctx context.Context, out io.Writer, o tmuxctl.OneShot, claudeBin string, args []string) (string, error) {
-	windowID, err := o.NewClaudeWindow(ctx, claudeBin, args)
+func spawnClaudeWindow(ctx context.Context, out io.Writer, o tmuxctl.OneShot, claudeBin string, args []string, dir string) (string, error) {
+	windowID, err := o.NewClaudeWindow(ctx, claudeBin, args, dir)
 	if err != nil {
 		return "", fmt.Errorf("launch: create claude window: %w", err)
 	}

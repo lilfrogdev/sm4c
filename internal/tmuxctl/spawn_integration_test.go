@@ -51,7 +51,7 @@ func TestIntegration_NewClaudeWindow_CreateTagListKill(t *testing.T) {
 	defer cancel()
 
 	// First spawn should create the session + first window atomically.
-	id1, err := o.NewClaudeWindow(ctx, sleep, []string{"3600"})
+	id1, err := o.NewClaudeWindow(ctx, sleep, []string{"3600"}, "")
 	if err != nil {
 		t.Fatalf("NewClaudeWindow (first): %v", err)
 	}
@@ -60,7 +60,7 @@ func TestIntegration_NewClaudeWindow_CreateTagListKill(t *testing.T) {
 	}
 
 	// Second spawn should attach to the existing session as a new window.
-	id2, err := o.NewClaudeWindow(ctx, sleep, []string{"3600"})
+	id2, err := o.NewClaudeWindow(ctx, sleep, []string{"3600"}, "")
 	if err != nil {
 		t.Fatalf("NewClaudeWindow (second): %v", err)
 	}
@@ -164,7 +164,7 @@ func TestIntegration_NewClaudeWindow_ForwardsSimpleArgThroughShell(t *testing.T)
 	defer cancel()
 
 	payload := "hello 'quoted' world"
-	if _, err := o.NewClaudeWindow(ctx, fakeClaude, []string{payload}); err != nil {
+	if _, err := o.NewClaudeWindow(ctx, fakeClaude, []string{payload}, ""); err != nil {
 		t.Fatalf("NewClaudeWindow: %v", err)
 	}
 

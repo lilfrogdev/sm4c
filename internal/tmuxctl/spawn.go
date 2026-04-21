@@ -51,25 +51,17 @@ var ErrSpawnNoClaudeBin = errors.New("tmuxctl: NewClaudeWindow: claudeBin is emp
 // binary with the given arguments, tagged with @sm4c-kind=claude, and
 // returns the assigned window ID (e.g. "@3").
 //
+// dir, when non-empty, sets the working directory of the new window
+// via tmux's -c flag. Empty dir inherits the session's cwd.
+//
 // If the sm4c tmux session does not yet exist on the socket, it is
 // created atomically with this window as its first window. Otherwise
 // the window is appended to the existing session.
 //
-// Every call reapplies the server-wide default-shell (pinned to
-// /bin/sh, see posixShell) and the window rename options; these
-// set-options are chained into the same tmux CLI invocation as the
-// new-session / new-window command so the first window is ALWAYS
-// spawned with a POSIX-compliant shell, regardless of the user's
-// login shell. This closes a real bug: on machines where the user's
-// login shell is nushell, fish, or elvish, tmux's default-shell
-// inherits that non-POSIX shell at server start, and our POSIX-escaped
-// `exec claude …` command strings are then mangled by the wrong
-// parser (nushell in particular preserves `'\''` literally).
-//
 // On any failure after the window is created, the window is killed
 // (best-effort) so the socket doesn't end up with an untagged "half
 // managed" window that sm4c would later render as Unmanaged.
-func (o OneShot) NewClaudeWindow(ctx context.Context, claudeBin string, args []string) (string, error) {
+func (o OneShot) NewClaudeWindow(ctx context.Context, claudeBin string, args []string, dir string) (string, error) {
 	if claudeBin == "" {
 		return "", ErrSpawnNoClaudeBin
 	}
@@ -95,9 +87,9 @@ func (o OneShot) NewClaudeWindow(ctx context.Context, claudeBin string, args []s
 	// fall back to the literal "claude" placeholder.
 	initialName := nameFromClaudeArgs(args)
 
-	windowID, err := o.newWindowOnExistingSession(ctx, cmdline, initialName)
+	windowID, err := o.newWindowOnExistingSession(ctx, cmdline, initialName, dir)
 	if err != nil && errors.Is(err, errNoSuchSession) {
-		windowID, err = o.newSessionWithCommand(ctx, cmdline, initialName)
+		windowID, err = o.newSessionWithCommand(ctx, cmdline, initialName, dir)
 	}
 	if err != nil {
 		return "", err
@@ -203,7 +195,7 @@ var errNoSuchSession = errors.New("tmuxctl: sm4c session does not exist")
 //   - The server is not running at all → errNoSuchSession (the chain
 //     cannot even start).
 //   - The server is running but the session is missing → errNoSuchSession.
-func (o OneShot) newWindowOnExistingSession(ctx context.Context, cmdline, initialName string) (string, error) {
+func (o OneShot) newWindowOnExistingSession(ctx context.Context, cmdline, initialName, dir string) (string, error) {
 	args := []string{
 		"set-option", "-g", "default-shell", posixShell,
 		";",
@@ -215,6 +207,9 @@ func (o OneShot) newWindowOnExistingSession(ctx context.Context, cmdline, initia
 	}
 	if initialName != "" {
 		args = append(args, "-n", initialName)
+	}
+	if dir != "" {
+		args = append(args, "-c", dir)
 	}
 	args = append(args, cmdline)
 	out, err := o.run(ctx, args...)
@@ -248,11 +243,11 @@ func (o OneShot) newWindowOnExistingSession(ctx context.Context, cmdline, initia
 // user input. The window-name starts as "claude" and is expected to
 // be updated by claude's own title-writing (OSC 0/2) shortly after
 // startup; sm4c does not rename windows itself at any point.
-func (o OneShot) newSessionWithCommand(ctx context.Context, cmdline, initialName string) (string, error) {
+func (o OneShot) newSessionWithCommand(ctx context.Context, cmdline, initialName, dir string) (string, error) {
 	if initialName == "" {
 		initialName = "claude"
 	}
-	out, err := o.run(ctx,
+	args := []string{
 		"set-option", "-g", "default-shell", posixShell,
 		";",
 		"set-option", "-g", "-w", "allow-rename", "on",
@@ -265,8 +260,12 @@ func (o OneShot) newSessionWithCommand(ctx context.Context, cmdline, initialName
 		"-n", initialName,
 		"-P",
 		"-F", "#{window_id}",
-		cmdline,
-	)
+	}
+	if dir != "" {
+		args = append(args, "-c", dir)
+	}
+	args = append(args, cmdline)
+	out, err := o.run(ctx, args...)
 	if err != nil {
 		return "", fmt.Errorf("new-session: %w", err)
 	}
