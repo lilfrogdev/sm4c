@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,19 +44,32 @@ type hookStreamClosedMsg struct{}
 // SM4C_HOOK_FIFO tmux environment variable and no-op when it is unset — this
 // prevents global ~/.claude/settings.json hooks from cross-talking into
 // unrelated sm4c instances or plain claude invocations outside tmux.
-func startHookListener(path string) (<-chan hookMsg, error) {
+// startHookListener creates the FIFO at path (mkfifo), opens it O_RDWR so
+// the reader holds both ends — preventing EOF when hook writers close between
+// writes — and starts a goroutine that parses lines and sends hookMsg values
+// on the returned channel.
+//
+// The returned stop func closes the file, which unblocks the scanner and
+// causes the goroutine to exit. It is safe to call stop more than once (a
+// sync.Once guards the close). Callers must call stop when the TUI exits so
+// that a subsequent TUI iteration does not spawn a second concurrent reader
+// on the same FIFO — FIFO reads are exclusive, not broadcast, and two
+// concurrent readers would split writes between them.
+func startHookListener(path string) (<-chan hookMsg, func(), error) {
 	if err := syscall.Mkfifo(path, 0600); err != nil && !os.IsExist(err) {
-		return nil, fmt.Errorf("tui: hook listener: mkfifo %s: %w", path, err)
+		return nil, nil, fmt.Errorf("tui: hook listener: mkfifo %s: %w", path, err)
 	}
 	// O_RDWR keeps both ends open so we never receive EOF when the last
 	// hook writer closes its end between writes.
 	f, err := os.OpenFile(path, os.O_RDWR, os.ModeNamedPipe) // #nosec G304 -- path constructed by sm4c, not user input
 	if err != nil {
-		return nil, fmt.Errorf("tui: hook listener: open %s: %w", path, err)
+		return nil, nil, fmt.Errorf("tui: hook listener: open %s: %w", path, err)
 	}
+	var once sync.Once
+	stop := func() { once.Do(func() { _ = f.Close() }) }
 	ch := make(chan hookMsg, 32)
 	go func() {
-		defer func() { _ = f.Close() }()
+		defer stop()
 		defer close(ch)
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
@@ -79,7 +93,7 @@ func startHookListener(path string) (<-chan hookMsg, error) {
 			ch <- hookMsg{paneID: paneID, event: ev}
 		}
 	}()
-	return ch, nil
+	return ch, stop, nil
 }
 
 // waitForHookEvent returns a Bubble Tea command that blocks until the next

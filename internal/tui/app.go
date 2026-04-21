@@ -526,14 +526,6 @@ func NewModel(deps Deps) Model {
 	if deps.PaneStream != nil {
 		m.paneEvents = deps.PaneStream()
 	}
-	if deps.HookFifoPath != "" {
-		ch, err := startHookListener(deps.HookFifoPath)
-		if err != nil {
-			debugf("hook listener failed: %v", err)
-		} else {
-			m.hookEvents = ch
-		}
-	}
 	return m
 }
 
@@ -2493,8 +2485,18 @@ func Run(
 	// supports 16 ANSI colors. Without this, styles use
 	// termenv.DefaultOutput() which may not match `out`.
 	lipgloss.SetDefaultRenderer(lipgloss.NewRenderer(out))
+	m := NewModel(deps)
+	if deps.HookFifoPath != "" {
+		ch, stop, err := startHookListener(deps.HookFifoPath)
+		if err != nil {
+			debugf("hook listener failed: %v", err)
+		} else {
+			m.hookEvents = ch
+			defer stop()
+		}
+	}
 	p := tea.NewProgram(
-		NewModel(deps),
+		m,
 		tea.WithInput(in),
 		tea.WithOutput(out),
 		tea.WithAltScreen(),
