@@ -1521,11 +1521,18 @@ func (m Model) mouseOverRightPane(x int) bool {
 //
 //	row 0: header ("sm4c — N sessions")
 //	row 1: blank separator
-//	row 2+: session cards, one per session
+//	row 2+: session cards
 //
-// Each card is 1 row when the session has no cwd, and 2 rows when it does
-// (the second row is the short path). Cards are joined without extra blank
-// lines between them.
+// Each card is rendered by renderSessionCard wrapped in cardBaseStyle /
+// sidebarHighlightStyle, both of which apply PaddingTop(1)+PaddingBottom(1).
+// That means each card occupies:
+//
+//	no cwd: 3 rows  (blank + name + blank)
+//	with cwd: 4 rows  (blank + name + cwd + blank)
+//
+// The cards are joined with a single "\n" in renderSessionList; that newline
+// is consumed as the line terminator between the last row of one card and
+// the first row of the next, so there is no extra inter-card gap.
 func (m Model) sessionIndexAtY(y int) int {
 	const listStartRow = 2 // header + blank separator
 	if y < listStartRow || len(m.sessions) == 0 {
@@ -1533,10 +1540,12 @@ func (m Model) sessionIndexAtY(y int) int {
 	}
 	row := y - listStartRow
 	for i, s := range m.sessions {
-		cardH := 1
+		// 1 (PaddingTop) + content rows + 1 (PaddingBottom)
+		contentRows := 1 // name line always present
 		if shortPath(s.Cwd) != "" {
-			cardH = 2
+			contentRows = 2 // name + cwd
 		}
+		cardH := 1 + contentRows + 1
 		if row < cardH {
 			return i
 		}
