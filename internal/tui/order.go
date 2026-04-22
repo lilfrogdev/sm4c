@@ -78,8 +78,8 @@ func saveSessionOrder(path string, names []string) error {
 }
 
 // applySessionOrder returns sessions sorted according to order (a list of
-// session names). Sessions whose names appear in order are placed first, in
-// that order. Sessions not listed append at the end in their original relative
+// window IDs). Sessions whose IDs appear in order are placed first, in that
+// order. Sessions not listed append at the end in their original relative
 // order. Sessions listed in order that are absent from sessions are silently
 // skipped — they no longer exist.
 //
@@ -89,17 +89,17 @@ func applySessionOrder(sessions []Session, order []string) []Session {
 		return sessions
 	}
 	pos := make(map[string]int, len(order))
-	for i, name := range order {
+	for i, id := range order {
 		// First occurrence wins; duplicates in the order file are ignored.
-		if _, dup := pos[name]; !dup {
-			pos[name] = i
+		if _, dup := pos[id]; !dup {
+			pos[id] = i
 		}
 	}
 	out := make([]Session, len(sessions))
 	copy(out, sessions)
 	sort.SliceStable(out, func(i, j int) bool {
-		pi, iKnown := pos[out[i].Name]
-		pj, jKnown := pos[out[j].Name]
+		pi, iKnown := pos[out[i].WindowID]
+		pj, jKnown := pos[out[j].WindowID]
 		switch {
 		case iKnown && jKnown:
 			return pi < pj
@@ -133,11 +133,11 @@ func moveSession(sessions []Session, from, to int) []Session {
 	return out
 }
 
-// sessionNames extracts the Name field from each session in order.
-func sessionNames(sessions []Session) []string {
-	names := make([]string, len(sessions))
+// sessionWindowIDs extracts the WindowID field from each session in order.
+func sessionWindowIDs(sessions []Session) []string {
+	ids := make([]string, len(sessions))
 	for i, s := range sessions {
-		names[i] = s.Name
+		ids[i] = s.WindowID
 	}
-	return names
+	return ids
 }

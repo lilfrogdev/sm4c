@@ -16,6 +16,7 @@ func TestApplySessionOrder(t *testing.T) {
 		return s
 	}
 
+	// order slices use WindowIDs (the "@<name>" format mkSessions generates).
 	cases := []struct {
 		name     string
 		sessions []Session
@@ -31,31 +32,31 @@ func TestApplySessionOrder(t *testing.T) {
 		{
 			name:     "order applied",
 			sessions: mkSessions("a", "b", "c"),
-			order:    []string{"c", "a", "b"},
+			order:    []string{"@c", "@a", "@b"},
 			want:     []string{"c", "a", "b"},
 		},
 		{
 			name:     "unknown sessions append at end in original order",
 			sessions: mkSessions("a", "b", "c", "d"),
-			order:    []string{"c", "a"},
+			order:    []string{"@c", "@a"},
 			want:     []string{"c", "a", "b", "d"},
 		},
 		{
 			name:     "removed entries in order are skipped",
 			sessions: mkSessions("a", "c"),
-			order:    []string{"c", "b", "a"}, // b no longer exists
+			order:    []string{"@c", "@b", "@a"}, // @b no longer exists
 			want:     []string{"c", "a"},
 		},
 		{
 			name:     "empty sessions",
 			sessions: nil,
-			order:    []string{"a", "b"},
+			order:    []string{"@a", "@b"},
 			want:     []string{},
 		},
 		{
 			name:     "all unknown",
 			sessions: mkSessions("x", "y"),
-			order:    []string{"a", "b"},
+			order:    []string{"@a", "@b"},
 			want:     []string{"x", "y"},
 		},
 	}

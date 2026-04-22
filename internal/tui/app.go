@@ -1575,7 +1575,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action == tea.MouseActionMotion && m.dragIdx >= 0 && !overRight {
 		if to := m.sessionIndexAtY(msg.Y); to >= 0 && to != m.dragIdx {
 			m.sessions = moveSession(m.sessions, m.dragIdx, to)
-			m.sessionOrder = sessionNames(m.sessions)
+			m.sessionOrder = sessionWindowIDs(m.sessions)
 			m.highlight = to
 			m.dragIdx = to
 		}

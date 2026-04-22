@@ -253,8 +253,14 @@ func (p *paneTerminal) render() string {
 }
 
 // renderScrolled builds the viewport when scrollOffset > 0. It combines
-// the tail of the scrollback buffer (older rows) with the top of the live
-// screen (newer rows) to fill exactly emu.Height() rows.
+// the tail of the scrollback buffer with the bottom of the live screen to
+// fill exactly emu.Height() rows.
+//
+// We use the BOTTOM rows of the live screen (not the top) so that
+// bottom-anchored TUIs like claude's stay visually stable as the user
+// scrolls: the live content slides naturally off the bottom as scrollback
+// rows enter from the top, rather than showing blank rows from the live
+// screen's unused upper region.
 func (p *paneTerminal) renderScrolled() string {
 	sb := p.emu.Scrollback()
 	if sb == nil {
@@ -287,13 +293,17 @@ func (p *paneTerminal) renderScrolled() string {
 		}
 	}
 
-	// Fill the remainder from the top of the live screen.
+	// Fill the remainder from the BOTTOM of the live screen.
+	// Taking the bottom rows keeps bottom-anchored apps (claude, vim, etc.)
+	// fully visible when only partially scrolled into scrollback.
 	if fromScreen > 0 {
 		screenStr := strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
-		screenRows := strings.SplitN(screenStr, "\n", fromScreen+1)
-		for i := 0; i < fromScreen && i < len(screenRows); i++ {
-			lines = append(lines, screenRows[i])
+		screenRows := strings.Split(screenStr, "\n")
+		start := len(screenRows) - fromScreen
+		if start < 0 {
+			start = 0
 		}
+		lines = append(lines, screenRows[start:]...)
 	}
 
 	return strings.Join(lines, "\n")
