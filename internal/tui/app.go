@@ -1598,7 +1598,9 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.Action == tea.MouseActionPress {
-			if idx := m.sessionIndexAtY(msg.Y); idx >= 0 {
+			idx := m.sessionIndexAtY(msg.Y)
+			debugf("click y=%d → idx=%d highlight=%d sessions=%d dragIdx=%d", msg.Y, idx, m.highlight, len(m.sessions), m.dragIdx)
+			if idx >= 0 {
 				m.highlight = idx
 				m.dragIdx = idx
 				return m, tea.Batch(

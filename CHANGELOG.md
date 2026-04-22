@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Scrollback overflow: when the scrollback buffer is deeper than the viewport height, `renderScrolled` was emitting more lines than the viewport (e.g. 1 000 lines into a 40-row pane). The excess content overflowed into the sidebar. Fixed by capping `fromScrollback = min(offset, height)` before the loop, so the output is always exactly `height` lines.
 - Drag-to-reorder now uses window IDs (stable tmux identifiers like `@3`) as the order key instead of session names. Previously all Claude sessions share the window name `"claude"`, so `applySessionOrder` treated them as the same entry and restored the original order on every tmux poll — making drags revert. Window IDs are unique per window so each session retains its dragged position.
 - Drag-to-reorder and click-to-select used incorrect session row heights in `sessionIndexAtY`. `cardBaseStyle` and `sidebarHighlightStyle` both apply `PaddingTop(1)+PaddingBottom(1)`, so each card occupies 3 terminal rows (no cwd) or 4 rows (with cwd). The previous code assumed 1 or 2 rows, causing drag motions to resolve to the wrong session (or −1) and clicks beyond the first two rows of a card to misfire.
 

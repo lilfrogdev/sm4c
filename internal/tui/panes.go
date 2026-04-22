@@ -277,7 +277,13 @@ func (p *paneTerminal) renderScrolled() string {
 	}
 
 	// Split the viewport into scrollback rows and live-screen rows.
+	// Cap fromScrollback at height so we never emit more lines than the
+	// viewport — if scrollback exceeds height, we fill entirely from
+	// scrollback and skip the live screen.
 	fromScrollback := offset
+	if fromScrollback > height {
+		fromScrollback = height
+	}
 	fromScreen := height - fromScrollback
 
 	lines := make([]string, 0, height)
