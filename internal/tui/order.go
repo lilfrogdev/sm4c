@@ -57,21 +57,21 @@ func saveSessionOrder(path string, names []string) error {
 		// name will both appear at adjacent positions, which is harmless.
 		if _, err := fmt.Fprintln(w, name); err != nil {
 			f.Close() //nolint:errcheck
-			os.Remove(tmpPath)
+			_ = os.Remove(tmpPath)
 			return fmt.Errorf("session order: write: %w", err)
 		}
 	}
 	if err := w.Flush(); err != nil {
 		f.Close() //nolint:errcheck
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("session order: flush: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("session order: close temp: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("session order: rename to %s: %w", path, err)
 	}
 	return nil
