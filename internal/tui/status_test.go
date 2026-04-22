@@ -502,5 +502,66 @@ func TestSpinnerRestartsAfterDoneAndKeystroke(t *testing.T) {
 	}
 }
 
+// TestHookBeforePaneResolved pins the pending-event queue: a hook that
+// arrives before the pane is mapped must be replayed once the pane resolves,
+// so the spinner works on the first session without requiring a second prompt.
+func TestHookBeforePaneResolved(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Working replayed on resolve arms ticker", func(t *testing.T) {
+		t.Parallel()
+		m := NewModel(Deps{})
+		// No paneToWindow entry yet — pane not resolved.
+
+		// Hook fires before pane is mapped.
+		m2, _ := m.Update(hookMsg{paneID: "%1", event: hookEventWorking})
+		next := m2.(Model)
+		// Should be queued, not applied.
+		if next.statusForWindow("@1") == StatusWorking {
+			t.Fatalf("hook was applied before pane was mapped; expected it to be queued")
+		}
+		if _, ok := next.pendingHookEvents["%1"]; !ok {
+			t.Fatalf("hook was not queued in pendingHookEvents")
+		}
+
+		// Pane resolves.
+		next.paneByWindow["@1"] = "%1" // set up so resolve msg is valid
+		m3, cmd := next.Update(paneResolvedMsg{windowID: "@1", paneID: "%1"})
+		final := m3.(Model)
+
+		if final.statusForWindow("@1") != StatusWorking {
+			t.Fatalf("pending Working hook was not replayed on resolve; got %v", final.statusForWindow("@1"))
+		}
+		if !final.statusTickArmed {
+			t.Fatalf("spinner ticker not armed after replaying Working hook")
+		}
+		if cmd == nil {
+			t.Fatalf("no tick Cmd returned after replaying Working hook")
+		}
+		if _, ok := final.pendingHookEvents["%1"]; ok {
+			t.Fatalf("pendingHookEvents not cleared after replay")
+		}
+	})
+
+	t.Run("Done replayed on resolve shows checkmark", func(t *testing.T) {
+		t.Parallel()
+		m := NewModel(Deps{})
+
+		m2, _ := m.Update(hookMsg{paneID: "%1", event: hookEventDone})
+		next := m2.(Model)
+		if _, ok := next.pendingHookEvents["%1"]; !ok {
+			t.Fatalf("Done hook was not queued")
+		}
+
+		next.paneByWindow["@1"] = "%1"
+		m3, _ := next.Update(paneResolvedMsg{windowID: "@1", paneID: "%1"})
+		final := m3.(Model)
+
+		if final.statusForWindow("@1") != StatusDone {
+			t.Fatalf("pending Done hook was not replayed; got %v", final.statusForWindow("@1"))
+		}
+	})
+}
+
 // Guard the bubbletea import.
 var _ tea.Msg = statusFrameTickMsg{}

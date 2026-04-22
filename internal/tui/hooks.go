@@ -125,9 +125,14 @@ func (m Model) applyHookEvent(msg hookMsg) {
 	}
 	windowID := m.paneToWindow[msg.paneID]
 	if windowID == "" {
-		debugf("applyHookEvent: DROP pane=%s event=%d (no window mapping; known panes: %v)", msg.paneID, msg.event, m.paneToWindow)
+		// Pane not yet mapped (ActivePaneResolver hasn't finished). Buffer
+		// the event so handlePaneResolved can replay it once the mapping
+		// is established. Only the most recent event per pane is kept.
+		debugf("applyHookEvent: QUEUE pane=%s event=%d (no window mapping yet)", msg.paneID, msg.event)
+		m.pendingHookEvents[msg.paneID] = msg.event
 		return
 	}
+	delete(m.pendingHookEvents, msg.paneID)
 	debugf("applyHookEvent: pane=%s window=%s event=%d", msg.paneID, windowID, msg.event)
 	ps := m.paneStatuses[windowID]
 	switch msg.event {

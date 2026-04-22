@@ -450,6 +450,15 @@ type Model struct {
 	// alongside paneByWindow in handlePaneResolved.
 	paneToWindow map[string]string
 
+	// pendingHookEvents buffers the most recent hook event for each pane
+	// that fired before paneToWindow had an entry for that pane. Hook
+	// scripts can fire (e.g. UserPromptSubmit) before the async
+	// ActivePaneResolver round-trip has finished — applyHookEvent would
+	// silently drop those events. handlePaneResolved replays the last
+	// pending event once the mapping is established. Only the most recent
+	// event per pane is kept (earlier ones are superseded).
+	pendingHookEvents map[string]hookEvent
+
 	// hookEvents is the channel delivering hookMsg values from the
 	// FIFO listener started in NewModel. Nil when no HookFifoPath
 	// was configured or the listener failed to start.
@@ -535,6 +544,7 @@ func NewModel(deps Deps) Model {
 		sizedFor:          make(map[string][2]int),
 		paneStatuses:      make(map[string]paneStatus),
 		paneToWindow:      make(map[string]string),
+		pendingHookEvents: make(map[string]hookEvent),
 		paneViewW:         defaultPaneWidth,
 		paneViewH:         defaultPaneHeight,
 		focus:              FocusSidebar,
@@ -1054,6 +1064,25 @@ func (m Model) handlePaneResolved(msg paneResolvedMsg) (Model, tea.Cmd) {
 	}
 	m.paneByWindow[msg.windowID] = msg.paneID
 	m.paneToWindow[msg.paneID] = msg.windowID
+
+	// Replay any hook event that arrived before this pane was mapped.
+	// If the replayed event is Working, arm the animation ticker exactly
+	// as the hookMsg handler would.
+	if ev, ok := m.pendingHookEvents[msg.paneID]; ok {
+		debugf("paneResolved: replaying pending hook event pane=%s event=%d", msg.paneID, ev)
+		if ev == hookEventDone {
+			m.statusTickArmed = false
+		}
+		m.applyHookEvent(hookMsg{paneID: msg.paneID, event: ev})
+		if tick := m.scheduleStatusTick(); tick != nil {
+			m.statusTickArmed = true
+			// Return immediately with the tick so the spinner starts.
+			// The capture path below is skipped — the pending event
+			// arriving means the session was already active; a stale
+			// capture would arrive after live bytes anyway.
+			return m, tick
+		}
+	}
 
 	if m.paneCapturer == nil {
 		return m, nil
