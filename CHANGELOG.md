@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Drag-to-reorder and click-to-select used incorrect session row heights in `sessionIndexAtY`. `cardBaseStyle` and `sidebarHighlightStyle` both apply `PaddingTop(1)+PaddingBottom(1)`, so each card occupies 3 terminal rows (no cwd) or 4 rows (with cwd). The previous code assumed 1 or 2 rows, causing drag motions to resolve to the wrong session (or −1) and clicks beyond the first two rows of a card to misfire.
+
 ### Added
 
 - Drag-to-reorder sidebar sessions. Left-click and drag a session card up or down to change its position in the list. The new order is written atomically to `$XDG_CONFIG_HOME/sm4c/session_order` on mouse release and reapplied on every tmux poll and across restarts, so the order survives quitting and re-entering sm4c. Sessions added after an order was saved (never dragged) append at the end. The drag uses `dragIdx` state on the model — not the terminal-reported held button — so it works on terminals that do not carry the button field in motion events.
