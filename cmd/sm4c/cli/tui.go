@@ -205,7 +205,6 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 	var resizer tui.WindowResizer
 	var closerFn tui.WindowCloser
 	var keys tui.KeySender
-	var scroller tui.PaneScroller
 	if o.TmuxBin != "" {
 		capturer = func(ctx context.Context, paneID string) ([]byte, error) {
 			return o.CapturePane(ctx, paneID)
@@ -243,9 +242,6 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 			}
 			return err
 		}
-		scroller = func(ctx context.Context, paneID string, up bool) error {
-			return o.ScrollPane(ctx, paneID, up)
-		}
 	}
 	return tui.Run(
 		asReader(cmd.InOrStdin()),
@@ -257,10 +253,9 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 			PaneResolver:       resolver,
 			PaneCapturer:       capturer,
 			WindowResizer:      resizer,
-			WindowCloser:       closerFn,
-			KeySender:          keys,
-			PaneScroller:       scroller,
-			InitialHighlight:   initialWindowID,
+			WindowCloser:     closerFn,
+			KeySender:        keys,
+			InitialHighlight: initialWindowID,
 			InitialFocus:       initialFocus,
 			SilenceThreshold:   silenceThreshold,
 			HookFifoPath:       hookFifoPath,

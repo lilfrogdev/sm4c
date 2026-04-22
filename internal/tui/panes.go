@@ -105,18 +105,6 @@ type KeySender func(ctx context.Context, paneID string, data []byte) error
 // tmuxctl.OneShot.ResizeWindow.
 type WindowResizer func(ctx context.Context, windowID string, width, height int) error
 
-// PaneScroller asks tmux to scroll the given pane's scrollback history up
-// or down. The TUI calls it when the user spins the mouse wheel in pane
-// focus mode. Unlike KeySender, which writes raw bytes into the pane's
-// PTY input (reaching Claude Code's process), PaneScroller engages
-// tmux's own copy-mode mechanism, which operates on tmux's scrollback
-// buffer independently of the process running in the pane.
-//
-// A nil PaneScroller disables mouse-wheel scrollback in pane focus;
-// the scroll events are silently dropped and the view stays put.
-// Production callers wrap tmuxctl.OneShot.ScrollPane.
-type PaneScroller func(ctx context.Context, paneID string, up bool) error
-
 // WindowCloser terminates a tmux window (the "close session" action)
 // identified by its tmux window ID. The TUI invokes it when the user
 // confirms an `x` close in the sidebar: killing the window sends
@@ -142,15 +130,25 @@ const (
 	defaultPaneHeight = 24
 )
 
-// paneTerminal pairs a VT emulator with a "has received any bytes
-// yet" flag. The flag lets renderRightPaneBody distinguish "emulator
-// exists but is still the post-boot blank screen" from "emulator has
-// drawn something", so we can keep showing a "waiting for output"
-// hint until claude actually emits bytes instead of flashing an
-// empty grid.
+// paneScrollStep is the number of terminal rows moved per mouse-wheel tick.
+const paneScrollStep = 3
+
+// paneTerminal pairs a VT emulator with rendering state.
+//
+// written tracks whether any bytes have been fed to the emulator; it lets
+// renderRightPaneBody distinguish "emulator exists but is still the
+// post-boot blank screen" from "emulator has drawn something", so we can
+// keep showing a "waiting for output" hint until claude actually emits
+// bytes instead of flashing an empty grid.
+//
+// scrollOffset is the number of rows above the live view that are
+// currently visible. 0 means the live bottom of the screen; a positive
+// value means the user has scrolled back into the scrollback buffer.
+// Scrolling is always clamped to [0, scrollback.Len()].
 type paneTerminal struct {
-	emu     *vt.Emulator
-	written bool
+	emu          *vt.Emulator
+	written      bool
+	scrollOffset int
 }
 
 // newPaneTerminal constructs a fresh emulator at the given
@@ -215,21 +213,90 @@ func (p *paneTerminal) resize(width, height int) {
 	p.emu.Resize(width, height)
 }
 
-// render returns the emulator's current screen as an ANSI-encoded
-// string: one line per row, each clipped to the emulator width,
-// with SGR escapes embedded so colors and attributes survive the
-// handoff to the outer terminal. The caller is responsible for
-// trimming trailing empty lines if the surrounding layout prefers
-// tight content.
+// scroll adjusts scrollOffset by delta rows (positive = scroll up / older,
+// negative = scroll down / newer). No-op when the emulator is in alt-screen
+// mode (scrollback is nil). The offset is clamped to [0, scrollback.Len()].
+func (p *paneTerminal) scroll(delta int) {
+	if p == nil || p.emu == nil {
+		return
+	}
+	sb := p.emu.Scrollback()
+	if sb == nil {
+		return // alt-screen mode has no scrollback
+	}
+	p.scrollOffset += delta
+	if p.scrollOffset < 0 {
+		p.scrollOffset = 0
+	}
+	if max := sb.Len(); p.scrollOffset > max {
+		p.scrollOffset = max
+	}
+}
+
+// render returns the emulator's current screen as an ANSI-encoded string:
+// one line per row with SGR escapes embedded so colors and attributes
+// survive the handoff to the outer terminal. When scrollOffset > 0, the
+// view is a window into the scrollback buffer + the top of the live screen;
+// otherwise it is the full live screen.
 func (p *paneTerminal) render() string {
 	if p == nil || p.emu == nil {
 		return ""
+	}
+	if p.scrollOffset > 0 {
+		return p.renderScrolled()
 	}
 	// cellbuf.Render() joins rows with \r\n. Strip the \r so Bubble Tea's
 	// incremental diff sees plain \n-terminated lines: the \r would confuse
 	// the visible-width measurement, causing the diff to skip "erase to end
 	// of line" sequences and leave stale characters on screen.
 	return strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
+}
+
+// renderScrolled builds the viewport when scrollOffset > 0. It combines
+// the tail of the scrollback buffer (older rows) with the top of the live
+// screen (newer rows) to fill exactly emu.Height() rows.
+func (p *paneTerminal) renderScrolled() string {
+	sb := p.emu.Scrollback()
+	if sb == nil {
+		return strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
+	}
+	sbLen := sb.Len()
+	height := p.emu.Height()
+
+	// Clamp in case scrollback shrunk since last scroll() call.
+	offset := p.scrollOffset
+	if offset > sbLen {
+		offset = sbLen
+		p.scrollOffset = sbLen
+	}
+
+	// Split the viewport into scrollback rows and live-screen rows.
+	fromScrollback := offset
+	fromScreen := height - fromScrollback
+
+	lines := make([]string, 0, height)
+
+	// Pull the last fromScrollback lines from the scrollback buffer.
+	sbStart := sbLen - fromScrollback
+	for i := sbStart; i < sbLen; i++ {
+		line := sb.Line(i)
+		if line == nil {
+			lines = append(lines, "")
+		} else {
+			lines = append(lines, line.Render())
+		}
+	}
+
+	// Fill the remainder from the top of the live screen.
+	if fromScreen > 0 {
+		screenStr := strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
+		screenRows := strings.SplitN(screenStr, "\n", fromScreen+1)
+		for i := 0; i < fromScreen && i < len(screenRows); i++ {
+			lines = append(lines, screenRows[i])
+		}
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 // paneDataMsg is delivered when the pane event stream yielded a
@@ -404,23 +471,6 @@ func (m Model) captureActivePane(paneID string) tea.Cmd {
 		defer cancel()
 		data, err := capturer(ctx, paneID)
 		return paneCaptureMsg{paneID: paneID, data: data, err: err}
-	}
-}
-
-// scrollPaneCmd returns a tea.Cmd that asks PaneScroller to scroll
-// the tmux pane's scrollback history. up=true scrolls towards older
-// output; up=false scrolls towards newer output. Returns nil when no
-// scroller is wired or paneID is empty.
-func (m Model) scrollPaneCmd(paneID string, up bool) tea.Cmd {
-	if m.paneScroller == nil || paneID == "" {
-		return nil
-	}
-	scroller := m.paneScroller
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
-		defer cancel()
-		_ = scroller(ctx, paneID, up)
-		return nil
 	}
 }
 

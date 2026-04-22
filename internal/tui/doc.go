@@ -236,9 +236,9 @@
 //   - Session working directory (M3e). tmuxctl's list-windows
 //     format string now includes #{pane_current_path}, surfaced
 //     to the TUI as Session.Cwd. The sidebar renders this as a
-//     faint second line per card, shortPath()'d to "~/…" under
-//     the home directory and truncLeft()-truncated when the
-//     path would overflow the sidebar column. Empty Cwd (tmux
+//     faint second line per card showing the basename only (home
+//     dir itself shows as "~"), truncLeft()-truncated when the
+//     name would overflow the sidebar column. Empty Cwd (tmux
 //     couldn't resolve a path, or the test stub doesn't set it)
 //     omits the line cleanly so no blank-indent row leaks into
 //     the view.

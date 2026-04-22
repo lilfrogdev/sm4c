@@ -3,6 +3,7 @@ package tui
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -126,8 +127,7 @@ type Deps struct {
 	PaneCapturer     PaneCapturer
 	WindowResizer    WindowResizer
 	WindowCloser     WindowCloser
-	KeySender    KeySender
-	PaneScroller PaneScroller
+	KeySender KeySender
 
 	InitialHighlight string
 	InitialFocus     Focus
@@ -154,6 +154,11 @@ type Deps struct {
 	// indices using the renderer set in Run.
 	SidebarHighlightBG string
 	SidebarHighlightFG string
+
+	// SessionOrderPath overrides where the drag-to-reorder state file is
+	// read from and written to. Empty means use sessionOrderPath() (the
+	// platform config dir). Tests can point this at a temp directory.
+	SessionOrderPath string
 }
 
 // Model is the Bubble Tea model backing the sidebar view. Its
@@ -404,12 +409,6 @@ type Model struct {
 	// UX is testable without a live tmux server).
 	keySender KeySender
 
-	// paneScroller is the mouse-wheel scrollback seam. When non-nil and
-	// the user scrolls the wheel in pane focus mode, it is called to
-	// engage tmux's copy-mode on the highlighted pane's scrollback
-	// buffer. Nil silently drops wheel events in pane focus.
-	paneScroller PaneScroller
-
 	// skipCaptureWindow is the tmux window ID for which the first
 	// pane resolution should skip the capture-pane backfill round-
 	// trip. It is set from Deps.InitialHighlight and consumed
@@ -488,6 +487,21 @@ type Model struct {
 	// newSessionDir is the directory the user selected in the dir
 	// picker. It is read by WorkingDir() after the TUI exits.
 	newSessionDir string
+
+	// sessionOrder is the authoritative list of session names in the
+	// user's preferred order. Persisted to sessionOrderPath on drag.
+	// Applied to every sessionsMsg to keep the sidebar stable across
+	// tmux polls.
+	sessionOrder []string
+
+	// sessionOrderPath is where sessionOrder is saved. Set from
+	// Deps.SessionOrderPath (or sessionOrderPath() if empty).
+	sessionOrderPath string
+
+	// dragIdx is the index of the session currently being dragged in
+	// the sidebar, or -1 when no drag is in progress. Set on
+	// MouseActionPress over the sidebar; cleared on MouseActionRelease.
+	dragIdx int
 }
 
 // paneBackfillBuffer bounds panePending per pane. 64 KiB is
@@ -523,6 +537,10 @@ func NewModel(deps Deps) Model {
 	if hlFG == "" {
 		hlFG = defaultSidebarHighlightFG
 	}
+	orderPath := deps.SessionOrderPath
+	if orderPath == "" {
+		orderPath = sessionOrderPath()
+	}
 	m := Model{
 		lister:            deps.Lister,
 		pollInterval:      pollInterval,
@@ -534,7 +552,6 @@ func NewModel(deps Deps) Model {
 		windowResizer:     deps.WindowResizer,
 		windowCloser:      deps.WindowCloser,
 		keySender:         deps.KeySender,
-		paneScroller:      deps.PaneScroller,
 		paneByWindow:      make(map[string]string),
 		paneErrByWindow:   make(map[string]error),
 		paneTerminals:     make(map[string]*paneTerminal),
@@ -547,10 +564,13 @@ func NewModel(deps Deps) Model {
 		pendingHookEvents: make(map[string]hookEvent),
 		paneViewW:         defaultPaneWidth,
 		paneViewH:         defaultPaneHeight,
-		focus:              FocusSidebar,
-		pendingFocus:       deps.InitialFocus == FocusPane,
+		focus:             FocusSidebar,
+		pendingFocus:      deps.InitialFocus == FocusPane,
 		sidebarHighlightBG: hlBG,
 		sidebarHighlightFG: hlFG,
+		sessionOrder:      loadSessionOrder(orderPath),
+		sessionOrderPath:  orderPath,
+		dragIdx:           -1,
 	}
 	if deps.PaneStream != nil {
 		m.paneEvents = deps.PaneStream()
@@ -792,7 +812,27 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 	debugf("sessions count=%d err=%v", len(msg.sessions), msg.err)
 	m.ready = true
 	m.listErr = msg.err
-	m.sessions = msg.sessions
+
+	// Remember which window is highlighted so we can restore the cursor
+	// after reordering (the order can change the index of any session).
+	var highlightWID string
+	if m.highlight >= 0 && m.highlight < len(m.sessions) {
+		highlightWID = m.sessions[m.highlight].WindowID
+	}
+
+	m.sessions = applySessionOrder(msg.sessions, m.sessionOrder)
+
+	// Restore highlight by window ID so a poll mid-drag (or any reorder)
+	// doesn't silently move the cursor to a different session.
+	if highlightWID != "" {
+		for i, s := range m.sessions {
+			if s.WindowID == highlightWID {
+				m.highlight = i
+				break
+			}
+		}
+	}
+
 	// If the caller asked us to snap to a specific window (e.g. the
 	// launch path just spawned a new claude window and wants the TUI
 	// to open on it), try that first. On success we clear the hint
@@ -1475,20 +1515,91 @@ func (m Model) mouseOverRightPane(x int) bool {
 	return x > m.sidebarWidth()
 }
 
-// handleMouse handles mouse wheel events for scrolling. Routing is based on
-// where the cursor IS (mouse X coordinate), not which column has keyboard
-// focus:
+// sessionIndexAtY maps a terminal row Y to a session list index, or returns
+// -1 when the coordinate falls outside the list. The sidebar top section is
+// laid out as:
 //
+//	row 0: header ("sm4c — N sessions")
+//	row 1: blank separator
+//	row 2+: session cards, one per session
+//
+// Each card is 1 row when the session has no cwd, and 2 rows when it does
+// (the second row is the short path). Cards are joined without extra blank
+// lines between them.
+func (m Model) sessionIndexAtY(y int) int {
+	const listStartRow = 2 // header + blank separator
+	if y < listStartRow || len(m.sessions) == 0 {
+		return -1
+	}
+	row := y - listStartRow
+	for i, s := range m.sessions {
+		cardH := 1
+		if shortPath(s.Cwd) != "" {
+			cardH = 2
+		}
+		if row < cardH {
+			return i
+		}
+		row -= cardH
+	}
+	return -1
+}
+
+// handleMouse handles mouse events for session navigation, drag-to-reorder,
+// and right-pane scrollback. Routing is based on where the cursor IS (mouse X
+// coordinate), not which column has keyboard focus:
+//
+//   - Left press/drag over the sidebar → click to navigate, or drag to reorder.
 //   - Wheel over the sidebar → navigate the session list (j/k equivalent).
-//   - Wheel over the right pane → engage tmux copy-mode on the highlighted
-//     pane's scrollback buffer via PaneScroller, regardless of focus state.
+//   - Wheel over the right pane → scroll the VT emulator's in-process
+//     scrollback buffer, regardless of focus state.
 //
-// SGR sequences are NOT forwarded — they go to claude's PTY input, not to
-// tmux's scroll buffer.
+// Drag: MouseActionPress sets dragIdx; each MouseActionMotion (with dragIdx ≥
+// 0) moves the session to the target row and updates sessionOrder in memory;
+// MouseActionRelease commits sessionOrder to disk. Not all terminals send the
+// held-button on motion events — dragIdx guards the motion case so it works
+// even when the protocol drops the button field.
 func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	overRight := m.mouseOverRightPane(msg.X)
 
+	// Motion: handle drag regardless of which button the terminal reports.
+	if msg.Action == tea.MouseActionMotion && m.dragIdx >= 0 && !overRight {
+		if to := m.sessionIndexAtY(msg.Y); to >= 0 && to != m.dragIdx {
+			m.sessions = moveSession(m.sessions, m.dragIdx, to)
+			m.sessionOrder = sessionNames(m.sessions)
+			m.highlight = to
+			m.dragIdx = to
+		}
+		return m, nil
+	}
+
+	// Release: commit drag if one was in progress.
+	if msg.Action == tea.MouseActionRelease && m.dragIdx >= 0 {
+		debugf("drag released: saving order %v", m.sessionOrder)
+		if err := saveSessionOrder(m.sessionOrderPath, m.sessionOrder); err != nil {
+			debugf("saveSessionOrder: %v", err)
+		}
+		m.dragIdx = -1
+		return m, nil
+	}
+
 	switch msg.Button {
+	case tea.MouseButtonLeft:
+		if overRight {
+			return m, nil
+		}
+		if msg.Action == tea.MouseActionPress {
+			if idx := m.sessionIndexAtY(msg.Y); idx >= 0 {
+				m.highlight = idx
+				m.dragIdx = idx
+				return m, tea.Batch(
+					m.resolveHighlightedPaneIfNeeded(),
+					m.resizeHighlightedWindow(),
+				)
+			}
+		}
+		return m, nil
+
 	case tea.MouseButtonWheelUp:
 		if !overRight {
 			// Sidebar area: navigate the session list.
@@ -1501,7 +1612,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// Right pane area: scroll claude's scrollback (older output).
+		// Right pane area: scroll back into older output.
 		if m.highlight < 0 || m.highlight >= len(m.sessions) {
 			return m, nil
 		}
@@ -1509,7 +1620,10 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if !ok || paneID == "" {
 			return m, nil
 		}
-		return m, m.scrollPaneCmd(paneID, true)
+		if term := m.paneTerminals[paneID]; term != nil {
+			term.scroll(paneScrollStep)
+		}
+		return m, nil
 
 	case tea.MouseButtonWheelDown:
 		if !overRight {
@@ -1523,7 +1637,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// Right pane area: scroll claude's scrollback (newer output).
+		// Right pane area: scroll forward toward newer output.
 		if m.highlight < 0 || m.highlight >= len(m.sessions) {
 			return m, nil
 		}
@@ -1531,7 +1645,10 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if !ok || paneID == "" {
 			return m, nil
 		}
-		return m, m.scrollPaneCmd(paneID, false)
+		if term := m.paneTerminals[paneID]; term != nil {
+			term.scroll(-paneScrollStep)
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -2353,10 +2470,9 @@ func (m Model) renderHeader() string {
 //
 // The second line is omitted when Session.Cwd is empty (tmux has
 // not yet observed a cwd for the pane, or the backend is the
-// test stub). shortPath trims the home prefix to "~" and
-// truncates the head to "…" when the path would overflow the
-// sidebar column, so the line is always single-wrap-safe at
-// sidebarMax.
+// test stub). shortPath returns the basename (or "~" for home),
+// truncated with "…" when needed so the line is always single-
+// wrap-safe at sidebarMax.
 //
 // Highlight is a full-width "card" band: the row styled with
 // lipgloss.Width(sidebarContentW) is padded with spaces out to
@@ -2546,15 +2662,9 @@ func (m Model) sidebarContentWidth() int {
 	return w
 }
 
-// shortPath normalizes an absolute filesystem path for display
-// in the narrow sidebar column. Two transforms, in order:
-//
-//  1. Replace the user's home directory prefix with "~" (the
-//     same convention shells and most developer TUIs use). If
-//     homeDir() can't be resolved, we skip this step rather
-//     than risk mis-trimming.
-//  2. Leave overflow handling to truncLeft, which is applied
-//     later at render time once the column width is known.
+// shortPath returns the last path component of p for compact display in the
+// sidebar. The home dir itself maps to "~"; empty input returns "".
+// Overflow handling is left to truncLeft at render time.
 //
 // stripTitleIcon removes the status icon that Claude Code prepends to the
 // terminal title before the project/session name. Claude Code formats its
@@ -2582,16 +2692,10 @@ func shortPath(p string) string {
 	if p == "" {
 		return ""
 	}
-	if home := homeDir(); home != "" && strings.HasPrefix(p, home) {
-		rest := strings.TrimPrefix(p, home)
-		switch {
-		case rest == "":
-			return "~"
-		case strings.HasPrefix(rest, "/"):
-			return "~" + rest
-		}
+	if home := homeDir(); p == home {
+		return "~"
 	}
-	return p
+	return filepath.Base(p)
 }
 
 // homeDir returns the current user's home directory, cached for

@@ -204,13 +204,8 @@ func TestSessionCardOmitsCwdLineWhenEmpty(t *testing.T) {
 	}
 }
 
-// TestShortPath covers the home-dir substitution helper so we
-// don't need to set HOME in the higher-level rendering tests.
-// Cases:
-//   - Empty input → empty output (callers skip rendering).
-//   - Path under HOME → "~/<rest>".
-//   - HOME itself → "~".
-//   - Path outside HOME → left alone.
+// TestShortPath covers the display helper: empty stays empty,
+// home dir itself → "~", all other paths → basename only.
 func TestShortPath(t *testing.T) {
 	t.Parallel()
 	home := homeDir()
@@ -224,8 +219,8 @@ func TestShortPath(t *testing.T) {
 	}{
 		{"empty", "", ""},
 		{"home root", home, "~"},
-		{"under home", home + "/Repos/sm4c", "~/Repos/sm4c"},
-		{"outside home", "/opt/bin", "/opt/bin"},
+		{"under home", home + "/Repos/sm4c", "sm4c"},
+		{"outside home", "/opt/bin", "bin"},
 	}
 	for _, c := range cases {
 		c := c
