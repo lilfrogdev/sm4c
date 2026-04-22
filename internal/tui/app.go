@@ -1457,16 +1457,41 @@ func (m Model) handleKeyInPaneFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, m.sendKeysToPane(paneID, data)
 }
 
-// handleMouse handles mouse wheel events for scrolling. In sidebar focus
-// mode, wheel-up/down navigate the session list. In pane focus mode,
-// wheel-up/down engage tmux copy-mode on the highlighted pane's scrollback
-// buffer via PaneScroller (two tmux round-trips: copy-mode then scroll-up/
-// scroll-down). SGR sequences are NOT used here — they would go to claude's
-// PTY input, not to tmux's scroll mechanism.
+// mouseOverRightPane reports whether the mouse event's X coordinate falls
+// within the right pane column. This lets wheel events scroll the right
+// pane regardless of keyboard focus — the same way every other terminal
+// multiplexer behaves (scroll where the cursor is, not where focus is).
+//
+// The right pane starts at column sidebarW + 1 (the border glyph) + 1
+// (right pane left padding). We use a slightly more conservative threshold
+// (sidebarW + 1) so hovering the border itself routes to the right pane.
+func (m Model) mouseOverRightPane(x int) bool {
+	if m.sidebarHidden {
+		return true
+	}
+	if m.width < minSplitWidth {
+		return false
+	}
+	return x > m.sidebarWidth()
+}
+
+// handleMouse handles mouse wheel events for scrolling. Routing is based on
+// where the cursor IS (mouse X coordinate), not which column has keyboard
+// focus:
+//
+//   - Wheel over the sidebar → navigate the session list (j/k equivalent).
+//   - Wheel over the right pane → engage tmux copy-mode on the highlighted
+//     pane's scrollback buffer via PaneScroller, regardless of focus state.
+//
+// SGR sequences are NOT forwarded — they go to claude's PTY input, not to
+// tmux's scroll buffer.
 func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	overRight := m.mouseOverRightPane(msg.X)
+
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
-		if m.focus == FocusSidebar {
+		if !overRight {
+			// Sidebar area: navigate the session list.
 			if m.highlight > 0 {
 				m.highlight--
 				return m, tea.Batch(
@@ -1476,7 +1501,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// Pane focus: engage tmux copy-mode scrollback (scroll up = older output).
+		// Right pane area: scroll claude's scrollback (older output).
 		if m.highlight < 0 || m.highlight >= len(m.sessions) {
 			return m, nil
 		}
@@ -1487,7 +1512,8 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, m.scrollPaneCmd(paneID, true)
 
 	case tea.MouseButtonWheelDown:
-		if m.focus == FocusSidebar {
+		if !overRight {
+			// Sidebar area: navigate the session list.
 			if m.highlight < len(m.sessions)-1 {
 				m.highlight++
 				return m, tea.Batch(
@@ -1497,7 +1523,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-		// Pane focus: engage tmux copy-mode scrollback (scroll down = newer output).
+		// Right pane area: scroll claude's scrollback (newer output).
 		if m.highlight < 0 || m.highlight >= len(m.sessions) {
 			return m, nil
 		}
