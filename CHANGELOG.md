@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Drag-to-reorder sidebar sessions. Left-click and drag a session card up or down to change its position in the list. The new order is written atomically to `$XDG_CONFIG_HOME/sm4c/session_order` on mouse release and reapplied on every tmux poll and across restarts, so the order survives quitting and re-entering sm4c. Sessions added after an order was saved (never dragged) append at the end. The drag uses `dragIdx` state on the model — not the terminal-reported held button — so it works on terminals that do not carry the button field in motion events.
+- Click to select: left-clicking a sidebar session row moves the highlight to it (same as navigating with `j`/`k`).
+- In-process VT scrollback. Mouse-wheel up/down over the right pane scrolls through the emulator's scrollback buffer directly — no tmux copy-mode round-trip. `paneTerminal` grows a `scrollOffset` field and `scroll`/`renderScrolled` methods that combine the tail of the `vt.Scrollback` buffer with the current screen to fill the viewport at the requested offset. Scrolling is instant, works regardless of pane focus state, and is a no-op in alt-screen mode (full-screen apps like claude's TUI manage their own screen). The previous `ScrollPane` / `PaneScroller` seam (which entered tmux copy-mode from the outside) is removed.
+
+### Changed
+
+- Sidebar cwd line now shows only the **basename** of the working directory (e.g. `sm4c` instead of `~/Repos/sm4c`). The home directory itself still displays as `~`. This halves the typical cwd width and avoids path truncation on most sessions. Note: two sessions in different parent directories with the same folder name (e.g. `~/work/api` and `~/personal/api`) will both show `api` — the session name on the first line distinguishes them.
+- `handleSessions` preserves the highlighted session by window ID across every poll and reorder. Previously the highlight was an index that silently moved to a different session if a poll or drag changed the list order above the cursor. The cursor now follows the session it was on, not the slot it was in.
+
+### Added
+
 - Mouse wheel scrolling. Scrolling up/down in the sidebar navigates the session list (same as `k`/`j`). Scrolling in pane focus mode forwards SGR wheel-up/down sequences (`\x1b[<64;1;1M` / `\x1b[<65;1;1M`) to the active tmux pane so Claude Code's own scroll behavior works. Note: `WithMouseCellMotion` is now enabled, which means normal terminal text selection requires Shift+drag instead of plain drag.
 
 ### Changed
