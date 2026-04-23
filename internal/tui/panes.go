@@ -563,6 +563,24 @@ func (m Model) sendKeysToPane(paneID string, data []byte) tea.Cmd {
 // terminate windowID. Returns nil when no closer is wired or
 // windowID is empty. The result is wrapped in a windowClosedMsg
 // the Update loop consumes to refresh the sidebar snapshot.
+// killEditorPane returns a tea.Cmd that asks PaneKiller to close paneID.
+// It is fire-and-forget: the result is discarded because the tmux
+// %pane-exited notification (which the bridge forwards) is the
+// authoritative signal for cleanup. A nil PaneKiller or empty paneID
+// is a no-op.
+func (m Model) killEditorPane(paneID string) tea.Cmd {
+	if m.paneKiller == nil || paneID == "" {
+		return nil
+	}
+	killer := m.paneKiller
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+		defer cancel()
+		_ = killer(ctx, paneID) // ignore errors; ErrNoSuchPane is already handled by the killer
+		return nil
+	}
+}
+
 func (m Model) closeManagedWindow(windowID string) tea.Cmd {
 	if m.windowCloser == nil || windowID == "" {
 		return nil

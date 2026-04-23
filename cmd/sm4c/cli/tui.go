@@ -385,12 +385,14 @@ func setupPaneBridge(cmd *cobra.Command, o tmuxctl.OneShot) (tui.PaneEventStream
 					debugBridgef("DROP pane=%s bytes=%d (buffer full)", out.PaneID, len(out.Data))
 				}
 			case tmuxctl.NotificationEvent:
-				// %pane-exited %N … — forward as a closed-pane signal
-				// so the TUI can clean up editor pane state when the
-				// editor process exits naturally.
-				if out.Kind == "pane-exited" && len(out.Args) > 0 {
-					paneID := out.Args[0]
-					if len(paneID) > 1 && paneID[0] == '%' {
+				// %pane-exited $session session-name @window window-name %pane exit-status
+				// The pane ID (the arg matching %\d+) can be at any position
+				// depending on the tmux version. Scan all args rather than
+				// assuming a fixed index — Args[0] is the session ID ($N), not
+				// the pane ID.
+				if out.Kind == "pane-exited" {
+					paneID := notificationPaneID(out.Args)
+					if paneID != "" {
 						select {
 						case events <- tui.PaneEvent{PaneID: paneID, Closed: true}:
 						default:
@@ -564,6 +566,34 @@ func terminalDims() (int, int, bool) {
 		return w, h, true
 	}
 	return 0, 0, false
+}
+
+// notificationPaneID scans the whitespace-split args of a tmux notification
+// for the first token matching the tmux pane ID format (%N where N is one or
+// more digits). This is necessary because the arg position of the pane ID
+// varies by notification type — for %pane-exited the layout is:
+//
+//	$session session-name @window window-name %pane exit-status
+//
+// so the pane ID is NOT at index 0 (that is the session ID, $N). Scanning all
+// args handles version differences without fragile index assumptions.
+func notificationPaneID(args []string) string {
+	for _, a := range args {
+		if len(a) < 2 || a[0] != '%' {
+			continue
+		}
+		allDigits := true
+		for _, c := range a[1:] {
+			if c < '0' || c > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			return a
+		}
+	}
+	return ""
 }
 
 // asReader / asWriter coerce Cobra's io.Reader / io.Writer

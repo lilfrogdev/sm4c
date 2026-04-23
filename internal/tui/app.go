@@ -2055,7 +2055,12 @@ func (m Model) handlePaneExited(msg paneExitedMsg) (Model, tea.Cmd) {
 	if m.focus == FocusEditor {
 		m.focus = FocusPane
 	}
-	return m, resizeCmd
+	// Explicitly kill the tmux pane in case remain-on-exit left it open
+	// (the process exited but the pane shell is still sitting there).
+	// KillPane silently ignores ErrNoSuchPane so this is safe when the
+	// pane already auto-closed.
+	killCmd := m.killEditorPane(msg.paneID)
+	return m, tea.Batch(resizeCmd, killCmd)
 }
 
 // errPaneGone is the sentinel KeySender implementations should
