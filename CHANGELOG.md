@@ -6,7 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Editor pane (`o` key): pressing `o` on a highlighted session opens the session's working directory in `$VISUAL` / `$EDITOR` / first of nvim, vim, nano found on `$PATH` as a vertical split alongside the claude pane. `Tab` swaps focus between the claude and editor panes while in pane-focus mode; `ctrl+b` always returns to the sidebar. The editor pane is sized to half the right-pane width; the VT emulators for both halves are resized on open and restored when the editor exits.
+
 ### Fixed
+
+- Scrollback "page-flip overlay": when the user scrolled up, the live claude UI stayed anchored at the bottom of the viewport while history appeared above it — both visible simultaneously, creating an overlay/stacking effect. `renderScrolled` was filling the remainder of the viewport with the **bottom** rows of the live screen, which kept the live content pinned. Changed to use the **top** rows instead, so the live screen slides naturally off the bottom as history enters from the top (standard terminal scroll behavior).
+- Full session scrollback on reconnect: `CapturePane` now passes `-S -10000` to tmux, seeding the in-process VT emulator with up to 10 000 lines of prior session history on the initial backfill. Previously only the visible screen was captured, so scrollback only covered output since sm4c last started. After a restart, the user can now scroll back through the full prior session history.
 
 - Scrollback overflow: when the scrollback buffer is deeper than the viewport height, `renderScrolled` was emitting more lines than the viewport (e.g. 1 000 lines into a 40-row pane). The excess content overflowed into the sidebar. Fixed by capping `fromScrollback = min(offset, height)` before the loop, so the output is always exactly `height` lines.
 - Drag-to-reorder now uses window IDs (stable tmux identifiers like `@3`) as the order key instead of session names. Previously all Claude sessions share the window name `"claude"`, so `applySessionOrder` treated them as the same entry and restored the original order on every tmux poll — making drags revert. Window IDs are unique per window so each session retains its dragged position.
