@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -205,6 +207,8 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 	var resizer tui.WindowResizer
 	var closerFn tui.WindowCloser
 	var keys tui.KeySender
+	var splitter tui.PaneSplitter
+	var killer tui.PaneKiller
 	if o.TmuxBin != "" {
 		capturer = func(ctx context.Context, paneID string) ([]byte, error) {
 			return o.CapturePane(ctx, paneID)
@@ -242,7 +246,18 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 			}
 			return err
 		}
+		splitter = func(ctx context.Context, windowID, cwd, editorBin string) (string, error) {
+			return o.SplitWindow(ctx, windowID, cwd, editorBin)
+		}
+		killer = func(ctx context.Context, paneID string) error {
+			err := o.KillPane(ctx, paneID)
+			if err == nil || errors.Is(err, tmuxctl.ErrNoSuchPane) {
+				return nil
+			}
+			return err
+		}
 	}
+	editorCmd := detectEditor()
 	return tui.Run(
 		asReader(cmd.InOrStdin()),
 		asWriter(cmd.OutOrStdout()),
@@ -253,9 +268,12 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 			PaneResolver:       resolver,
 			PaneCapturer:       capturer,
 			WindowResizer:      resizer,
-			WindowCloser:     closerFn,
-			KeySender:        keys,
-			InitialHighlight: initialWindowID,
+			WindowCloser:       closerFn,
+			KeySender:          keys,
+			PaneSplitter:       splitter,
+			PaneKiller:         killer,
+			EditorCmd:          editorCmd,
+			InitialHighlight:   initialWindowID,
 			InitialFocus:       initialFocus,
 			SilenceThreshold:   silenceThreshold,
 			HookFifoPath:       hookFifoPath,
@@ -356,17 +374,30 @@ func setupPaneBridge(cmd *cobra.Command, o tmuxctl.OneShot) (tui.PaneEventStream
 		defer closeEvents()
 		defer debugBridgef("bridge-exit reason=client.events-closed")
 		for ev := range client.Events() {
-			out, ok := ev.(tmuxctl.OutputEvent)
-			if !ok {
-				continue
-			}
-			// Non-blocking send with drop: if the TUI is too slow
-			// to drain, we prefer to lose a chunk rather than
-			// block the tmux protocol reader.
-			select {
-			case events <- tui.PaneEvent{PaneID: out.PaneID, Data: out.Data}:
-			default:
-				debugBridgef("DROP pane=%s bytes=%d (buffer full)", out.PaneID, len(out.Data))
+			switch out := ev.(type) {
+			case tmuxctl.OutputEvent:
+				// Non-blocking send with drop: if the TUI is too slow
+				// to drain, we prefer to lose a chunk rather than
+				// block the tmux protocol reader.
+				select {
+				case events <- tui.PaneEvent{PaneID: out.PaneID, Data: out.Data}:
+				default:
+					debugBridgef("DROP pane=%s bytes=%d (buffer full)", out.PaneID, len(out.Data))
+				}
+			case tmuxctl.NotificationEvent:
+				// %pane-exited %N … — forward as a closed-pane signal
+				// so the TUI can clean up editor pane state when the
+				// editor process exits naturally.
+				if out.Kind == "pane-exited" && len(out.Args) > 0 {
+					paneID := out.Args[0]
+					if len(paneID) > 1 && paneID[0] == '%' {
+						select {
+						case events <- tui.PaneEvent{PaneID: paneID, Closed: true}:
+						default:
+							debugBridgef("DROP pane-exited pane=%s (buffer full)", paneID)
+						}
+					}
+				}
 			}
 		}
 	}()
@@ -415,6 +446,35 @@ const paneBridgeStartTimeout = 3 * time.Second
 // user sees the latest state on the next frame), and it keeps the
 // tmux protocol reader responsive.
 const paneBridgeBufferSize = 512
+
+// detectEditor returns the editor binary to use for the `o` binding by
+// consulting $VISUAL, then $EDITOR, then PATH (looking for nvim, vim, nano
+// in that order). Returns "" if no editor is found, which disables the `o`
+// binding.
+func detectEditor() string {
+	// $VISUAL and $EDITOR are the POSIX-standard way to specify a preferred
+	// editor; most shells and tools honour this convention.
+	for _, env := range []string{"VISUAL", "EDITOR"} {
+		if v := os.Getenv(env); v != "" {
+			// Take only the first word — some users set EDITOR to
+			// "nvim -e" or similar; we want just the binary name.
+			bin := strings.Fields(v)[0]
+			if filepath.IsAbs(bin) {
+				return bin
+			}
+			if p, err := exec.LookPath(bin); err == nil {
+				return p
+			}
+		}
+	}
+	// Fall back to well-known editors in preference order.
+	for _, name := range []string{"nvim", "vim", "nano"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return ""
+}
 
 // sessionLister adapts tmuxctl.OneShot.ListWindows to the
 // tui.SessionLister signature. Two responsibilities:

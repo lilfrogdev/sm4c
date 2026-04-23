@@ -30,9 +30,15 @@ import (
 // the TUI feeds these bytes into a charmbracelet/x/vt emulator
 // so ANSI styling, cursor positioning, and line wrapping render
 // identically to a native tmux attach.
+//
+// Closed, when true, signals that the pane has exited (the tmux
+// `%pane-exited` notification was received). Data is empty in this
+// case. The TUI uses this to clean up editor pane state when the
+// editor process exits naturally.
 type PaneEvent struct {
 	PaneID string
 	Data   []byte
+	Closed bool
 }
 
 // PaneEventStream returns a receive-only channel of PaneEvent values.
@@ -104,6 +110,23 @@ type KeySender func(ctx context.Context, paneID string, data []byte) error
 // where the user's tmux is pre-3.2. Production callers wrap
 // tmuxctl.OneShot.ResizeWindow.
 type WindowResizer func(ctx context.Context, windowID string, width, height int) error
+
+// PaneSplitter creates a vertical split (side-by-side panes) inside the
+// given tmux window, starts the editor in the new pane at cwd, and
+// returns the new pane ID. Used to implement the `o` binding that opens
+// the session's working directory in the user's preferred editor.
+//
+// A nil PaneSplitter disables the `o` binding. Production callers wrap
+// tmuxctl.OneShot.SplitWindow.
+type PaneSplitter func(ctx context.Context, windowID, cwd, editorBin string) (paneID string, err error)
+
+// PaneKiller terminates a single tmux pane by its pane ID. Used to close
+// the editor pane when the user navigates away. Implementations should
+// treat an already-gone pane (editor process already exited) as success.
+//
+// A nil PaneKiller means editor panes are left running when the user
+// navigates away — they can be closed manually inside the editor.
+type PaneKiller func(ctx context.Context, paneID string) error
 
 // WindowCloser terminates a tmux window (the "close session" action)
 // identified by its tmux window ID. The TUI invokes it when the user
@@ -253,14 +276,14 @@ func (p *paneTerminal) render() string {
 }
 
 // renderScrolled builds the viewport when scrollOffset > 0. It combines
-// the tail of the scrollback buffer with the bottom of the live screen to
+// the tail of the scrollback buffer with the top of the live screen to
 // fill exactly emu.Height() rows.
 //
-// We use the BOTTOM rows of the live screen (not the top) so that
-// bottom-anchored TUIs like claude's stay visually stable as the user
-// scrolls: the live content slides naturally off the bottom as scrollback
-// rows enter from the top, rather than showing blank rows from the live
-// screen's unused upper region.
+// We use the TOP rows of the live screen so that scrolling behaves like a
+// real terminal: as you scroll up, history rows enter from the top and the
+// live screen slides off the bottom. Taking the BOTTOM rows (the previous
+// approach) anchored the live UI in place while history appeared above it,
+// creating an "overlay" artifact that made it look like pages were stacking.
 func (p *paneTerminal) renderScrolled() string {
 	sb := p.emu.Scrollback()
 	if sb == nil {
@@ -299,17 +322,20 @@ func (p *paneTerminal) renderScrolled() string {
 		}
 	}
 
-	// Fill the remainder from the BOTTOM of the live screen.
-	// Taking the bottom rows keeps bottom-anchored apps (claude, vim, etc.)
-	// fully visible when only partially scrolled into scrollback.
+	// Fill the remainder from the TOP of the live screen.
+	// This makes the live content slide off the bottom as you scroll up,
+	// matching standard terminal scrollback behavior.
 	if fromScreen > 0 {
 		screenStr := strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
 		screenRows := strings.Split(screenStr, "\n")
-		start := len(screenRows) - fromScreen
-		if start < 0 {
-			start = 0
+		end := fromScreen
+		if end > len(screenRows) {
+			end = len(screenRows)
 		}
-		lines = append(lines, screenRows[start:]...)
+		lines = append(lines, screenRows[:end]...)
+		for len(lines) < height {
+			lines = append(lines, "")
+		}
 	}
 
 	return strings.Join(lines, "\n")
@@ -386,6 +412,23 @@ type windowResizedMsg struct {
 	err      error
 }
 
+// paneExitedMsg is delivered when the pane stream reports that a
+// specific pane has exited (PaneEvent.Closed == true). The Model
+// uses this to clean up editor pane state when the editor process
+// exits naturally (e.g. the user types :q in nvim).
+type paneExitedMsg struct {
+	paneID string
+}
+
+// editorOpenedMsg is delivered when PaneSplitter returns successfully.
+// It records the new editor pane ID so the Model can start routing
+// Tab-key focus to it and rendering its output alongside the claude pane.
+type editorOpenedMsg struct {
+	windowID string
+	paneID   string
+	err      error
+}
+
 // normalizeCaptureEOL converts bare LF (`\n`) row terminators into
 // CRLF (`\r\n`) so a VT emulator interprets them as "move cursor to
 // column 0 of the next row" rather than "cursor down, same column".
@@ -438,9 +481,9 @@ func normalizeCaptureEOL(src []byte) []byte {
 }
 
 // waitForPaneEvent returns a tea.Cmd that reads one PaneEvent from
-// the stream and wraps it as a paneDataMsg. If the channel is closed
-// we emit paneStreamClosedMsg, which stops the re-arm loop in
-// Update. Returns nil when no stream is wired (empty-state tests).
+// the stream and wraps it as a paneDataMsg or paneExitedMsg. If the
+// channel is closed we emit paneStreamClosedMsg, which stops the
+// re-arm loop in Update. Returns nil when no stream is wired.
 func (m Model) waitForPaneEvent() tea.Cmd {
 	ch := m.paneEvents
 	if ch == nil {
@@ -450,6 +493,9 @@ func (m Model) waitForPaneEvent() tea.Cmd {
 		ev, ok := <-ch
 		if !ok {
 			return paneStreamClosedMsg{}
+		}
+		if ev.Closed {
+			return paneExitedMsg{paneID: ev.PaneID}
 		}
 		return paneDataMsg{paneID: ev.PaneID, data: ev.Data}
 	}

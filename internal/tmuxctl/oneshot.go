@@ -368,15 +368,21 @@ func (o OneShot) CapturePane(ctx context.Context, paneID string) ([]byte, error)
 	if _, err := parsePaneID([]byte(paneID)); err != nil {
 		return nil, fmt.Errorf("tmuxctl: CapturePane: %w", err)
 	}
-	// -p prints to stdout, -e preserves ANSI escape sequences
-	// (colors + cursor motion — required to replay into the VT
-	// emulator without information loss), -t scopes the capture
-	// to a specific pane. We deliberately do NOT pass -S / -E
-	// here: capturing only the visible screen keeps the payload
-	// bounded (tmux's default scrollback is 2000 lines and a
-	// hostile claude could fill it), and the emulator receives
-	// live %output for everything that scrolls past afterwards.
-	out, err := o.run(ctx, "capture-pane", "-p", "-e", "-t", paneID)
+	// -p prints to stdout, -e preserves ANSI escape sequences,
+	// -t scopes to the pane, -S -N starts N lines above the visible
+	// screen (i.e., includes the scrollback buffer).
+	//
+	// Capturing scrollback lets the TUI's in-process emulator
+	// replay the full session history so the user can scroll back
+	// past the point where sm4c was started. Without -S the emulator
+	// only ever holds the visible screen on first connect, meaning
+	// sm4c sessions that restart mid-session lose all prior history.
+	//
+	// 10 000 matches the in-process emulator's DefaultScrollbackSize.
+	// Tmux clamps the start automatically if its own history-limit
+	// is smaller, so overshooting is safe. Lines older than 10 000
+	// are evicted from the emulator's scrollback as replay fills it.
+	out, err := o.run(ctx, "capture-pane", "-p", "-e", "-t", paneID, "-S", "-10000")
 	if errors.Is(err, ErrServerNotRunning) {
 		return nil, ErrNoSuchPane
 	}
@@ -573,6 +579,79 @@ func (o OneShot) SetGlobalEnv(ctx context.Context, key, value string) error {
 	}
 	_, err := o.run(ctx, "set-environment", "-g", key, value)
 	return err
+}
+
+// SplitWindow creates a vertical split (side-by-side panes) inside the
+// given window, starts editorBin in the new right pane at cwd, and
+// returns the new pane ID (e.g. "%7").
+//
+// The split uses `-h` (horizontal split in tmux terminology) which places
+// the new pane to the right of the active pane. The editor binary is run
+// via `exec <editorBin> .` so the pane closes when the editor exits.
+//
+// cwd must be a valid directory path; empty cwd inherits the pane's
+// current directory. editorBin must be an absolute path or a resolvable
+// command name validated by the caller before SplitWindow is invoked.
+func (o OneShot) SplitWindow(ctx context.Context, windowID, cwd, editorBin string) (string, error) {
+	if err := safe.Arg(windowID); err != nil {
+		return "", fmt.Errorf("tmuxctl: SplitWindow: windowID: %w", err)
+	}
+	if !strings.HasPrefix(windowID, "@") {
+		return "", fmt.Errorf("tmuxctl: SplitWindow: windowID %q is not in @N form", safe.Line(windowID))
+	}
+	if err := safe.Arg(editorBin); err != nil {
+		return "", fmt.Errorf("tmuxctl: SplitWindow: editorBin: %w", err)
+	}
+	shellCmd := "exec " + shEscape(editorBin) + " ."
+
+	args := []string{"split-window", "-h", "-t", windowID, "-P", "-F", "#{pane_id}"}
+	if cwd != "" {
+		if err := safe.Arg(cwd); err == nil {
+			args = append(args, "-c", cwd)
+		}
+	}
+	args = append(args, shellCmd)
+
+	out, err := o.run(ctx, args...)
+	if errors.Is(err, ErrServerNotRunning) {
+		return "", ErrNoSuchWindow
+	}
+	if err != nil {
+		low := err.Error()
+		if strings.Contains(low, "can't find window") ||
+			strings.Contains(low, "window not found") {
+			return "", ErrNoSuchWindow
+		}
+		return "", err
+	}
+	return parsePaneID(out)
+}
+
+// KillPane terminates the tmux pane identified by paneID. This is used
+// to close the editor split pane when the user navigates away or closes
+// the editor from sm4c's side. If the pane is already gone (closed by
+// the editor process exiting) this returns ErrNoSuchPane — callers
+// should treat that as a successful outcome.
+func (o OneShot) KillPane(ctx context.Context, paneID string) error {
+	if err := safe.Arg(paneID); err != nil {
+		return fmt.Errorf("tmuxctl: KillPane: paneID: %w", err)
+	}
+	if _, err := parsePaneID([]byte(paneID)); err != nil {
+		return fmt.Errorf("tmuxctl: KillPane: %w", err)
+	}
+	_, err := o.run(ctx, "kill-pane", "-t", paneID)
+	if errors.Is(err, ErrServerNotRunning) {
+		return ErrNoSuchPane
+	}
+	if err != nil {
+		low := err.Error()
+		if strings.Contains(low, "can't find pane") ||
+			strings.Contains(low, "pane not found") {
+			return ErrNoSuchPane
+		}
+		return err
+	}
+	return nil
 }
 
 // SessionExists returns true iff the sm4c session is present on a live
