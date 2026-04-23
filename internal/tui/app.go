@@ -536,6 +536,12 @@ type Model struct {
 	// opened alongside it. Populated by editorOpenedMsg; cleared when
 	// the editor pane exits (paneExitedMsg) or when the session closes.
 	editorPaneByWindow map[string]string
+
+	// claudeTitleByWindow caches the OSC terminal title for the claude pane
+	// of each window. Updated from the sessionsMsg poll ONLY when no editor
+	// pane is open for that window (so nvim's title never overwrites it).
+	// The sidebar display reads from here instead of s.Title directly.
+	claudeTitleByWindow map[string]string
 }
 
 // paneBackfillBuffer bounds panePending per pane. 64 KiB is
@@ -599,8 +605,9 @@ func NewModel(deps Deps) Model {
 		paneStatuses:       make(map[string]paneStatus),
 		paneToWindow:       make(map[string]string),
 		pendingHookEvents:  make(map[string]hookEvent),
-		editorPaneByWindow: make(map[string]string),
-		paneViewW:          defaultPaneWidth,
+		editorPaneByWindow:  make(map[string]string),
+		claudeTitleByWindow: make(map[string]string),
+		paneViewW:           defaultPaneWidth,
 		paneViewH:          defaultPaneHeight,
 		focus:              FocusSidebar,
 		pendingFocus:       deps.InitialFocus == FocusPane,
@@ -794,9 +801,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case windowClosedMsg:
 		return m.handleWindowClosed(msg)
 	case editorOpenedMsg:
-		return m.handleEditorOpened(msg), nil
+		return m.handleEditorOpened(msg)
 	case paneExitedMsg:
-		return m.handlePaneExited(msg), nil
+		return m.handlePaneExited(msg)
 	}
 	// Forward unrecognised messages to the dir picker when it is open.
 	// The filepicker uses an internal readDirMsg type for async directory
@@ -874,6 +881,16 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 	}
 
 	m.sessions = applySessionOrder(msg.sessions, m.sessionOrder)
+
+	// Cache the claude pane's OSC title per window — but only when no editor
+	// pane is open for that window. When an editor (e.g. nvim) is active, it
+	// becomes the active pane and tmux reports its title via #{pane_title},
+	// which would overwrite the real claude session name.
+	for _, s := range m.sessions {
+		if _, hasEditor := m.editorPaneByWindow[s.WindowID]; !hasEditor {
+			m.claudeTitleByWindow[s.WindowID] = s.Title
+		}
+	}
 
 	// Restore highlight by window ID so a poll mid-drag (or any reorder)
 	// doesn't silently move the cursor to a different session.
@@ -1976,49 +1993,60 @@ func (m Model) openEditorPane(windowID, cwd string) tea.Cmd {
 // handleEditorOpened records the new editor pane ID. On error the
 // split failed silently — the user stays in FocusPane looking at the
 // claude pane with no editor alongside it.
-func (m Model) handleEditorOpened(msg editorOpenedMsg) Model {
+func (m Model) handleEditorOpened(msg editorOpenedMsg) (Model, tea.Cmd) {
 	debugf("editorOpened window=%s pane=%s err=%v", msg.windowID, msg.paneID, msg.err)
 	if msg.err != nil || msg.paneID == "" {
-		return m
+		return m, nil
 	}
 	m.editorPaneByWindow[msg.windowID] = msg.paneID
-	// Mark the pane as captured so we don't try to capture-pane a brand-new editor.
+	// Mark the editor pane as captured so we don't trigger a capture-pane
+	// for the brand-new editor pane.
 	m.paneCaptured[msg.paneID] = true
-	// Resize both emulators to half-width now that a split exists.
-	if m.paneViewW >= 2 {
-		halfW := (m.paneViewW - 1) / 2
-		if claudePaneID := m.paneByWindow[msg.windowID]; claudePaneID != "" {
-			if t := m.paneTerminals[claudePaneID]; t != nil {
-				t.resize(halfW, m.paneViewH)
-			}
-		}
-		if t := m.paneTerminals[msg.paneID]; t != nil {
-			t.resize(halfW, m.paneViewH)
-		}
+
+	// Drop the claude pane's stale full-width emulator content. The old
+	// content was rendered at full width; showing it at half-width produces
+	// visual artifacts. Deleting the terminal causes the pane to show
+	// "waiting for output" briefly until the SIGWINCH-triggered redraw lands.
+	if claudePaneID := m.paneByWindow[msg.windowID]; claudePaneID != "" {
+		delete(m.paneTerminals, claudePaneID)
+		// Keep paneCaptured so we don't issue another capture-pane;
+		// the SIGWINCH redraw will populate the emulator via live %output.
+		m.paneCaptured[claudePaneID] = true
 	}
-	return m
+
+	// Clear the sizedFor cache so resizeHighlightedWindow doesn't skip
+	// the resize because the dimensions happen to match the last send.
+	delete(m.sizedFor, msg.windowID)
+
+	// Resize the highlighted window so tmux distributes the split and claude
+	// gets a SIGWINCH at the correct half-width, triggering a fresh redraw.
+	return m, m.resizeHighlightedWindow()
 }
 
 // handlePaneExited cleans up state for an editor pane that has exited.
 // If the user was focused on the editor pane we return them to FocusPane.
-func (m Model) handlePaneExited(msg paneExitedMsg) Model {
+func (m Model) handlePaneExited(msg paneExitedMsg) (Model, tea.Cmd) {
 	debugf("paneExited pane=%s", msg.paneID)
+	var resizeCmd tea.Cmd
 	// Find which window this editor pane belonged to and remove the mapping.
 	for wid, pid := range m.editorPaneByWindow {
 		if pid == msg.paneID {
 			delete(m.editorPaneByWindow, wid)
-			// Resize the claude pane back to full width now that the split is gone.
-			if m.paneViewW >= 1 {
-				if claudePaneID := m.paneByWindow[wid]; claudePaneID != "" {
-					if t := m.paneTerminals[claudePaneID]; t != nil {
-						t.resize(m.paneViewW, m.paneViewH)
-					}
-				}
+			// Drop the claude pane's stale half-width emulator content so it
+			// doesn't show at full width until the SIGWINCH redraw arrives.
+			if claudePaneID := m.paneByWindow[wid]; claudePaneID != "" {
+				delete(m.paneTerminals, claudePaneID)
+				m.paneCaptured[claudePaneID] = true
 			}
+			// Clear the sizedFor cache and issue a resize so tmux gives
+			// the now-sole pane the full window width and claude gets a
+			// SIGWINCH.
+			delete(m.sizedFor, wid)
+			resizeCmd = m.resizeHighlightedWindow()
 			break
 		}
 	}
-	// Clean up the VT emulator for this pane.
+	// Clean up the VT emulator for the editor pane.
 	delete(m.paneTerminals, msg.paneID)
 	delete(m.paneCapturing, msg.paneID)
 	delete(m.paneCaptured, msg.paneID)
@@ -2027,7 +2055,7 @@ func (m Model) handlePaneExited(msg paneExitedMsg) Model {
 	if m.focus == FocusEditor {
 		m.focus = FocusPane
 	}
-	return m
+	return m, resizeCmd
 }
 
 // errPaneGone is the sentinel KeySender implementations should
@@ -2625,7 +2653,9 @@ func (m Model) renderRightPaneHeader() string {
 	}
 	s := m.sessions[m.highlight]
 	name := s.Name
-	if s.Title != "" {
+	if cached := m.claudeTitleByWindow[s.WindowID]; cached != "" {
+		name = stripTitleIcon(cached)
+	} else if s.Title != "" {
 		name = stripTitleIcon(s.Title)
 	}
 	if name == "" {
@@ -2803,12 +2833,13 @@ func (m Model) renderSessionList() string {
 			glyph = statusGlyphHighlighted(status, m.statusFrame, bg, fg)
 		}
 		name := s.Name
-		// Prefer the OSC terminal title captured by tmux (#{pane_title})
-		// over the static tmux window name. Claude Code sets this via
-		// OSC 0/2; tmux intercepts it and exposes it through the
-		// list-windows poll, so the sidebar reflects the dynamic
-		// session/project label rather than the hardcoded "claude" name.
-		if s.Title != "" {
+		// Prefer the cached claude-pane OSC title over the static tmux window
+		// name. We cache it per-window and freeze updates while an editor pane
+		// is open (the editor becomes the active pane, so #{pane_title} would
+		// reflect nvim's title instead of the claude session name).
+		if cached := m.claudeTitleByWindow[s.WindowID]; cached != "" {
+			name = stripTitleIcon(cached)
+		} else if s.Title != "" {
 			name = stripTitleIcon(s.Title)
 		}
 		if name == "" {

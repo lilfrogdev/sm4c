@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Editor pane: session name in sidebar and right-pane header changed to the editor's title (e.g. "nvim") while an editor split was open. `#{pane_title}` reflects the active pane, which becomes the editor pane on open. Fixed by caching the claude pane's OSC title per window in `claudeTitleByWindow` and freezing updates to that cache while an editor pane is open for the window.
+- Editor pane: claude view showed ANSI artifacts after the split opened because the VT emulator held stale full-width content being rendered at half-width. Fixed by dropping the emulator on `editorOpenedMsg` (shows "waiting for output" momentarily) and issuing a `resize-window` command so tmux redistributes the split and claude gets a SIGWINCH, producing a fresh redraw at the correct half-width.
+- Editor pane: closing the editor left the claude view at half-width. `handlePaneExited` only resized the in-process VT emulator but never sent a tmux resize command. Fixed by also dropping the stale half-width emulator and issuing `resize-window` on exit, so claude gets a SIGWINCH and redraws full-width.
+
 ### Added
 
 - Editor pane (`o` key): pressing `o` on a highlighted session opens the session's working directory in `$VISUAL` / `$EDITOR` / first of nvim, vim, nano found on `$PATH` as a vertical split alongside the claude pane. `Tab` swaps focus between the claude and editor panes while in pane-focus mode; `ctrl+b` always returns to the sidebar. The editor pane is sized to half the right-pane width; the VT emulators for both halves are resized on open and restored when the editor exits.
