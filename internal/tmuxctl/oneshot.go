@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -191,6 +192,12 @@ type Window struct {
 	// Claude-assigned label rather than the static tmux window name.
 	// Sanitized via safe.Label before storage.
 	PaneTitle string
+
+	// PaneCount is the number of panes currently open in this window
+	// (#{window_panes}). Used to detect when an editor split has been
+	// closed: if the TUI has an editor pane registered for a window but
+	// PaneCount drops to 1, the editor pane is gone.
+	PaneCount int
 }
 
 // Managed reports whether this window was created by sm4c (tagged with
@@ -221,7 +228,7 @@ func (w Window) Managed() bool { return w.Kind == KindClaude }
 //   - #{pane_current_path}   : active pane's cwd, absolute path
 //   - #{pane_title}          : last OSC 0/2 title set by the pane, untrusted
 //   - #{window_name}         : untrusted, must be last (free-form field)
-const listWindowsFormat = "#{window_id}\t#{window_active}\t#{session_name}\t#{@sm4c-kind}\t#{window_flags}\t#{pane_current_path}\t#{pane_title}\t#{window_name}"
+const listWindowsFormat = "#{window_id}\t#{window_active}\t#{session_name}\t#{@sm4c-kind}\t#{window_flags}\t#{pane_current_path}\t#{pane_title}\t#{window_panes}\t#{window_name}"
 
 // ListWindows returns every window visible on the sm4c tmux server, in
 // tmux's native ordering. If the server is not running this returns
@@ -247,17 +254,18 @@ func parseWindows(out []byte) ([]Window, error) {
 		if len(rawLine) == 0 {
 			continue
 		}
-		// Splitn with N=8 so that any tabs present in the free-form
+		// Splitn with N=9 so that any tabs present in the free-form
 		// window_name (last field) stay bundled into the final slot.
 		// pane_title (second-to-last) is also untrusted but rarely
 		// contains tabs in practice; a tab would truncate the title
 		// at the tab boundary after safe.Label strips the control byte,
 		// which is an acceptable cosmetic degradation. See
 		// listWindowsFormat for the slot order.
-		parts := strings.SplitN(string(rawLine), "\t", 8)
-		if len(parts) != 8 {
+		parts := strings.SplitN(string(rawLine), "\t", 9)
+		if len(parts) != 9 {
 			return nil, fmt.Errorf("tmuxctl: malformed list-windows row: %q", safe.Line(string(rawLine)))
 		}
+		paneCount, _ := strconv.Atoi(parts[7])
 		w := Window{
 			ID:          parts[0],
 			SessionName: parts[2],
@@ -265,7 +273,8 @@ func parseWindows(out []byte) ([]Window, error) {
 			Flags:       parts[4],
 			CurrentPath: safe.Line(parts[5]),
 			PaneTitle:   safe.Label(parts[6]),
-			Name:        safe.Label(parts[7]),
+			PaneCount:   paneCount,
+			Name:        safe.Label(parts[8]),
 			Active:      parts[1] == "1",
 		}
 		wins = append(wins, w)

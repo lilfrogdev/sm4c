@@ -502,11 +502,12 @@ func sessionLister(o tmuxctl.OneShot) tui.SessionLister {
 				continue
 			}
 			out = append(out, tui.Session{
-				WindowID: w.ID,
-				Name:     w.Name,
-				Active:   w.Active,
-				Cwd:      w.CurrentPath,
-				Title:    w.PaneTitle,
+				WindowID:  w.ID,
+				Name:      w.Name,
+				Active:    w.Active,
+				Cwd:       w.CurrentPath,
+				Title:     w.PaneTitle,
+				PaneCount: w.PaneCount,
 			})
 		}
 		return out, nil

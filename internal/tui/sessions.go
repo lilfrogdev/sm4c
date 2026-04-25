@@ -72,6 +72,13 @@ type Session struct {
 	// static tmux window name ("claude"). Updated on every
 	// SessionLister poll tick.
 	Title string
+
+	// PaneCount is the number of panes currently open in the tmux window
+	// (#{window_panes}). The TUI uses this during the sessions poll to
+	// detect when an editor split has closed: if PaneCount drops to 1
+	// while the model still has an editor pane registered for this
+	// window, the editor pane has exited.
+	PaneCount int
 }
 
 // SessionLister is the TUI's seam onto tmux. It is injected by the

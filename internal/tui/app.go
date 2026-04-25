@@ -714,11 +714,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleMouse(msg)
 	case sessionsMsg:
 		next := m.handleSessions(msg)
-		return next, tea.Batch(
+		cmds := []tea.Cmd{
 			next.scheduleNextPoll(),
 			next.resolveHighlightedPaneIfNeeded(),
 			next.resizeHighlightedWindow(),
-		)
+		}
+		// Poll-based fallback: detect editor pane closure when the window drops
+		// to 1 pane (editor exited but %pane-exited was missed).
+		for wid, editorPaneID := range next.editorPaneByWindow {
+			for _, s := range next.sessions {
+				if s.WindowID == wid && s.PaneCount == 1 {
+					cleaned, cleanup := next.handlePaneExited(paneExitedMsg{paneID: editorPaneID})
+					next = cleaned
+					cmds = append(cmds, cleanup)
+					break
+				}
+			}
+		}
+		return next, tea.Batch(cmds...)
 	case pollTickMsg:
 		// A tick's only job is to kick off the next fetch. The fetch
 		// itself, once complete, will schedule the following tick.
@@ -803,7 +816,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case editorOpenedMsg:
 		return m.handleEditorOpened(msg)
 	case paneExitedMsg:
-		return m.handlePaneExited(msg)
+		next, cmd := m.handlePaneExited(msg)
+		return next, tea.Batch(cmd, next.waitForPaneEvent())
 	}
 	// Forward unrecognised messages to the dir picker when it is open.
 	// The filepicker uses an internal readDirMsg type for async directory
