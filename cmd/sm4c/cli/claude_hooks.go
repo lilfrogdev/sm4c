@@ -54,7 +54,7 @@ type claudeHookGroup struct {
 // started after sm4c); falls back to tmux show-environment -g for sessions that
 // predate sm4c's startup. Uses sed to extract the value since -v is not available
 // in tmux < 3.4.
-const hookScript = `[ -n "$TMUX_PANE" ] && { _fifo=$SM4C_HOOK_FIFO; [ -z "$_fifo" ] && _fifo=$(tmux show-environment -g SM4C_HOOK_FIFO 2>/dev/null | sed -n 's/^SM4C_HOOK_FIFO=//p'); } && [ -n "$_fifo" ] && printf '%%s %s\n' "$TMUX_PANE" >> "$_fifo" 2>/dev/null`
+const hookScript = `[ -n "$TMUX_PANE" ] && { _fifo=$SM4C_HOOK_FIFO; [ -z "$_fifo" ] && _fifo=$(tmux show-environment -g SM4C_HOOK_FIFO 2>/dev/null | sed -n 's/^SM4C_HOOK_FIFO=//p'); } && [ -n "$_fifo" ] && printf '%%s %s\n' "$TMUX_PANE" >> "$_fifo" 2>/dev/null; true`
 
 var sm4cHooks = map[string]claudeHookGroup{
 	"UserPromptSubmit": {
