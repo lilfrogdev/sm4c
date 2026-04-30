@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Right pane: after claude finishes responding, a visual artifact (the turquoise completion frame — horizontal lines, session name, input box) remained painted in the right pane until the terminal was manually resized. Root cause: claude's completion UI uses cursor-absolute positioning; when it finishes, the frame stays at its last draw position. Fixed by issuing a force-resize wiggle (SIGWINCH) to the highlighted tmux window when `hookEventDone` fires, causing claude to redraw and clear the artifact immediately.
+
 - Status indicators (spinner / ✓ / ?): indicators were always dark when starting a new session for the first time. `SetGlobalEnv` silently failed when the tmux server didn't exist yet, so `SM4C_HOOK_FIFO` was never in the Claude process's environment and every hook script's guard no-oped. Fixed by adding a `GlobalEnv` field to `OneShot` and injecting `set-environment -g SM4C_HOOK_FIFO …` atomically into the `new-session` / `new-window` command chain before the window is created, covering both `sm4c` (bare, press `n`) and `sm4c [args]` entry points.
 
 - Editor pane: closing nvim (`:q`) left the split open in sm4c's view and the tmux pane sitting idle. Root cause: the bridge was reading `out.Args[0]` as the pane ID from `%pane-exited`, but tmux's format is `$session session-name @window window-name %pane exit-status` — `Args[0]` is the session ID (`$N`), not the pane ID (`%N`). The `%` prefix check silently dropped every `%pane-exited` event. Fixed by scanning all args for the first token matching `%\d+`. Additionally, `handlePaneExited` now explicitly calls `KillPane` on the editor pane so any pane left open by `remain-on-exit` is closed.

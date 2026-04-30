@@ -781,6 +781,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusTickArmed = true
 			cmds = append(cmds, tick)
 		}
+		// When the highlighted window finishes responding, force a
+		// SIGWINCH so claude redraws its UI cleanly. Without this,
+		// claude's completion frame (turquoise box, session name) stays
+		// painted at its last cursor position until the user resizes the
+		// terminal. A wiggle resize is guaranteed to trigger SIGWINCH
+		// even when the pane dimensions haven't changed.
+		if msg.event == hookEventDone {
+			if doneWid := m.paneToWindow[msg.paneID]; doneWid != "" &&
+				m.highlight >= 0 && m.highlight < len(m.sessions) &&
+				m.sessions[m.highlight].WindowID == doneWid {
+				m.forceResizePending = true
+				cmds = append(cmds, m.resizeHighlightedWindow())
+			}
+		}
 		return m, tea.Batch(cmds...)
 	case hookStreamClosedMsg:
 		m.hookEvents = nil
