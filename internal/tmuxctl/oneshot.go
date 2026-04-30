@@ -70,6 +70,12 @@ type OneShot struct {
 	TmuxBin     string // absolute path; validated by preflight
 	SocketName  string // defaults to DefaultSocketName
 	SessionName string // defaults to DefaultSessionName
+	// GlobalEnv holds environment variables to inject via `set-environment -g`
+	// into every new-session and new-window chain. Entries are set atomically
+	// with window creation so the spawned process inherits them even when the
+	// tmux server is being started for the first time (before SetGlobalEnv
+	// could be called separately).
+	GlobalEnv map[string]string
 }
 
 // NewOneShot constructs a OneShot with default socket / session names.

@@ -99,6 +99,10 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 	// instance gets an isolated pipe. Propagate it to the tmux
 	// environment so Claude Code hook scripts inherit it via $SM4C_HOOK_FIFO.
 	fifoPath := filepath.Join(os.TempDir(), "sm4c-"+o.SocketName+"-hooks.fifo")
+	// Embed it in GlobalEnv so every newSessionWithCommand / newWindowOnExistingSession
+	// call injects it atomically — covering the first-ever launch where the tmux
+	// server doesn't exist yet and SetGlobalEnv below would silently fail.
+	o.GlobalEnv = map[string]string{"SM4C_HOOK_FIFO": fifoPath}
 	hookCtx := cmd.Context()
 	if hookCtx == nil {
 		hookCtx = context.Background()
@@ -135,6 +139,11 @@ func openTUI(cmd *cobra.Command, o tmuxctl.OneShot, claudeBin, initialWindowID s
 			if spawnErr != nil {
 				return spawnErr
 			}
+			// The spawn may have just created the tmux server for the
+			// first time (first-ever session). Now that the server is
+			// running, ensure SM4C_HOOK_FIFO is in the global env so
+			// any subsequent new-window calls inherit it too.
+			_ = o.SetGlobalEnv(ctx, "SM4C_HOOK_FIFO", fifoPath)
 			// Re-enter the TUI focused on the freshly-spawned
 			// window with pane focus so the user can type
 			// immediately into claude — matching the UX promise

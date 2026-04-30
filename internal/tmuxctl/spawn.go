@@ -199,12 +199,17 @@ func (o OneShot) newWindowOnExistingSession(ctx context.Context, cmdline, initia
 	args := []string{
 		"set-option", "-g", "default-shell", posixShell,
 		";",
+	}
+	for k, v := range o.GlobalEnv {
+		args = append(args, "set-environment", "-g", k, v, ";")
+	}
+	args = append(args,
 		"new-window",
-		"-t", o.SessionName + ":",
+		"-t", o.SessionName+":",
 		"-d",
 		"-P",
 		"-F", "#{window_id}",
-	}
+	)
 	if initialName != "" {
 		args = append(args, "-n", initialName)
 	}
@@ -254,13 +259,21 @@ func (o OneShot) newSessionWithCommand(ctx context.Context, cmdline, initialName
 		";",
 		"set-option", "-g", "-w", "automatic-rename", "off",
 		";",
+	}
+	// Inject GlobalEnv entries before new-session so the first window inherits
+	// them. This is the only window where the server doesn't exist yet and
+	// SetGlobalEnv can't be called beforehand.
+	for k, v := range o.GlobalEnv {
+		args = append(args, "set-environment", "-g", k, v, ";")
+	}
+	args = append(args,
 		"new-session",
 		"-d",
 		"-s", o.SessionName,
 		"-n", initialName,
 		"-P",
 		"-F", "#{window_id}",
-	}
+	)
 	if dir != "" {
 		args = append(args, "-c", dir)
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/lilfrogdev/sm4c/internal/tmuxctl"
@@ -73,6 +75,11 @@ func runLaunch(cmd *cobra.Command, args []string, pf *persistentFlags) error {
 	}
 	spawnCtx, cancel := context.WithTimeout(ctx, launchTimeout)
 	defer cancel()
+
+	// Set SM4C_HOOK_FIFO in GlobalEnv before spawning so newSessionWithCommand
+	// injects it atomically even when this is the first ever sm4c window.
+	fifoPath := filepath.Join(os.TempDir(), "sm4c-"+o.SocketName+"-hooks.fifo")
+	o.GlobalEnv = map[string]string{"SM4C_HOOK_FIFO": fifoPath}
 
 	windowID, err := spawnClaudeWindow(spawnCtx, cmd.OutOrStdout(), o, report.ClaudePath, args, "")
 	if err != nil {
