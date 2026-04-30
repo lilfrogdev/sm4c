@@ -22,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `sm4c new` subcommand: spawns a new claude session without opening the TUI. Accepts `--name` / `-n` (sets the tmux window name and passes `-n` to claude) and `--dir` / `-d` (working directory). Additional positional arguments are forwarded verbatim to claude. The new window appears in the sidebar within the next poll tick, making it possible for one claude session to programmatically start a sibling session via a shell tool call.
+
 - Editor pane (`o` key): pressing `o` on a highlighted session opens the session's working directory in `$VISUAL` / `$EDITOR` / first of nvim, vim, nano found on `$PATH` as a vertical split alongside the claude pane. `Tab` swaps focus between the claude and editor panes while in pane-focus mode; `ctrl+b` always returns to the sidebar. The editor pane is sized to half the right-pane width; the VT emulators for both halves are resized on open and restored when the editor exits.
 
 ### Fixed

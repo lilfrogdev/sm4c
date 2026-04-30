@@ -126,6 +126,7 @@ never spawn a claude session.`,
 		newLsCmd(pf),
 		newStatusCmd(pf),
 		newStopCmd(pf),
+		newNewCmd(pf),
 	)
 	return cmd
 }
