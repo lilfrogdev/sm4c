@@ -144,6 +144,11 @@ type Deps struct {
 	// Empty disables `o` even when PaneSplitter is wired.
 	EditorCmd string
 
+	// TermCmd is the shell binary (e.g. "/bin/zsh") that the `t` binding
+	// launches as a terminal pane alongside the highlighted session. Empty
+	// disables `t` even when PaneSplitter is wired.
+	TermCmd string
+
 	InitialHighlight string
 	InitialFocus     Focus
 
@@ -532,10 +537,23 @@ type Model struct {
 	// the `o` binding.
 	editorCmd string
 
-	// editorPaneByWindow maps a tmux window ID to the editor pane ID
-	// opened alongside it. Populated by editorOpenedMsg; cleared when
-	// the editor pane exits (paneExitedMsg) or when the session closes.
+	// termCmd is the shell binary for the `t` binding (e.g. "/bin/zsh").
+	// Empty disables `t`.
+	termCmd string
+
+	// editorPaneByWindow maps a tmux window ID to the side pane ID
+	// currently open alongside it (editor OR terminal). Populated by
+	// editorOpenedMsg; cleared when the pane exits or the session closes.
 	editorPaneByWindow map[string]string
+
+	// sidePaneIsTerminal records whether the side pane for a window is a
+	// terminal (true) or an editor (false / absent). Indexed by window ID.
+	sidePaneIsTerminal map[string]bool
+
+	// pendingSideOpen holds a side-pane swap requested while another side
+	// pane is still closing. handlePaneExited reads this map after cleanup
+	// and opens the new kind. Values: "editor" or "terminal".
+	pendingSideOpen map[string]string
 
 	// claudeTitleByWindow caches the OSC terminal title for the claude pane
 	// of each window. Updated from the sessionsMsg poll ONLY when no editor
@@ -595,6 +613,7 @@ func NewModel(deps Deps) Model {
 		paneSplitter:       deps.PaneSplitter,
 		paneKiller:         deps.PaneKiller,
 		editorCmd:          deps.EditorCmd,
+		termCmd:            deps.TermCmd,
 		paneByWindow:       make(map[string]string),
 		paneErrByWindow:    make(map[string]error),
 		paneTerminals:      make(map[string]*paneTerminal),
@@ -605,7 +624,9 @@ func NewModel(deps Deps) Model {
 		paneStatuses:       make(map[string]paneStatus),
 		paneToWindow:       make(map[string]string),
 		pendingHookEvents:  make(map[string]hookEvent),
-		editorPaneByWindow:  make(map[string]string),
+		editorPaneByWindow: make(map[string]string),
+		sidePaneIsTerminal: make(map[string]bool),
+		pendingSideOpen:    make(map[string]string),
 		claudeTitleByWindow: make(map[string]string),
 		paneViewW:           defaultPaneWidth,
 		paneViewH:          defaultPaneHeight,
@@ -1546,8 +1567,8 @@ func (m Model) handleKeyInSidebarFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Open the session's working directory in the editor. Gates:
 		//   - PaneSplitter and EditorCmd must be wired.
 		//   - A session must be highlighted.
-		// If the highlighted session already has an editor pane open,
-		// switch focus directly to the editor instead of opening another.
+		// If a terminal side pane is open, swap it for an editor.
+		// If an editor is already open, focus it.
 		if m.paneSplitter == nil || m.editorCmd == "" {
 			return m, nil
 		}
@@ -1558,20 +1579,64 @@ func (m Model) handleKeyInSidebarFocus(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if wid == "" {
 			return m, nil
 		}
-		// If editor is already open for this session, focus it.
-		if _, exists := m.editorPaneByWindow[wid]; exists {
+		if sidePaneID, exists := m.editorPaneByWindow[wid]; exists {
+			if m.sidePaneIsTerminal[wid] {
+				// Terminal open → swap to editor.
+				m.pendingSideOpen[wid] = "editor"
+				m.focus = FocusPane
+				return m, m.killEditorPane(sidePaneID)
+			}
+			// Editor already open → focus it.
 			m.focus = FocusPane
 			return m, tea.Batch(
 				m.resolveHighlightedPaneIfNeeded(),
 				m.resizeHighlightedWindow(),
 			)
 		}
-		// Otherwise enter pane focus and dispatch the split.
+		// No side pane open → enter pane focus and dispatch the split.
 		m.focus = FocusPane
 		cwd := m.sessions[m.highlight].Cwd
 		return m, tea.Batch(
 			m.resolveHighlightedPaneIfNeeded(),
 			m.openEditorPane(wid, cwd),
+		)
+
+	case "t":
+		// Open a terminal side pane. Gates:
+		//   - PaneSplitter and TermCmd must be wired.
+		//   - A session must be highlighted.
+		// If an editor side pane is open, swap it for a terminal.
+		// If a terminal is already open, focus it.
+		if m.paneSplitter == nil || m.termCmd == "" {
+			return m, nil
+		}
+		if m.highlight < 0 || m.highlight >= len(m.sessions) {
+			return m, nil
+		}
+		wid := m.sessions[m.highlight].WindowID
+		if wid == "" {
+			return m, nil
+		}
+		if sidePaneID, exists := m.editorPaneByWindow[wid]; exists {
+			if !m.sidePaneIsTerminal[wid] {
+				// Editor open → swap to terminal.
+				m.pendingSideOpen[wid] = "terminal"
+				m.focus = FocusPane
+				return m, m.killEditorPane(sidePaneID)
+			}
+			// Terminal already open → focus it.
+			m.focus = FocusPane
+			return m, tea.Batch(
+				m.resolveHighlightedPaneIfNeeded(),
+				m.resizeHighlightedWindow(),
+			)
+		}
+		// No side pane open → enter pane focus and dispatch the split.
+		m.focus = FocusPane
+		cwd := m.sessions[m.highlight].Cwd
+		return m, tea.Batch(
+			m.resolveHighlightedPaneIfNeeded(),
+			m.openTerminalPane(wid, cwd),
 		)
 
 	case "?":
@@ -2001,21 +2066,43 @@ func (m Model) handleWindowClosed(msg windowClosedMsg) (tea.Model, tea.Cmd) {
 	return m, m.fetchSessions()
 }
 
-// openEditorPane returns a tea.Cmd that calls PaneSplitter to create a
-// vertical split alongside the claude pane and wraps the result in an
-// editorOpenedMsg. Returns nil when no splitter is wired.
-func (m Model) openEditorPane(windowID, cwd string) tea.Cmd {
-	if m.paneSplitter == nil || m.editorCmd == "" || windowID == "" {
+// openSidePane returns a tea.Cmd that calls PaneSplitter to create a
+// vertical split running cmd alongside the claude pane. isTerminal tags
+// the resulting editorOpenedMsg so handleEditorOpened can record the pane
+// type in sidePaneIsTerminal.
+func (m Model) openSidePane(windowID, cwd, cmd string, isTerminal bool) tea.Cmd {
+	if m.paneSplitter == nil || cmd == "" || windowID == "" {
 		return nil
 	}
 	splitter := m.paneSplitter
-	editorCmd := m.editorCmd
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
 		defer cancel()
-		paneID, err := splitter(ctx, windowID, cwd, editorCmd)
-		return editorOpenedMsg{windowID: windowID, paneID: paneID, err: err}
+		paneID, err := splitter(ctx, windowID, cwd, cmd)
+		return editorOpenedMsg{windowID: windowID, paneID: paneID, err: err, isTerminal: isTerminal}
 	}
+}
+
+// openEditorPane opens the editor binary as a side pane.
+func (m Model) openEditorPane(windowID, cwd string) tea.Cmd {
+	return m.openSidePane(windowID, cwd, m.editorCmd, false)
+}
+
+// openTerminalPane opens the shell as a side pane.
+func (m Model) openTerminalPane(windowID, cwd string) tea.Cmd {
+	return m.openSidePane(windowID, cwd, m.termCmd, true)
+}
+
+// cwdForWindow returns the working directory for the session with the
+// given window ID, or "" if not found. Used by handlePaneExited to open
+// a pending swap side pane after the previous one exits.
+func (m Model) cwdForWindow(windowID string) string {
+	for _, s := range m.sessions {
+		if s.WindowID == windowID {
+			return s.Cwd
+		}
+	}
+	return ""
 }
 
 // handleEditorOpened records the new editor pane ID. On error the
@@ -2027,8 +2114,13 @@ func (m Model) handleEditorOpened(msg editorOpenedMsg) (Model, tea.Cmd) {
 		return m, nil
 	}
 	m.editorPaneByWindow[msg.windowID] = msg.paneID
-	// Mark the editor pane as captured so we don't trigger a capture-pane
-	// for the brand-new editor pane.
+	if msg.isTerminal {
+		m.sidePaneIsTerminal[msg.windowID] = true
+	} else {
+		delete(m.sidePaneIsTerminal, msg.windowID)
+	}
+	// Mark the side pane as captured so we don't trigger a capture-pane
+	// for the brand-new pane.
 	m.paneCaptured[msg.paneID] = true
 
 	// Drop the claude pane's stale full-width emulator content. The old
@@ -2051,15 +2143,20 @@ func (m Model) handleEditorOpened(msg editorOpenedMsg) (Model, tea.Cmd) {
 	return m, m.resizeHighlightedWindow()
 }
 
-// handlePaneExited cleans up state for an editor pane that has exited.
-// If the user was focused on the editor pane we return them to FocusPane.
+// handlePaneExited cleans up state for a side pane (editor or terminal)
+// that has exited. If the user was focused on it we return them to FocusPane.
+// If a pendingSideOpen swap was requested while this pane was closing, we
+// open the new side pane now that the old one is gone.
 func (m Model) handlePaneExited(msg paneExitedMsg) (Model, tea.Cmd) {
 	debugf("paneExited pane=%s", msg.paneID)
 	var resizeCmd tea.Cmd
-	// Find which window this editor pane belonged to and remove the mapping.
+	var foundWid string
+	// Find which window this side pane belonged to and remove the mapping.
 	for wid, pid := range m.editorPaneByWindow {
 		if pid == msg.paneID {
+			foundWid = wid
 			delete(m.editorPaneByWindow, wid)
+			delete(m.sidePaneIsTerminal, wid)
 			// Drop the claude pane's stale half-width emulator content so it
 			// doesn't show at full width until the SIGWINCH redraw arrives.
 			if claudePaneID := m.paneByWindow[wid]; claudePaneID != "" {
@@ -2074,21 +2171,34 @@ func (m Model) handlePaneExited(msg paneExitedMsg) (Model, tea.Cmd) {
 			break
 		}
 	}
-	// Clean up the VT emulator for the editor pane.
+	// Clean up the VT emulator for the side pane.
 	delete(m.paneTerminals, msg.paneID)
 	delete(m.paneCapturing, msg.paneID)
 	delete(m.paneCaptured, msg.paneID)
 	delete(m.panePending, msg.paneID)
-	// If the user was focused on the now-gone editor pane, revert to FocusPane.
+	// If the user was focused on the now-gone side pane, revert to FocusPane.
 	if m.focus == FocusEditor {
 		m.focus = FocusPane
 	}
-	// Explicitly kill the tmux pane in case remain-on-exit left it open
-	// (the process exited but the pane shell is still sitting there).
-	// KillPane silently ignores ErrNoSuchPane so this is safe when the
-	// pane already auto-closed.
+	// Explicitly kill the tmux pane in case remain-on-exit left it open.
 	killCmd := m.killEditorPane(msg.paneID)
-	return m, tea.Batch(resizeCmd, killCmd)
+
+	// Swap: if the user pressed t/o while this pane was still open, open the
+	// requested side pane now that cleanup is complete.
+	var openCmd tea.Cmd
+	if foundWid != "" {
+		if kind, ok := m.pendingSideOpen[foundWid]; ok {
+			delete(m.pendingSideOpen, foundWid)
+			cwd := m.cwdForWindow(foundWid)
+			switch kind {
+			case "editor":
+				openCmd = m.openEditorPane(foundWid, cwd)
+			case "terminal":
+				openCmd = m.openTerminalPane(foundWid, cwd)
+			}
+		}
+	}
+	return m, tea.Batch(resizeCmd, killCmd, openCmd)
 }
 
 // errPaneGone is the sentinel KeySender implementations should
@@ -2267,6 +2377,8 @@ var sidebarBindings = []keybind{
 	{"enter", "focus session"},
 	{"ctrl+b", "focus session"},
 	{"n", "new session"},
+	{"o", "open editor split"},
+	{"t", "open terminal split"},
 	{"x", "close session"},
 	{"z", "hide sidebar"},
 	{"?", "toggle help"},
@@ -2748,24 +2860,28 @@ func (m Model) renderRightPaneBody() string {
 		return hintStyle.Render("waiting for output  " + paneID)
 	}
 
-	// If an editor pane is open for this session, render a split view.
+	// If a side pane is open for this session, render a split view.
 	editorPaneID := m.editorPaneByWindow[wid]
 	if editorPaneID != "" {
-		return m.renderSplitBody(term, editorPaneID)
+		return m.renderSplitBody(term, editorPaneID, m.sidePaneIsTerminal[wid])
 	}
 
 	return term.render()
 }
 
-// renderSplitBody renders the claude pane and editor pane side by side,
-// separated by a "│" column. Each pane gets roughly half the body width.
-func (m Model) renderSplitBody(claudeTerm *paneTerminal, editorPaneID string) string {
+// renderSplitBody renders the claude pane and side pane (editor or terminal)
+// side by side, separated by a "│" column. Each pane gets roughly half the body width.
+func (m Model) renderSplitBody(claudeTerm *paneTerminal, editorPaneID string, isTerminal bool) string {
 	editorTerm, hasEditor := m.paneTerminals[editorPaneID]
 	claudeStr := claudeTerm.render()
 
 	var editorStr string
 	if !hasEditor || editorTerm == nil || !editorTerm.written {
-		editorStr = hintStyle.Render("editor starting…")
+		hint := "editor starting…"
+		if isTerminal {
+			hint = "terminal starting…"
+		}
+		editorStr = hintStyle.Render(hint)
 	} else {
 		editorStr = editorTerm.render()
 	}

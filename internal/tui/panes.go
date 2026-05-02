@@ -419,12 +419,15 @@ type paneExitedMsg struct {
 }
 
 // editorOpenedMsg is delivered when PaneSplitter returns successfully.
-// It records the new editor pane ID so the Model can start routing
+// It records the new side-pane ID so the Model can start routing
 // Tab-key focus to it and rendering its output alongside the claude pane.
+// isTerminal distinguishes a shell terminal pane (t binding) from an
+// editor pane (o binding); the rendering and focus wiring are identical.
 type editorOpenedMsg struct {
-	windowID string
-	paneID   string
-	err      error
+	windowID   string
+	paneID     string
+	err        error
+	isTerminal bool
 }
 
 // normalizeCaptureEOL converts bare LF (`\n`) row terminators into

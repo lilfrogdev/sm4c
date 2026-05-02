@@ -267,6 +267,7 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 		}
 	}
 	editorCmd := detectEditor()
+	termCmd := detectShell()
 	return tui.Run(
 		asReader(cmd.InOrStdin()),
 		asWriter(cmd.OutOrStdout()),
@@ -282,6 +283,7 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 			PaneSplitter:       splitter,
 			PaneKiller:         killer,
 			EditorCmd:          editorCmd,
+			TermCmd:            termCmd,
 			InitialHighlight:   initialWindowID,
 			InitialFocus:       initialFocus,
 			SilenceThreshold:   silenceThreshold,
@@ -457,6 +459,15 @@ const paneBridgeStartTimeout = 3 * time.Second
 // user sees the latest state on the next frame), and it keeps the
 // tmux protocol reader responsive.
 const paneBridgeBufferSize = 512
+
+// detectShell returns the shell binary for the `t` binding. It reads
+// $SHELL first (the user's login shell), then falls back to /bin/sh.
+func detectShell() string {
+	if sh := os.Getenv("SHELL"); sh != "" {
+		return sh
+	}
+	return "/bin/sh"
+}
 
 // detectEditor returns the editor binary to use for the `o` binding by
 // consulting $VISUAL, then $EDITOR, then PATH (looking for nvim, vim, nano
