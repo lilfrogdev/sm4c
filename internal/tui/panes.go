@@ -275,15 +275,22 @@ func (p *paneTerminal) render() string {
 	return strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
 }
 
-// renderScrolled builds the viewport when scrollOffset > 0. It combines
-// the tail of the scrollback buffer with the top of the live screen to
-// fill exactly emu.Height() rows.
+// renderScrolled builds the viewport when scrollOffset > 0.
 //
-// We use the TOP rows of the live screen so that scrolling behaves like a
-// real terminal: as you scroll up, history rows enter from the top and the
-// live screen slides off the bottom. Taking the BOTTOM rows (the previous
-// approach) anchored the live UI in place while history appeared above it,
-// creating an "overlay" artifact that made it look like pages were stacking.
+// Content model: think of scrollback + live screen as one continuous tape:
+//
+//	rows 0 .. sbLen-1          → scrollback (oldest to newest)
+//	rows sbLen .. sbLen+height-1 → live screen (top to bottom)
+//
+// scrollOffset is how many rows above the live screen's bottom the viewport
+// has been dragged. The viewport's top row in the combined tape is:
+//
+//	viewTop = sbLen - scrollOffset
+//
+// Each viewport row i reads combined-tape row (viewTop + i): scrollback when
+// that index is in [0, sbLen), live screen when in [sbLen, sbLen+height).
+// This makes scrolling continuous across the scrollback/live-screen boundary
+// without capping or special-casing at one screenful.
 func (p *paneTerminal) renderScrolled() string {
 	sb := p.emu.Scrollback()
 	if sb == nil {
@@ -299,42 +306,33 @@ func (p *paneTerminal) renderScrolled() string {
 		p.scrollOffset = sbLen
 	}
 
-	// Split the viewport into scrollback rows and live-screen rows.
-	// Cap fromScrollback at height so we never emit more lines than the
-	// viewport — if scrollback exceeds height, we fill entirely from
-	// scrollback and skip the live screen.
-	fromScrollback := offset
-	if fromScrollback > height {
-		fromScrollback = height
-	}
-	fromScreen := height - fromScrollback
+	viewTop := sbLen - offset
 
-	lines := make([]string, 0, height)
+	// Pre-render the live screen once (needed when viewport overlaps it).
+	var screenRows []string
+	screenStr := strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
+	screenRows = strings.Split(screenStr, "\n")
 
-	// Pull the last fromScrollback lines from the scrollback buffer.
-	sbStart := sbLen - fromScrollback
-	for i := sbStart; i < sbLen; i++ {
-		line := sb.Line(i)
-		if line == nil {
-			lines = append(lines, "")
-		} else {
-			lines = append(lines, line.Render())
-		}
-	}
-
-	// Fill the remainder from the TOP of the live screen.
-	// This makes the live content slide off the bottom as you scroll up,
-	// matching standard terminal scrollback behavior.
-	if fromScreen > 0 {
-		screenStr := strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
-		screenRows := strings.Split(screenStr, "\n")
-		end := fromScreen
-		if end > len(screenRows) {
-			end = len(screenRows)
-		}
-		lines = append(lines, screenRows[:end]...)
-		for len(lines) < height {
-			lines = append(lines, "")
+	lines := make([]string, height)
+	for i := 0; i < height; i++ {
+		row := viewTop + i
+		switch {
+		case row < 0:
+			lines[i] = ""
+		case row < sbLen:
+			line := sb.Line(row)
+			if line == nil {
+				lines[i] = ""
+			} else {
+				lines[i] = line.Render()
+			}
+		default:
+			screenIdx := row - sbLen
+			if screenIdx < len(screenRows) {
+				lines[i] = screenRows[screenIdx]
+			} else {
+				lines[i] = ""
+			}
 		}
 	}
 
