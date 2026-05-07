@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Terminal split: after opening a terminal (or editor) side pane, the left claude pane did not resize to half-width. The `split-window` command immediately sends SIGWINCH to the claude pane; the resulting `%output` could arrive at `handlePaneData` before `editorOpenedMsg` was processed, creating an emulator at full width. `handleEditorOpened` then deleted it and fired a force-resize, but the H+1 wiggle frame caused a flash and the pane sometimes ended up at the wrong width. Fixed by applying the same `paneCapturing=true` + `doneRestorePanes` suppression used for `hookEventDone`: all `%output` during the split-and-resize sequence is buffered, and `windowResizedMsg` flushes it into a fresh emulator at the correct `(paneViewW-1)/2` width in one shot.
+
 - Right pane: the force-resize SIGWINCH wiggle (used to clear claude's completion frame) caused a visible flash after every response. The H+1 intermediate redraw was being rendered for one frame before the H redraw arrived. Fixed by deleting the pane emulator and setting `paneCapturing=true` before firing the wiggle so all intermediate `%output` is buffered. `windowResizedMsg` then flushes the buffer to a fresh emulator in one shot, meaning only the final H-height state ever renders.
 
 - Terminal split (`t` key): opening a terminal side pane immediately crashed and closed the pane. `SplitWindow` appended ` .` to every command (`exec /bin/zsh .`), causing the shell to interpret `.` as a script file and exit. Fixed by skipping the ` .` suffix for terminal (non-editor) panes.

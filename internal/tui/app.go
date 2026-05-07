@@ -2176,15 +2176,20 @@ func (m Model) handleEditorOpened(msg editorOpenedMsg) (Model, tea.Cmd) {
 	// for the brand-new pane.
 	m.paneCaptured[msg.paneID] = true
 
-	// Drop the claude pane's stale full-width emulator content. The old
-	// content was rendered at full width; showing it at half-width produces
-	// visual artifacts. Deleting the terminal causes the pane to show
-	// "waiting for output" briefly until the SIGWINCH-triggered redraw lands.
+	// Drop the claude pane's stale full-width emulator and buffer all
+	// %output until after the force-resize completes. This prevents two
+	// problems:
+	//   1. split-window's immediate SIGWINCH can arrive before this handler
+	//      runs, creating a wrong-width emulator. paneCapturing=true ensures
+	//      that early %output is buffered rather than fed into a stale or
+	//      wrong-width emulator.
+	//   2. The H+1 intermediate state during forceResizeManagedWindow would
+	//      otherwise flash a half-rendered frame. doneRestorePanes defers the
+	//      flush until windowResizedMsg confirms the final H has been sent.
 	if claudePaneID := m.paneByWindow[msg.windowID]; claudePaneID != "" {
 		delete(m.paneTerminals, claudePaneID)
-		// Keep paneCaptured so we don't issue another capture-pane;
-		// the SIGWINCH redraw will populate the emulator via live %output.
-		m.paneCaptured[claudePaneID] = true
+		m.paneCapturing[claudePaneID] = true
+		m.doneRestorePanes[msg.windowID] = claudePaneID
 	}
 
 	// Clear the sizedFor cache so resizeHighlightedWindow doesn't skip
