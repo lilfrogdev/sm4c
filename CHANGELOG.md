@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Right pane: the force-resize SIGWINCH wiggle (used to clear claude's completion frame) caused a visible flash after every response. The H+1 intermediate redraw was being rendered for one frame before the H redraw arrived. Fixed by deleting the pane emulator and setting `paneCapturing=true` before firing the wiggle so all intermediate `%output` is buffered. `windowResizedMsg` then flushes the buffer to a fresh emulator in one shot, meaning only the final H-height state ever renders.
+
 - Terminal split (`t` key): opening a terminal side pane immediately crashed and closed the pane. `SplitWindow` appended ` .` to every command (`exec /bin/zsh .`), causing the shell to interpret `.` as a script file and exit. Fixed by skipping the ` .` suffix for terminal (non-editor) panes.
 
 - Terminal split: after opening the terminal split, the claude view showed "waiting for output" instead of the split layout. The `renderRightPaneBody` "waiting for output" guard fired before the side-pane check, hiding the split view while claude's emulator was refreshing. Fixed by checking for an active side pane before the guard so the split renders immediately.
