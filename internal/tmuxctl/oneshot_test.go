@@ -10,11 +10,11 @@ func TestParseWindows_Basic(t *testing.T) {
 
 	// Three rows: an active managed window, a background managed
 	// window, and an unmanaged window created outside sm4c.
-	// Format: window_id, active, session, kind, flags, cwd, pane_title, window_panes, window_name
+	// Format: window_id, active, session, kind, flags, cwd, pane_title, window_panes, side_pane_id, side_pane_kind, window_name
 	in := []byte("" +
-		"@1\t1\tsm4c\tclaude\t*\t/home/user/proj/refactor-api\tmy-project\t1\trefactor-api\n" +
-		"@2\t0\tsm4c\tclaude\t#\t/home/user/proj/tests\t\t1\ttests\n" +
-		"@3\t0\tsm4c\t\t\t/tmp\t\t1\trogue-shell\n")
+		"@1\t1\tsm4c\tclaude\t*\t/home/user/proj/refactor-api\tmy-project\t1\t\t\trefactor-api\n" +
+		"@2\t0\tsm4c\tclaude\t#\t/home/user/proj/tests\t\t1\t\t\ttests\n" +
+		"@3\t0\tsm4c\t\t\t/tmp\t\t1\t\t\trogue-shell\n")
 
 	got, err := parseWindows(in)
 	if err != nil {
@@ -56,7 +56,7 @@ func TestParseWindows_Basic(t *testing.T) {
 func TestParseWindows_EmptyCurrentPath(t *testing.T) {
 	t.Parallel()
 
-	in := []byte("@1\t1\tsm4c\tclaude\t*\t\t\t1\tmy-session\n")
+	in := []byte("@1\t1\tsm4c\tclaude\t*\t\t\t1\t\t\tmy-session\n")
 	got, err := parseWindows(in)
 	if err != nil {
 		t.Fatalf("parseWindows: %v", err)
@@ -79,7 +79,7 @@ func TestParseWindows_SanitizesName(t *testing.T) {
 	// case from the plan. parseWindows must strip it before handing
 	// back, so nothing a hostile claude title can do will corrupt the
 	// outer terminal when the sidebar renders it.
-	in := []byte("@1\t1\tsm4c\tclaude\t*\t/tmp\t\t1\tevil\x1b[2Jname\n")
+	in := []byte("@1\t1\tsm4c\tclaude\t*\t/tmp\t\t1\t\t\tevil\x1b[2Jname\n")
 
 	got, err := parseWindows(in)
 	if err != nil {
@@ -105,8 +105,8 @@ func TestParseWindows_NameWithTabs(t *testing.T) {
 	// SplitN's N=9 bundles everything past the 8th tab into parts[8].
 	// safe.Label then strips control bytes (including \t) so the
 	// stored Name is tab-free without losing the surrounding chars.
-	// Format: id, active, session, kind, flags, cwd, pane_title, window_panes, window_name(free)
-	in := []byte("@1\t1\tsm4c\tclaude\t*\t/tmp\t\t1\ta\tb\tc\n")
+	// Format: id, active, session, kind, flags, cwd, pane_title, window_panes, side_pane_id, side_pane_kind, window_name(free)
+	in := []byte("@1\t1\tsm4c\tclaude\t*\t/tmp\t\t1\t\t\ta\tb\tc\n")
 	got, err := parseWindows(in)
 	if err != nil {
 		t.Fatalf("parseWindows: %v", err)
@@ -136,7 +136,7 @@ func TestParseWindows_EmptyInput(t *testing.T) {
 func TestParseWindows_Malformed(t *testing.T) {
 	t.Parallel()
 
-	// Fewer than 9 fields: must error rather than panic.
+	// Fewer than 11 fields: must error rather than panic.
 	in := []byte("@1\t1\tsm4c\tclaude\n")
 	if _, err := parseWindows(in); err == nil {
 		t.Fatal("parseWindows: want error on malformed row; got nil")

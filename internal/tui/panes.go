@@ -118,7 +118,7 @@ type WindowResizer func(ctx context.Context, windowID string, width, height int)
 //
 // A nil PaneSplitter disables the `o` binding. Production callers wrap
 // tmuxctl.OneShot.SplitWindow.
-type PaneSplitter func(ctx context.Context, windowID, cwd, editorBin string) (paneID string, err error)
+type PaneSplitter func(ctx context.Context, windowID, cwd, cmd string, isTerminal bool) (paneID string, err error)
 
 // PaneKiller terminates a single tmux pane by its pane ID. Used to close
 // the editor pane when the user navigates away. Implementations should
@@ -245,7 +245,7 @@ func (p *paneTerminal) scroll(delta int) {
 	}
 	sb := p.emu.Scrollback()
 	if sb == nil {
-		return // alt-screen mode has no scrollback
+		return
 	}
 	p.scrollOffset += delta
 	if p.scrollOffset < 0 {
@@ -309,9 +309,15 @@ func (p *paneTerminal) renderScrolled() string {
 	viewTop := sbLen - offset
 
 	// Pre-render the live screen once (needed when viewport overlaps it).
+	// When claude is in alt-screen mode, emu.Render() returns the interactive
+	// UI (prompt box, etc.), not main-screen content. Mixing that with main-
+	// screen scrollback produces the repeated-prompt-box artifact. Use empty
+	// lines for the live-screen portion instead.
 	var screenRows []string
-	screenStr := strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
-	screenRows = strings.Split(screenStr, "\n")
+	if !p.emu.IsAltScreen() {
+		screenStr := strings.ReplaceAll(p.emu.Render(), "\r\n", "\n")
+		screenRows = strings.Split(screenStr, "\n")
+	}
 
 	lines := make([]string, height)
 	for i := 0; i < height; i++ {

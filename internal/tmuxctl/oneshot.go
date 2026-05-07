@@ -204,6 +204,14 @@ type Window struct {
 	// closed: if the TUI has an editor pane registered for a window but
 	// PaneCount drops to 1, the editor pane is gone.
 	PaneCount int
+
+	// SidePaneID and SidePaneKind are set when sm4c opened a side pane
+	// (editor/terminal) for this window. They are stored as tmux window
+	// options (@sm4c-side-pane / @sm4c-side-pane-kind) so sm4c can
+	// reconstruct the split state after a restart. SidePaneID is empty
+	// when no side pane was opened. Only populated when PaneCount > 1.
+	SidePaneID   string
+	SidePaneKind string
 }
 
 // Managed reports whether this window was created by sm4c (tagged with
@@ -233,8 +241,11 @@ func (w Window) Managed() bool { return w.Kind == KindClaude }
 //   - #{window_flags}        : subset of "*+-!#~M"
 //   - #{pane_current_path}   : active pane's cwd, absolute path
 //   - #{pane_title}          : last OSC 0/2 title set by the pane, untrusted
+//   - #{window_panes}        : integer pane count
+//   - #{@sm4c-side-pane}     : side pane ID if sm4c opened a split ("%N" or "")
+//   - #{@sm4c-side-pane-kind}: "terminal" or "editor" or ""
 //   - #{window_name}         : untrusted, must be last (free-form field)
-const listWindowsFormat = "#{window_id}\t#{window_active}\t#{session_name}\t#{@sm4c-kind}\t#{window_flags}\t#{pane_current_path}\t#{pane_title}\t#{window_panes}\t#{window_name}"
+const listWindowsFormat = "#{window_id}\t#{window_active}\t#{session_name}\t#{@sm4c-kind}\t#{window_flags}\t#{pane_current_path}\t#{pane_title}\t#{window_panes}\t#{@sm4c-side-pane}\t#{@sm4c-side-pane-kind}\t#{window_name}"
 
 // ListWindows returns every window visible on the sm4c tmux server, in
 // tmux's native ordering. If the server is not running this returns
@@ -260,15 +271,14 @@ func parseWindows(out []byte) ([]Window, error) {
 		if len(rawLine) == 0 {
 			continue
 		}
-		// Splitn with N=9 so that any tabs present in the free-form
+		// Splitn with N=11 so that any tabs present in the free-form
 		// window_name (last field) stay bundled into the final slot.
-		// pane_title (second-to-last) is also untrusted but rarely
-		// contains tabs in practice; a tab would truncate the title
-		// at the tab boundary after safe.Label strips the control byte,
-		// which is an acceptable cosmetic degradation. See
-		// listWindowsFormat for the slot order.
-		parts := strings.SplitN(string(rawLine), "\t", 9)
-		if len(parts) != 9 {
+		// pane_title (index 6) is also untrusted but rarely contains tabs
+		// in practice; a tab would truncate the title at the tab boundary
+		// after safe.Label strips the control byte, which is an acceptable
+		// cosmetic degradation. See listWindowsFormat for the slot order.
+		parts := strings.SplitN(string(rawLine), "\t", 11)
+		if len(parts) != 11 {
 			return nil, fmt.Errorf("tmuxctl: malformed list-windows row: %q", safe.Line(string(rawLine)))
 		}
 		paneCount, _ := strconv.Atoi(parts[7])
@@ -280,7 +290,9 @@ func parseWindows(out []byte) ([]Window, error) {
 			CurrentPath: safe.Line(parts[5]),
 			PaneTitle:   safe.Label(parts[6]),
 			PaneCount:   paneCount,
-			Name:        safe.Label(parts[8]),
+			SidePaneID:  parts[8],
+			SidePaneKind: parts[9],
+			Name:        safe.Label(parts[10]),
 			Active:      parts[1] == "1",
 		}
 		wins = append(wins, w)
@@ -302,6 +314,16 @@ func parseWindows(out []byte) ([]Window, error) {
 func (o OneShot) ActivePane(ctx context.Context, windowID string) (string, error) {
 	if err := safe.Arg(windowID); err != nil {
 		return "", fmt.Errorf("tmuxctl: ActivePane: windowID: %w", err)
+	}
+	// When sm4c opened a side pane for this window, it tagged the window
+	// with @sm4c-claude-pane so the correct claude pane can be recovered
+	// after sm4c restarts (split-window makes the NEW pane active, so
+	// the active pane at restart would otherwise be the terminal/editor).
+	tagged, err := o.run(ctx, "display-message", "-p", "-t", windowID, "-F", "#{@sm4c-claude-pane}")
+	if err == nil {
+		if paneID, perr := parsePaneID(tagged); perr == nil {
+			return paneID, nil
+		}
 	}
 	// display-message -p prints the formatted value to stdout; -t
 	// scopes the lookup to the window; the format string is a single
@@ -607,7 +629,7 @@ func (o OneShot) SetGlobalEnv(ctx context.Context, key, value string) error {
 // cwd must be a valid directory path; empty cwd inherits the pane's
 // current directory. editorBin must be an absolute path or a resolvable
 // command name validated by the caller before SplitWindow is invoked.
-func (o OneShot) SplitWindow(ctx context.Context, windowID, cwd, editorBin string) (string, error) {
+func (o OneShot) SplitWindow(ctx context.Context, windowID, cwd, editorBin string, isTerminal bool) (string, error) {
 	if err := safe.Arg(windowID); err != nil {
 		return "", fmt.Errorf("tmuxctl: SplitWindow: windowID: %w", err)
 	}
@@ -617,7 +639,19 @@ func (o OneShot) SplitWindow(ctx context.Context, windowID, cwd, editorBin strin
 	if err := safe.Arg(editorBin); err != nil {
 		return "", fmt.Errorf("tmuxctl: SplitWindow: editorBin: %w", err)
 	}
-	shellCmd := "exec " + shEscape(editorBin) + " ."
+	shellCmd := "exec " + shEscape(editorBin)
+	if !isTerminal {
+		shellCmd += " ."
+	}
+
+	// Capture the claude pane ID before splitting — split-window makes
+	// the NEW pane active, so after the split the "active pane" would be
+	// the side pane. We store it as @sm4c-claude-pane so ActivePane can
+	// recover the correct pane after an sm4c restart.
+	claudePaneID := ""
+	if cp, err2 := o.run(ctx, "display-message", "-p", "-t", windowID, "-F", "#{pane_id}"); err2 == nil {
+		claudePaneID = strings.TrimSpace(string(cp))
+	}
 
 	args := []string{"split-window", "-h", "-t", windowID, "-P", "-F", "#{pane_id}"}
 	if cwd != "" {
@@ -639,7 +673,22 @@ func (o OneShot) SplitWindow(ctx context.Context, windowID, cwd, editorBin strin
 		}
 		return "", err
 	}
-	return parsePaneID(out)
+	sidePaneID, err := parsePaneID(out)
+	if err != nil {
+		return "", err
+	}
+
+	// Tag the window so sm4c can reconstruct the split state after restart.
+	if claudePaneID != "" {
+		kind := "editor"
+		if isTerminal {
+			kind = "terminal"
+		}
+		_, _ = o.run(ctx, "set-option", "-w", "-t", windowID, "@sm4c-claude-pane", claudePaneID)
+		_, _ = o.run(ctx, "set-option", "-w", "-t", windowID, "@sm4c-side-pane", sidePaneID)
+		_, _ = o.run(ctx, "set-option", "-w", "-t", windowID, "@sm4c-side-pane-kind", kind)
+	}
+	return sidePaneID, nil
 }
 
 // KillPane terminates the tmux pane identified by paneID. This is used

@@ -802,18 +802,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusTickArmed = true
 			cmds = append(cmds, tick)
 		}
-		// When the highlighted window finishes responding, force a
-		// SIGWINCH so claude redraws its UI cleanly. Without this,
-		// claude's completion frame (turquoise box, session name) stays
-		// painted at its last cursor position until the user resizes the
-		// terminal. A wiggle resize is guaranteed to trigger SIGWINCH
-		// even when the pane dimensions haven't changed.
+		// When any window finishes responding, force a SIGWINCH so claude
+		// redraws its UI cleanly. Without this, claude's completion frame
+		// (turquoise box, session name) stays painted at its last cursor
+		// position until the user resizes the terminal. A wiggle resize
+		// is guaranteed to trigger SIGWINCH even when pane dimensions
+		// haven't changed. We fire for ALL finished sessions (not just
+		// the highlighted one) so the artifact doesn't linger when the
+		// user switches sessions and comes back.
 		if msg.event == hookEventDone {
-			if doneWid := m.paneToWindow[msg.paneID]; doneWid != "" &&
-				m.highlight >= 0 && m.highlight < len(m.sessions) &&
-				m.sessions[m.highlight].WindowID == doneWid {
-				m.forceResizePending = true
-				cmds = append(cmds, m.resizeHighlightedWindow())
+			if doneWid := m.paneToWindow[msg.paneID]; doneWid != "" {
+				w, h := m.paneViewW, m.paneViewH
+				if w > 0 && h > 0 {
+					delete(m.sizedFor, doneWid)
+					cmds = append(cmds, m.forceResizeManagedWindow(doneWid, w, h))
+				}
 			}
 		}
 		return m, tea.Batch(cmds...)
@@ -939,6 +942,29 @@ func (m Model) handleSessions(msg sessionsMsg) Model {
 		if _, hasEditor := m.editorPaneByWindow[s.WindowID]; !hasEditor {
 			m.claudeTitleByWindow[s.WindowID] = s.Title
 		}
+	}
+
+	// Reconstruct split state from window options after restart. When sm4c
+	// restarts and finds a window that previously had a side pane, the
+	// session carries SidePaneID (read from @sm4c-side-pane). Populate
+	// editorPaneByWindow so the split layout, resize math, and pane routing
+	// work correctly without needing the user to re-open the split.
+	// We only restore when not already tracked, to avoid overwriting live
+	// state during normal polling.
+	for _, s := range m.sessions {
+		if s.SidePaneID == "" {
+			continue
+		}
+		if _, alreadyTracked := m.editorPaneByWindow[s.WindowID]; alreadyTracked {
+			continue
+		}
+		m.editorPaneByWindow[s.WindowID] = s.SidePaneID
+		if s.SidePaneIsTerminal {
+			m.sidePaneIsTerminal[s.WindowID] = true
+		} else {
+			delete(m.sidePaneIsTerminal, s.WindowID)
+		}
+		debugf("restored side pane wid=%s pane=%s terminal=%v", s.WindowID, s.SidePaneID, s.SidePaneIsTerminal)
 	}
 
 	// Restore highlight by window ID so a poll mid-drag (or any reorder)
@@ -1264,6 +1290,16 @@ func (m Model) handlePaneResolved(msg paneResolvedMsg) (Model, tea.Cmd) {
 			// arriving means the session was already active; a stale
 			// capture would arrive after live bytes anyway.
 			return m, tick
+		}
+		// For a Done event replayed here, also trigger the force-resize.
+		// paneToWindow is now populated (set just above), so the same
+		// SIGWINCH logic as the live hookMsg handler can fire.
+		if ev == hookEventDone {
+			w, h := m.paneViewW, m.paneViewH
+			if w > 0 && h > 0 {
+				delete(m.sizedFor, msg.windowID)
+				return m, m.forceResizeManagedWindow(msg.windowID, w, h)
+			}
 		}
 	}
 
@@ -2078,7 +2114,7 @@ func (m Model) openSidePane(windowID, cwd, cmd string, isTerminal bool) tea.Cmd 
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
 		defer cancel()
-		paneID, err := splitter(ctx, windowID, cwd, cmd)
+		paneID, err := splitter(ctx, windowID, cwd, cmd, isTerminal)
 		return editorOpenedMsg{windowID: windowID, paneID: paneID, err: err, isTerminal: isTerminal}
 	}
 }
@@ -2855,15 +2891,20 @@ func (m Model) renderRightPaneBody() string {
 	if !ok {
 		return hintStyle.Render("resolving pane…")
 	}
+	// Check for a side pane before the "waiting for output" guard: when
+	// a terminal or editor split just opened we delete claude's stale
+	// terminal so it shows "waiting for output" — but we still want to
+	// render the split layout immediately rather than hiding it.
+	editorPaneID := m.editorPaneByWindow[wid]
+	if editorPaneID != "" {
+		// claude's terminal may be nil/empty while it's redrawing after the split
+		claudeTerm := m.paneTerminals[paneID] // render() handles nil gracefully
+		return m.renderSplitBody(claudeTerm, editorPaneID, m.sidePaneIsTerminal[wid])
+	}
+
 	term, ok := m.paneTerminals[paneID]
 	if !ok || term == nil || !term.written {
 		return hintStyle.Render("waiting for output  " + paneID)
-	}
-
-	// If a side pane is open for this session, render a split view.
-	editorPaneID := m.editorPaneByWindow[wid]
-	if editorPaneID != "" {
-		return m.renderSplitBody(term, editorPaneID, m.sidePaneIsTerminal[wid])
 	}
 
 	return term.render()

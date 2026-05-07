@@ -255,8 +255,8 @@ func runTUIProgramReal(cmd *cobra.Command, o tmuxctl.OneShot, initialWindowID st
 			}
 			return err
 		}
-		splitter = func(ctx context.Context, windowID, cwd, editorBin string) (string, error) {
-			return o.SplitWindow(ctx, windowID, cwd, editorBin)
+		splitter = func(ctx context.Context, windowID, cwd, bin string, isTerminal bool) (string, error) {
+			return o.SplitWindow(ctx, windowID, cwd, bin, isTerminal)
 		}
 		killer = func(ctx context.Context, paneID string) error {
 			err := o.KillPane(ctx, paneID)
@@ -521,14 +521,24 @@ func sessionLister(o tmuxctl.OneShot) tui.SessionLister {
 			if !w.Managed() {
 				continue
 			}
-			out = append(out, tui.Session{
+			s := tui.Session{
 				WindowID:  w.ID,
 				Name:      w.Name,
 				Active:    w.Active,
 				Cwd:       w.CurrentPath,
 				Title:     w.PaneTitle,
 				PaneCount: w.PaneCount,
-			})
+			}
+			// Restore side pane state from window options so the split
+			// layout is recovered after an sm4c restart. Only trust the
+			// stored pane ID when PaneCount > 1 (if the side pane exited
+			// while sm4c was down, PaneCount will be 1 and the stale
+			// option is ignored automatically).
+			if w.PaneCount > 1 && w.SidePaneID != "" {
+				s.SidePaneID = w.SidePaneID
+				s.SidePaneIsTerminal = w.SidePaneKind == "terminal"
+			}
+			out = append(out, s)
 		}
 		return out, nil
 	}

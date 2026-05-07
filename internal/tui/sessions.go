@@ -79,6 +79,13 @@ type Session struct {
 	// while the model still has an editor pane registered for this
 	// window, the editor pane has exited.
 	PaneCount int
+
+	// SidePaneID and SidePaneIsTerminal are populated when the tmux window
+	// has a known sm4c side pane (set via @sm4c-side-pane window options).
+	// The TUI uses these to reconstruct editorPaneByWindow after a restart
+	// so the split layout is restored correctly. Only set when PaneCount > 1.
+	SidePaneID       string
+	SidePaneIsTerminal bool
 }
 
 // SessionLister is the TUI's seam onto tmux. It is injected by the
