@@ -177,8 +177,10 @@ func statusGlyphHighlighted(status SessionStatus, frame int, bg, fg string) stri
 }
 
 // statusFrameTickMsg is delivered by the ticker while at least one pane is
-// Working. It carries no payload; the handler advances Model.statusFrame.
-type statusFrameTickMsg struct{}
+// Working. gen is the Model.statusTickGen value at the time the tick was
+// scheduled; the handler ignores ticks whose gen no longer matches, which
+// lets stale tick chains die naturally without cancellation.
+type statusFrameTickMsg struct{ gen int }
 
 // anyPaneWorking reports whether at least one tracked pane is currently in
 // the Working state. This is the animation-tick gating predicate: we only
@@ -199,6 +201,9 @@ func (m Model) anyPaneWorking() bool {
 //   - no tick already in flight (guarded by Model.statusTickArmed).
 //
 // Returning nil terminates the tick chain when nothing needs animating.
+// Each tick is stamped with the current statusTickGen so that stale ticks
+// (left over from a generation that was invalidated by hookEventDone) are
+// ignored by the handler rather than advancing the frame counter twice.
 func (m Model) scheduleStatusTick() tea.Cmd {
 	if m.statusTickArmed {
 		return nil
@@ -206,7 +211,8 @@ func (m Model) scheduleStatusTick() tea.Cmd {
 	if !m.anyPaneWorking() {
 		return nil
 	}
+	gen := m.statusTickGen
 	return tea.Tick(statusFrameInterval, func(time.Time) tea.Msg {
-		return statusFrameTickMsg{}
+		return statusFrameTickMsg{gen: gen}
 	})
 }

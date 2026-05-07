@@ -498,6 +498,13 @@ type Model struct {
 	// tick; cleared when the tick arrives.
 	statusTickArmed bool
 
+	// statusTickGen is a monotonic counter incremented each time the
+	// in-flight tick is intentionally invalidated (e.g. on hookEventDone).
+	// Each scheduled tick is stamped with the gen at creation time; the
+	// handler drops ticks whose gen no longer matches, preventing stale
+	// tick chains from compounding the animation cadence.
+	statusTickGen int
+
 	// dirPicker is non-nil while the directory-picker overlay is
 	// open (triggered by `n` in sidebar focus). When the user
 	// confirms with space, newSessionDir is set and the TUI quits
@@ -775,6 +782,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		next := m.handlePaneData(msg)
 		return next, next.waitForPaneEvent()
 	case statusFrameTickMsg:
+		// Drop stale ticks from invalidated generations (e.g. left
+		// over from a hookEventDone that bumped statusTickGen while an
+		// old tick was already in flight). Without this guard, each
+		// Done+Working transition with concurrent sessions would leave
+		// one more ghost tick running, accelerating the spinner.
+		if msg.gen != m.statusTickGen {
+			return m, nil
+		}
 		// Advance the animation frame and, if any pane is
 		// still Working, schedule the next tick. The frame
 		// counter is modulo-applied inside statusGlyph, so
@@ -804,6 +819,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// round.
 		m.applyHookEvent(msg)
 		if msg.event == hookEventDone {
+			// Invalidate the in-flight tick so it does not advance
+			// statusFrame when it fires after we re-arm below.
+			m.statusTickGen++
 			m.statusTickArmed = false
 		}
 		cmds := []tea.Cmd{m.waitForHookEvent()}
@@ -1295,6 +1313,7 @@ func (m Model) handlePaneResolved(msg paneResolvedMsg) (Model, tea.Cmd) {
 	if ev, ok := m.pendingHookEvents[msg.paneID]; ok {
 		debugf("paneResolved: replaying pending hook event pane=%s event=%d", msg.paneID, ev)
 		if ev == hookEventDone {
+			m.statusTickGen++
 			m.statusTickArmed = false
 		}
 		m.applyHookEvent(hookMsg{paneID: msg.paneID, event: ev})
