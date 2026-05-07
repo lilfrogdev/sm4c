@@ -550,6 +550,14 @@ type Model struct {
 	// terminal (true) or an editor (false / absent). Indexed by window ID.
 	sidePaneIsTerminal map[string]bool
 
+	// doneRestorePanes maps windowID → claudePaneID for windows where a
+	// hookEventDone force-resize is in flight. While set, the claude pane's
+	// emulator is deleted and paneCapturing is true, so %output from the
+	// H+1 intermediate resize state is buffered rather than rendered. The
+	// windowResizedMsg handler flushes the buffer in one shot, preventing
+	// the height-change flash from ever appearing on screen.
+	doneRestorePanes map[string]string
+
 	// pendingSideOpen holds a side-pane swap requested while another side
 	// pane is still closing. handlePaneExited reads this map after cleanup
 	// and opens the new kind. Values: "editor" or "terminal".
@@ -627,6 +635,7 @@ func NewModel(deps Deps) Model {
 		editorPaneByWindow: make(map[string]string),
 		sidePaneIsTerminal: make(map[string]bool),
 		pendingSideOpen:    make(map[string]string),
+		doneRestorePanes:   make(map[string]string),
 		claudeTitleByWindow: make(map[string]string),
 		paneViewW:           defaultPaneWidth,
 		paneViewH:          defaultPaneHeight,
@@ -805,15 +814,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// When any window finishes responding, force a SIGWINCH so claude
 		// redraws its UI cleanly. Without this, claude's completion frame
 		// (turquoise box, session name) stays painted at its last cursor
-		// position until the user resizes the terminal. A wiggle resize
-		// is guaranteed to trigger SIGWINCH even when pane dimensions
-		// haven't changed. We fire for ALL finished sessions (not just
-		// the highlighted one) so the artifact doesn't linger when the
-		// user switches sessions and comes back.
+		// position until the user resizes the terminal.
+		//
+		// The force-resize wiggle (H → H+1 → H) causes an intermediate
+		// %output at H+1 height that would flash on screen. To suppress
+		// it: delete the pane's emulator and set paneCapturing=true so
+		// all incoming %output is buffered in panePending. When the
+		// windowResizedMsg fires (after both resize calls complete), we
+		// flush the buffer in one shot — the emulator is built from the
+		// final H-height content and the intermediate state never renders.
 		if msg.event == hookEventDone {
 			if doneWid := m.paneToWindow[msg.paneID]; doneWid != "" {
 				w, h := m.paneViewW, m.paneViewH
 				if w > 0 && h > 0 {
+					delete(m.paneTerminals, msg.paneID)
+					m.paneCapturing[msg.paneID] = true
+					m.doneRestorePanes[doneWid] = msg.paneID
 					delete(m.sizedFor, doneWid)
 					cmds = append(cmds, m.forceResizeManagedWindow(doneWid, w, h))
 				}
@@ -838,14 +854,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case paneCaptureMsg:
 		return m.handlePaneCapture(msg), nil
 	case windowResizedMsg:
-		// The WindowResizer round-trip completed. Success or
-		// failure, we have nothing to do here — the emulator is
-		// already sized locally; if the tmux-side resize failed
-		// the user will see drift and can recover by switching
-		// sessions. We deliberately do not surface per-resize
-		// errors in the sidebar; they are too chatty during a
-		// flaky tmux state to be useful.
-		_ = msg
+		// The WindowResizer round-trip completed. Flush any buffered
+		// %output that was suppressed during a hookEventDone force-resize
+		// (the paneCapturing+delete trick to avoid the H+1 flash).
+		if claudePaneID, ok := m.doneRestorePanes[msg.windowID]; ok {
+			delete(m.doneRestorePanes, msg.windowID)
+			m = m.handlePaneCapture(paneCaptureMsg{paneID: claudePaneID})
+		}
 		return m, nil
 	case keysSentMsg:
 		return m.handleKeysSent(msg), nil
@@ -1291,12 +1306,14 @@ func (m Model) handlePaneResolved(msg paneResolvedMsg) (Model, tea.Cmd) {
 			// capture would arrive after live bytes anyway.
 			return m, tick
 		}
-		// For a Done event replayed here, also trigger the force-resize.
-		// paneToWindow is now populated (set just above), so the same
-		// SIGWINCH logic as the live hookMsg handler can fire.
+		// For a Done event replayed here, trigger the force-resize with
+		// the same flash-suppression as the live hookMsg handler.
 		if ev == hookEventDone {
 			w, h := m.paneViewW, m.paneViewH
 			if w > 0 && h > 0 {
+				delete(m.paneTerminals, msg.paneID)
+				m.paneCapturing[msg.paneID] = true
+				m.doneRestorePanes[msg.windowID] = msg.paneID
 				delete(m.sizedFor, msg.windowID)
 				return m, m.forceResizeManagedWindow(msg.windowID, w, h)
 			}
